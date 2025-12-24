@@ -44,13 +44,7 @@ function fmtDate(ms){
 
 function safeStr(v){ return (v == null) ? "" : String(v); }
 
-function includesAny(hay, needles){
-  const h = norm(hay);
-  return needles.some(n => h.includes(norm(n)));
-}
-
-function buildSimpleSearchKey(t){
-  // A single searchable blob
+function buildSearchKey(t){
   return [
     t.trialName,
     t.trialType,
@@ -101,6 +95,19 @@ function summarizeList(list, limit = 25){
   return lines.join("\n") + (list.length > limit ? `\n\n(Showing ${limit} of ${list.length})` : "");
 }
 
+function countBy(list, getter){
+  const m = new Map();
+  for (const x of list) {
+    const k = (getter(x) || "Unknown").toString().trim() || "Unknown";
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  return [...m.entries()].sort((a,b)=> b[1]-a[1]);
+}
+
+function topPairs(mEntries, n=5){
+  return mEntries.slice(0,n).map(([k,c]) => `${k}: ${c}`).join(", ");
+}
+
 // ----------------------------
 // Public API
 // ----------------------------
@@ -133,51 +140,118 @@ export function answerFieldTrials({ question, snapshot }){
     ...t,
     __createdMs: parseTime(t.createdAt),
     __updatedMs: parseTime(t.updatedAt),
-    __search: buildSimpleSearchKey(t)
+    __search: buildSearchKey(t)
   }));
 
-  // SUMMARY
-  if (qn === "trials" || qn === "field trials" || qn === "trials summary") {
-    const total = trials.length;
-    const byStatus = new Map();
-    const byYear = new Map();
-    const byCrop = new Map();
-    const byType = new Map();
+  // ----------------------------
+  // NEW: TRIALS COMPARE
+  // ----------------------------
+  // Commands:
+  //  - trials compare <text>
+  //  - trial compare <text>
+  //  - compare trials <text>
+  let mCompare =
+    /^trials\s+compare\s+(.+)$/i.exec(q) ||
+    /^trial\s+compare\s+(.+)$/i.exec(q) ||
+    /^compare\s+trials\s+(.+)$/i.exec(q);
 
-    for (const t of trials) {
-      const s = (t.status || "unknown").toString();
-      const y = (t.cropYear != null ? String(t.cropYear) : "unknown");
-      const c = (t.crop || "unknown").toString();
-      const tp = (t.trialType || "unknown").toString();
+  if (mCompare) {
+    let needle = (mCompare[1] || "").trim();
+    if ((needle.startsWith('"') && needle.endsWith('"')) || (needle.startsWith("'") && needle.endsWith("'"))) {
+      needle = needle.slice(1, -1).trim();
+    }
+    const n = norm(needle);
 
-      byStatus.set(s, (byStatus.get(s) || 0) + 1);
-      byYear.set(y, (byYear.get(y) || 0) + 1);
-      byCrop.set(c, (byCrop.get(c) || 0) + 1);
-      byType.set(tp, (byType.get(tp) || 0) + 1);
+    // match by trialName contains first; fallback to full search blob
+    let matched = trials.filter(t => norm(t.trialName).includes(n));
+    if (!matched.length) matched = trials.filter(t => t.__search.includes(n));
+
+    if (!matched.length) {
+      return {
+        answer:
+          `No trials matched "${needle}".\n\nTry:\n• trials compare fungicide\n• trials compare "Soybean Fungicide"\n• trials name ${needle}`,
+        meta: { snapshotId }
+      };
     }
 
-    const top5 = (m) => [...m.entries()].sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`${k}: ${v}`).join(", ");
+    // Group by trialName (this is the “program” bucket)
+    const byName = new Map();
+    for (const t of matched) {
+      const name = safeStr(t.trialName).trim() || "(No name)";
+      if (!byName.has(name)) byName.set(name, []);
+      byName.get(name).push(t);
+    }
+
+    // Sort groups by size desc
+    const groups = [...byName.entries()].sort((a,b)=> b[1].length - a[1].length);
+
+    // Keep output tight: top 8 groups
+    const showGroups = groups.slice(0, 8);
+
+    const lines = [];
+    lines.push(`Trials compare for "${needle}" (matched ${matched.length}):`);
+
+    for (const [name, list] of showGroups) {
+      const crops = countBy(list, t => t.crop || "Unknown");
+      const years = countBy(list, t => (t.cropYear != null ? String(t.cropYear) : "Unknown"));
+      const types = countBy(list, t => t.trialType || "Unknown");
+      const status = countBy(list, t => t.status || "Unknown");
+
+      const checks = countBy(list, t => t.check || "Unknown").slice(0, 6);
+      const treatments = countBy(list, t => t.treatmentProduct || "Unknown").slice(0, 6);
+
+      lines.push(`\n• ${name}`);
+      lines.push(`  - count: ${list.length}`);
+      lines.push(`  - crop: ${topPairs(crops, 3)}`);
+      lines.push(`  - year: ${topPairs(years, 3)}`);
+      lines.push(`  - type: ${topPairs(types, 3)}`);
+      lines.push(`  - status: ${topPairs(status, 5)}`);
+      lines.push(`  - check options: ${checks.map(([k,c])=>`${k} (${c})`).join(", ")}`);
+      lines.push(`  - treatment options: ${treatments.map(([k,c])=>`${k} (${c})`).join(", ")}`);
+    }
+
+    if (groups.length > 8) {
+      lines.push(`\n(Showing 8 of ${groups.length} trialName groups. Be more specific to narrow it down.)`);
+    }
+
+    lines.push(`\nNext: ask "trial \\"<exact trial name>\\"" to see the details for one program.`);
+    return { answer: lines.join("\n"), meta: { snapshotId, matched: matched.length, groups: groups.length } };
+  }
+
+  // ----------------------------
+  // SUMMARY
+  // ----------------------------
+  if (qn === "trials" || qn === "field trials" || qn === "trials summary") {
+    const total = trials.length;
+
+    const byStatus = countBy(trials, t => (t.status || "unknown"));
+    const byYear   = countBy(trials, t => (t.cropYear != null ? String(t.cropYear) : "unknown"));
+    const byCrop   = countBy(trials, t => (t.crop || "unknown"));
+    const byType   = countBy(trials, t => (t.trialType || "unknown"));
 
     return {
       answer:
         `Field Trials summary (snapshot ${snapshotId}):\n` +
         `• Total trials: ${total}\n` +
-        `• By status: ${top5(byStatus)}\n` +
-        `• By year: ${top5(byYear)}\n` +
-        `• By crop: ${top5(byCrop)}\n` +
-        `• By type: ${top5(byType)}\n\n` +
+        `• By status: ${topPairs(byStatus)}\n` +
+        `• By year: ${topPairs(byYear)}\n` +
+        `• By crop: ${topPairs(byCrop)}\n` +
+        `• By type: ${topPairs(byType)}\n\n` +
         `Try:\n` +
-        `• "trials status completed"\n` +
-        `• "trials year 2025"\n` +
-        `• "trials crop soybeans"\n` +
-        `• "trials type fungicides"\n` +
-        `• "trials product Butler Mix"\n` +
-        `• "trial soybean fungicide $50"`,
+        `• trials compare fungicide\n` +
+        `• trials status completed\n` +
+        `• trials year 2025\n` +
+        `• trials crop soybeans\n` +
+        `• trials type fungicides\n` +
+        `• trials product Butler Mix\n` +
+        `• trial "Soybean Fungicide $50 Program"`,
       meta: { snapshotId, trialsCount: total }
     };
   }
 
-  // FILTERS: trials status / year / crop / type / product / name
+  // ----------------------------
+  // FILTERS
+  // ----------------------------
   let m =
     /^trials\s+status\s+(.+)$/i.exec(q) ||
     /^trials\s+year\s+([0-9]{4})$/i.exec(q) ||
@@ -187,9 +261,7 @@ export function answerFieldTrials({ question, snapshot }){
     /^trials\s+name\s+(.+)$/i.exec(q);
 
   if (m) {
-    // determine which matched by checking prefix
     const lower = qn;
-
     let list = trials;
     let label = "";
 
@@ -225,7 +297,9 @@ export function answerFieldTrials({ question, snapshot }){
     };
   }
 
-  // TRIAL lookup by: ID OR name-ish search
+  // ----------------------------
+  // TRIAL lookup by ID or name-ish
+  // ----------------------------
   m = /^trial\s+(.+)\s*$/i.exec(q);
   if (m) {
     let needle = (m[1] || "").trim();
@@ -234,20 +308,14 @@ export function answerFieldTrials({ question, snapshot }){
     }
     const needleN = norm(needle);
 
-    // 1) exact id
     let found = trials.find(t => t.id === needle) || null;
-
-    // 2) exact trialName
     if (!found) found = trials.find(t => norm(t.trialName) === needleN) || null;
-
-    // 3) contains in name/type/product/notes
     if (!found) found = trials.find(t => t.__search.includes(needleN)) || null;
 
     if (!found) {
       return {
         answer:
-          `I couldn’t find a trial matching "${needle}".\n\n` +
-          `Try:\n• trial "<full trial name>"\n• trials name ${needle}\n• trials product ${needle}\n• trials type ${needle}`,
+          `I couldn’t find a trial matching "${needle}".\n\nTry:\n• trial "<full trial name>"\n• trials name ${needle}\n• trials product ${needle}\n• trials compare ${needle}`,
         meta: { snapshotId }
       };
     }
@@ -270,9 +338,7 @@ export function answerFieldTrials({ question, snapshot }){
     if (found.notes) lines.push(`• notes: ${safeStr(found.notes).trim()}`);
 
     const nk = Object.keys(nested);
-    if (nk.length) {
-      lines.push(`• nested: ${nk.map(k => `${k}(${nested[k]})`).join(", ")}`);
-    }
+    if (nk.length) lines.push(`• nested: ${nk.map(k => `${k}(${nested[k]})`).join(", ")}`);
 
     return { answer: lines.join("\n"), meta: { snapshotId, trialId: found.id } };
   }
@@ -280,12 +346,12 @@ export function answerFieldTrials({ question, snapshot }){
   return {
     answer:
       `Try:\n` +
-      `• "trials summary"\n` +
-      `• "trials status completed"\n` +
-      `• "trials year 2025"\n` +
-      `• "trials crop soybeans"\n` +
-      `• "trials type fungicides"\n` +
-      `• "trials product Butler Mix"\n` +
+      `• trials compare fungicide\n` +
+      `• trials summary\n` +
+      `• trials status completed\n` +
+      `• trials year 2025\n` +
+      `• trials crop soybeans\n` +
+      `• trials product Butler Mix\n` +
       `• trial "Soybean Fungicide $50 Program"`,
     meta: { snapshotId }
   };
