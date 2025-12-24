@@ -165,20 +165,27 @@ app.post("/chat", async (req, res) => {
 
   const snap = await loadSnapshot({ force: false });
 
-  // For now: confirm we can see snapshot + return minimal meta
-  // (Next step we’ll use snap.json to answer real questions.)
+  // PROOF: list top-level keys + counts (no sensitive content)
+  const topKeys = snap?.json && typeof snap.json === "object" ? Object.keys(snap.json).slice(0, 20) : [];
+  const counts = {};
+  for (const k of topKeys) {
+    const v = snap.json[k];
+    counts[k] = Array.isArray(v) ? v.length : (v && typeof v === "object" ? Object.keys(v).length : (v == null ? 0 : 1));
+  }
+
   res.json({
-    answer: `Echo: ${q}`,
+    answer: `Snapshot loaded ✅ (id: ${snap.activeSnapshotId || "unknown"}). Ask me something next.`,
     meta: {
       receivedAt: new Date().toISOString(),
       snapshotId: snap.activeSnapshotId,
       snapshotUploadedAt: snap.uploadedAt,
       snapshotBytes: snap.bytes || 0,
-      snapshotOk: !!snap.json,
-      snapshotError: snap.lastError || null
+      topKeys,
+      counts
     }
   });
 });
+
 
 // --------------------------------------------------
 // Start server
