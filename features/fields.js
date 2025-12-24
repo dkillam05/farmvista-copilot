@@ -119,6 +119,8 @@ export function findFieldsRoot(snapshotJson) {
     ["export", "fields"],
     ["snapshot", "fields"],
     ["fv", "fields"]
+    ["data", "__collections__", "fields"],
+    ["__collections__", "fields"],
   ];
 
   for (const path of nestedCandidates) {
