@@ -1,9 +1,15 @@
+import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials.js";
+import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
-import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 
 export async function handleChat({ question, snapshot }) {
-  // Field-readiness weather (requires "field ..." and rain/temp keywords)
+  // Field Trials
+  if (canHandleFieldTrials(question)) {
+    return answerFieldTrials({ question, snapshot });
+  }
+
+  // Field-readiness weather (requires "field ..." + rain/temp)
   if (canHandleFieldReadinessWeather(question)) {
     return answerFieldReadinessWeather({ question, snapshot });
   }
@@ -21,9 +27,10 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
+      `• Trials: "trials summary", "trials pending", "trial <id>"\n` +
       `• Fields: "list fields", "field <name>"\n` +
       `• Grain: "grain summary", "grain bags"\n` +
-      `• Field Readiness Weather: "field <name> rain yesterday", "field <name> rain last 3 days", "field <name> temp now"`,
+      `• Weather: "field <name> rain yesterday"`,
     meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
   };
 }
