@@ -9,7 +9,7 @@ function getCollectionsRoot(snapshotJson){
 
 function colObj(colsRoot, name){
   if (!colsRoot || !colsRoot[name] || typeof colsRoot[name] !== "object") return null;
-  return colsRoot[name]; // object map
+  return colsRoot[name];
 }
 
 function colAsArray(colsRoot, name){
@@ -23,7 +23,6 @@ function colAsArray(colsRoot, name){
 }
 
 function parseTime(v){
-  // Firefoo exports timestamps like { "__time__": "2025-12-04T16:06:57.714Z" }
   if (!v) return null;
   if (typeof v === "string") {
     const ms = Date.parse(v);
@@ -43,72 +42,29 @@ function fmtDate(ms){
   }catch{ return null; }
 }
 
-function safeStr(v){
-  return (v == null) ? "" : String(v);
+function safeStr(v){ return (v == null) ? "" : String(v); }
+
+function includesAny(hay, needles){
+  const h = norm(hay);
+  return needles.some(n => h.includes(norm(n)));
 }
 
-function matchContains(hay, needle){
-  return norm(hay).includes(norm(needle));
-}
-
-function groupCount(list, keyFn){
-  const m = new Map();
-  for (const x of list) {
-    const k = keyFn(x) || "Unknown";
-    m.set(k, (m.get(k) || 0) + 1);
-  }
-  // return sorted array of [k,count]
-  return Array.from(m.entries()).sort((a,b)=> b[1]-a[1]);
-}
-
-function topN(arr, n){
-  return arr.slice(0, n);
-}
-
-function buildFieldIndex(fieldsArr){
-  // index by id + lowercased name
-  const byId = new Map();
-  const byName = new Map();
-  for (const f of fieldsArr) {
-    const id = safeStr(f.id || f.fieldId || f.docId);
-    if (id) byId.set(id, f);
-
-    const nm = safeStr(f.name || f.fieldName || f.label || f.title);
-    if (nm) byName.set(norm(nm), f);
-  }
-  return { byId, byName };
-}
-
-function buildFarmIndex(farmsArr){
-  const byId = new Map();
-  const byName = new Map();
-  for (const f of farmsArr) {
-    const id = safeStr(f.id || f.farmId || f.docId);
-    if (id) byId.set(id, f);
-
-    const nm = safeStr(f.name || f.farmName || f.label || f.title);
-    if (nm) byName.set(norm(nm), f);
-  }
-  return { byId, byName };
-}
-
-function labelField(fieldDoc){
-  if (!fieldDoc) return null;
-  const name = safeStr(fieldDoc.name || fieldDoc.fieldName || fieldDoc.label || fieldDoc.title).trim();
-  const farm = safeStr(fieldDoc.farmName || fieldDoc.farm || fieldDoc.farmLabel).trim();
-  if (name && farm) return `${name} (${farm})`;
-  return name || farm || null;
-}
-
-function labelFarm(farmDoc){
-  if (!farmDoc) return null;
-  const name = safeStr(farmDoc.name || farmDoc.farmName || farmDoc.label || farmDoc.title).trim();
-  return name || null;
+function buildSimpleSearchKey(t){
+  // A single searchable blob
+  return [
+    t.trialName,
+    t.trialType,
+    t.crop,
+    t.cropYear,
+    t.operationTask,
+    t.status,
+    t.treatmentProduct,
+    t.check,
+    t.notes
+  ].map(safeStr).join(" • ").toLowerCase();
 }
 
 function detectNestedKeys(trial){
-  // You mentioned: field, yieldBlocks, attachments, checks, trials, etc.
-  // We’ll report presence/counts without dumping content.
   const keys = ["yieldBlocks", "attachments", "checks", "trials", "trialRuns", "events", "photos", "maps", "notesLog"];
   const out = {};
   for (const k of keys) {
@@ -119,6 +75,32 @@ function detectNestedKeys(trial){
   return out;
 }
 
+function summarizeList(list, limit = 25){
+  const sorted = [...list].sort((a,b)=> (b.__updatedMs||0)-(a.__updatedMs||0));
+  const show = sorted.slice(0, limit);
+
+  const lines = show.map(t => {
+    const name = safeStr(t.trialName).trim() || "(No name)";
+    const type = safeStr(t.trialType).trim();
+    const crop = safeStr(t.crop).trim();
+    const year = t.cropYear != null ? String(t.cropYear) : "";
+    const status = safeStr(t.status).trim() || "";
+    const upd = fmtDate(t.__updatedMs) || fmtDate(t.__createdMs) || "";
+    const prod = safeStr(t.treatmentProduct).trim();
+
+    const bits = [];
+    if (type) bits.push(type);
+    if (crop || year) bits.push([crop, year].filter(Boolean).join(" "));
+    if (status) bits.push(status);
+    if (prod) bits.push(prod);
+    if (upd) bits.push(`updated ${upd}`);
+
+    return `• ${name}${bits.length ? ` — ${bits.join(" • ")}` : ""}`;
+  });
+
+  return lines.join("\n") + (list.length > limit ? `\n\n(Showing ${limit} of ${list.length})` : "");
+}
+
 // ----------------------------
 // Public API
 // ----------------------------
@@ -127,8 +109,8 @@ export function canHandleFieldTrials(question){
   if (!q) return false;
 
   if (q === "trials" || q === "field trials" || q === "trial" || q === "trials summary") return true;
-  if (q.startsWith("trials ")) return true;      // trials pending / trials year 2025 / trials crop corn
-  if (q.startsWith("trial ")) return true;       // trial <id> / trial "name"
+  if (q.startsWith("trials ")) return true;
+  if (q.startsWith("trial ")) return true;
   return false;
 }
 
@@ -139,200 +121,157 @@ export function answerFieldTrials({ question, snapshot }){
   const json = snapshot?.json || null;
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
 
-  if (!json) {
-    return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
-  }
+  if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
-  if (!colsRoot) {
-    return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
-  }
+  if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
   const trialsArr = colAsArray(colsRoot, "fieldTrials");
-  const fieldsArr = colAsArray(colsRoot, "fields");
-  const farmsArr  = colAsArray(colsRoot, "farms");
+  if (!trialsArr.length) return { answer: "No fieldTrials records found in the snapshot.", meta: { snapshotId } };
 
-  if (!trialsArr.length) {
-    return { answer: "No fieldTrials records found in the snapshot.", meta: { snapshotId } };
-  }
+  const trials = trialsArr.map(t => ({
+    ...t,
+    __createdMs: parseTime(t.createdAt),
+    __updatedMs: parseTime(t.updatedAt),
+    __search: buildSimpleSearchKey(t)
+  }));
 
-  const fieldIdx = buildFieldIndex(fieldsArr);
-  const farmIdx  = buildFarmIndex(farmsArr);
-
-  // enrich a trial with optional field/farm label if ids exist
-  function enrich(t){
-    const fieldId = safeStr(t.fieldId || t.field || t.fieldDocId || t.fieldKey).trim() || null;
-    const farmId  = safeStr(t.farmId || t.farm || t.farmDocId || t.farmKey).trim() || null;
-
-    const fieldDoc = fieldId ? fieldIdx.byId.get(fieldId) : null;
-    const farmDoc  = farmId ? farmIdx.byId.get(farmId) : null;
-
-    const createdMs = parseTime(t.createdAt);
-    const updatedMs = parseTime(t.updatedAt);
-
-    return {
-      ...t,
-      __fieldLabel: labelField(fieldDoc),
-      __farmLabel: labelFarm(farmDoc),
-      __createdMs: createdMs,
-      __updatedMs: updatedMs
-    };
-  }
-
-  const trials = trialsArr.map(enrich);
-
-  // ----------------------------
-  // Helpers for filtering
-  // ----------------------------
-  function filterByStatus(status){
-    const s = norm(status);
-    return trials.filter(t => norm(t.status) === s);
-  }
-
-  function filterByYear(year){
-    const y = Number(year);
-    return trials.filter(t => Number(t.cropYear) === y);
-  }
-
-  function filterByCrop(crop){
-    const c = norm(crop);
-    return trials.filter(t => norm(t.crop) === c);
-  }
-
-  function summarizeList(list, limit = 25){
-    const sorted = [...list].sort((a,b)=> (b.__updatedMs||0)-(a.__updatedMs||0));
-    const show = sorted.slice(0, limit);
-
-    const lines = show.map(t => {
-      const name = safeStr(t.trialName).trim() || "(No name)";
-      const type = safeStr(t.trialType).trim();
-      const crop = safeStr(t.crop).trim();
-      const year = t.cropYear != null ? String(t.cropYear) : "";
-      const status = safeStr(t.status).trim() || "";
-      const upd = fmtDate(t.__updatedMs) || fmtDate(t.__createdMs) || "";
-      const check = safeStr(t.check).trim();
-
-      const loc = t.__fieldLabel || t.__farmLabel || "";
-      const bits = [];
-      if (type) bits.push(type);
-      if (crop || year) bits.push([crop, year].filter(Boolean).join(" "));
-      if (status) bits.push(status);
-      if (check) bits.push(`check: ${check}`);
-      if (loc) bits.push(loc);
-      if (upd) bits.push(`updated ${upd}`);
-
-      return `• ${name}  (${t.id})${bits.length ? ` — ${bits.join(" • ")}` : ""}`;
-    });
-
-    return lines.join("\n") + (list.length > limit ? `\n\n(Showing ${limit} of ${list.length})` : "");
-  }
-
-  // ----------------------------
-  // Commands
-  // ----------------------------
+  // SUMMARY
   if (qn === "trials" || qn === "field trials" || qn === "trials summary") {
-    const byStatus = groupCount(trials, t => (t.status ? String(t.status) : "unknown"));
-    const byYear   = groupCount(trials, t => (t.cropYear != null ? String(t.cropYear) : "unknown"));
-    const byCrop   = groupCount(trials, t => (t.crop ? String(t.crop) : "unknown"));
-    const byType   = groupCount(trials, t => (t.trialType ? String(t.trialType) : "unknown"));
+    const total = trials.length;
+    const byStatus = new Map();
+    const byYear = new Map();
+    const byCrop = new Map();
+    const byType = new Map();
 
-    const lines = [];
-    lines.push(`Field Trials summary (snapshot ${snapshotId}):`);
-    lines.push(`• Total trials: ${trials.length}`);
+    for (const t of trials) {
+      const s = (t.status || "unknown").toString();
+      const y = (t.cropYear != null ? String(t.cropYear) : "unknown");
+      const c = (t.crop || "unknown").toString();
+      const tp = (t.trialType || "unknown").toString();
 
-    const fmtTop = (pairs) => topN(pairs, 5).map(([k,c]) => `${k}: ${c}`).join(", ");
+      byStatus.set(s, (byStatus.get(s) || 0) + 1);
+      byYear.set(y, (byYear.get(y) || 0) + 1);
+      byCrop.set(c, (byCrop.get(c) || 0) + 1);
+      byType.set(tp, (byType.get(tp) || 0) + 1);
+    }
 
-    lines.push(`• By status: ${fmtTop(byStatus)}`);
-    lines.push(`• By year: ${fmtTop(byYear)}`);
-    lines.push(`• By crop: ${fmtTop(byCrop)}`);
-    lines.push(`• By type: ${fmtTop(byType)}`);
+    const top5 = (m) => [...m.entries()].sort((a,b)=>b[1]-a[1]).slice(0,5).map(([k,v])=>`${k}: ${v}`).join(", ");
 
-    lines.push(`\nTry:`);
-    lines.push(`• "trials pending" / "trials active" / "trials completed"`);
-    lines.push(`• "trials year 2025"`);
-    lines.push(`• "trials crop corn"`);
-    lines.push(`• "trial <id>"`);
-
-    return { answer: lines.join("\n"), meta: { snapshotId, trialsCount: trials.length } };
-  }
-
-  // trials pending/active/completed
-  let m = /^trials\s+(pending|active|completed)\s*$/i.exec(q);
-  if (m) {
-    const status = m[1];
-    const list = filterByStatus(status);
     return {
-      answer: `Trials ${status} (${list.length}):\n\n` + (list.length ? summarizeList(list, 30) : "• none"),
-      meta: { snapshotId, status }
+      answer:
+        `Field Trials summary (snapshot ${snapshotId}):\n` +
+        `• Total trials: ${total}\n` +
+        `• By status: ${top5(byStatus)}\n` +
+        `• By year: ${top5(byYear)}\n` +
+        `• By crop: ${top5(byCrop)}\n` +
+        `• By type: ${top5(byType)}\n\n` +
+        `Try:\n` +
+        `• "trials status completed"\n` +
+        `• "trials year 2025"\n` +
+        `• "trials crop soybeans"\n` +
+        `• "trials type fungicides"\n` +
+        `• "trials product Butler Mix"\n` +
+        `• "trial soybean fungicide $50"`,
+      meta: { snapshotId, trialsCount: total }
     };
   }
 
-  // trials year 2025
-  m = /^trials\s+year\s+([0-9]{4})\s*$/i.exec(q);
+  // FILTERS: trials status / year / crop / type / product / name
+  let m =
+    /^trials\s+status\s+(.+)$/i.exec(q) ||
+    /^trials\s+year\s+([0-9]{4})$/i.exec(q) ||
+    /^trials\s+crop\s+(.+)$/i.exec(q) ||
+    /^trials\s+type\s+(.+)$/i.exec(q) ||
+    /^trials\s+product\s+(.+)$/i.exec(q) ||
+    /^trials\s+name\s+(.+)$/i.exec(q);
+
   if (m) {
-    const year = m[1];
-    const list = filterByYear(year);
+    // determine which matched by checking prefix
+    const lower = qn;
+
+    let list = trials;
+    let label = "";
+
+    if (lower.startsWith("trials status ")) {
+      const val = q.slice("trials status ".length).trim();
+      label = `status "${val}"`;
+      list = trials.filter(t => norm(t.status) === norm(val));
+    } else if (lower.startsWith("trials year ")) {
+      const val = q.slice("trials year ".length).trim();
+      label = `year ${val}`;
+      list = trials.filter(t => String(t.cropYear) === val);
+    } else if (lower.startsWith("trials crop ")) {
+      const val = q.slice("trials crop ".length).trim();
+      label = `crop "${val}"`;
+      list = trials.filter(t => norm(t.crop) === norm(val));
+    } else if (lower.startsWith("trials type ")) {
+      const val = q.slice("trials type ".length).trim();
+      label = `type "${val}"`;
+      list = trials.filter(t => norm(t.trialType).includes(norm(val)));
+    } else if (lower.startsWith("trials product ")) {
+      const val = q.slice("trials product ".length).trim();
+      label = `product "${val}"`;
+      list = trials.filter(t => norm(t.treatmentProduct).includes(norm(val)));
+    } else if (lower.startsWith("trials name ")) {
+      const val = q.slice("trials name ".length).trim();
+      label = `name contains "${val}"`;
+      list = trials.filter(t => norm(t.trialName).includes(norm(val)));
+    }
+
     return {
-      answer: `Trials for cropYear ${year} (${list.length}):\n\n` + (list.length ? summarizeList(list, 30) : "• none"),
-      meta: { snapshotId, year }
+      answer: `Trials for ${label} (${list.length}):\n\n` + (list.length ? summarizeList(list, 40) : "• none"),
+      meta: { snapshotId, filter: label, count: list.length }
     };
   }
 
-  // trials crop corn/soybeans
-  m = /^trials\s+crop\s+(.+)\s*$/i.exec(q);
-  if (m) {
-    const crop = m[1].trim();
-    const list = filterByCrop(crop);
-    return {
-      answer: `Trials for crop "${crop}" (${list.length}):\n\n` + (list.length ? summarizeList(list, 30) : "• none"),
-      meta: { snapshotId, crop }
-    };
-  }
-
-  // trial <id> OR trial "name"
+  // TRIAL lookup by: ID OR name-ish search
   m = /^trial\s+(.+)\s*$/i.exec(q);
   if (m) {
-    let needle = m[1].trim();
-    // allow quotes
+    let needle = (m[1] || "").trim();
     if ((needle.startsWith('"') && needle.endsWith('"')) || (needle.startsWith("'") && needle.endsWith("'"))) {
       needle = needle.slice(1, -1).trim();
     }
+    const needleN = norm(needle);
 
-    let found =
-      trials.find(t => t.id === needle) ||
-      trials.find(t => matchContains(t.trialName, needle)) ||
-      trials.find(t => matchContains(t.trialType, needle)) ||
-      null;
+    // 1) exact id
+    let found = trials.find(t => t.id === needle) || null;
+
+    // 2) exact trialName
+    if (!found) found = trials.find(t => norm(t.trialName) === needleN) || null;
+
+    // 3) contains in name/type/product/notes
+    if (!found) found = trials.find(t => t.__search.includes(needleN)) || null;
 
     if (!found) {
       return {
-        answer: `I couldn’t find a trial matching "${needle}". Try "trials summary" or "trials pending".`,
+        answer:
+          `I couldn’t find a trial matching "${needle}".\n\n` +
+          `Try:\n• trial "<full trial name>"\n• trials name ${needle}\n• trials product ${needle}\n• trials type ${needle}`,
         meta: { snapshotId }
       };
     }
 
-    const nested = detectNestedKeys(found);
     const created = fmtDate(found.__createdMs);
     const updated = fmtDate(found.__updatedMs);
+    const nested = detectNestedKeys(found);
 
     const lines = [];
-    lines.push(`Trial: ${safeStr(found.trialName).trim() || "(No name)"} (${found.id})`);
+    lines.push(`Trial: ${safeStr(found.trialName).trim() || "(No name)"}`);
+    lines.push(`• id: ${found.id}`);
     if (found.trialType) lines.push(`• type: ${found.trialType}`);
     if (found.crop || found.cropYear) lines.push(`• crop: ${[found.crop, found.cropYear].filter(Boolean).join(" ")}`);
     if (found.status) lines.push(`• status: ${found.status}`);
     if (found.operationTask) lines.push(`• task: ${found.operationTask}`);
     if (found.treatmentProduct) lines.push(`• treatmentProduct: ${found.treatmentProduct}`);
     if (found.check) lines.push(`• check: ${found.check}`);
-    if (found.__fieldLabel) lines.push(`• field: ${found.__fieldLabel}`);
-    if (found.__farmLabel) lines.push(`• farm: ${found.__farmLabel}`);
     if (created) lines.push(`• created: ${created}`);
     if (updated) lines.push(`• updated: ${updated}`);
     if (found.notes) lines.push(`• notes: ${safeStr(found.notes).trim()}`);
 
-    const nestedKeys = Object.keys(nested);
-    if (nestedKeys.length) {
-      lines.push(`• nested: ` + nestedKeys.map(k => `${k}(${nested[k]})`).join(", "));
-      lines.push(`(Ask: "trial ${found.id} yieldBlocks" etc. — we’ll add deep views next)`);
+    const nk = Object.keys(nested);
+    if (nk.length) {
+      lines.push(`• nested: ${nk.map(k => `${k}(${nested[k]})`).join(", ")}`);
     }
 
     return { answer: lines.join("\n"), meta: { snapshotId, trialId: found.id } };
@@ -342,10 +281,12 @@ export function answerFieldTrials({ question, snapshot }){
     answer:
       `Try:\n` +
       `• "trials summary"\n` +
-      `• "trials pending"\n` +
+      `• "trials status completed"\n` +
       `• "trials year 2025"\n` +
-      `• "trials crop corn"\n` +
-      `• "trial <id>"`,
+      `• "trials crop soybeans"\n` +
+      `• "trials type fungicides"\n` +
+      `• "trials product Butler Mix"\n` +
+      `• trial "Soybean Fungicide $50 Program"`,
     meta: { snapshotId }
   };
 }
