@@ -1,3 +1,5 @@
+// /chat/handleChat.js  (FULL FILE)
+
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
 import { canHandleBinSites, answerBinSites } from "../features/binSites.js";
@@ -7,6 +9,7 @@ import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials
 import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
+import { canHandleFarms, answerFarms } from "../features/farms.js";
 
 export async function handleChat({ question, snapshot }) {
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
@@ -18,10 +21,12 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFieldReadinessWeather(question)) return answerFieldReadinessWeather({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
+  if (canHandleFarms(question)) return answerFarms({ question, snapshot });
 
   return {
     answer:
       `Try:\n` +
+      `• Farms: "farms", "farm Pisgah", "active farms", "unused farms"\n` +
       `• Equipment: "equipment summary", "equipment type starfire", "equipment search 8R410"\n` +
       `• Boundaries: "boundaries open"\n` +
       `• Bin Sites: "binsites summary"\n` +
