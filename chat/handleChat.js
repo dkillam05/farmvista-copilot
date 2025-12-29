@@ -19,7 +19,49 @@ import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
 import { canHandleFieldMaintenance, answerFieldMaintenance } from "../features/fieldMaintenance.js";
 
+/* --------------------------------------------------
+   REPORT INTENT DETECTION
+-------------------------------------------------- */
+function wantsReport(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+
+  return (
+    t.includes("make this into a report") ||
+    t.includes("make this a report") ||
+    t.includes("turn this into a report") ||
+    t.includes("turn that into a report") ||
+    t.includes("print this") ||
+    t.includes("print that") ||
+    t.includes("print it") ||
+    t.includes("export this") ||
+    t.includes("export that") ||
+    t.includes("export it") ||
+    t.includes("pdf") ||
+    t.includes("save this as a pdf") ||
+    t.includes("i want this as a report") ||
+    t.includes("i need this as a report") ||
+    t.includes("can i get this as a report") ||
+    t.includes("can you make this a report")
+  );
+}
+
+/* --------------------------------------------------
+   MAIN CHAT ROUTER
+-------------------------------------------------- */
 export async function handleChat({ question, snapshot }) {
+  // 🚨 FIRST: check for report intent
+  if (wantsReport(question)) {
+    return {
+      answer: "Got it — generating a report from the last answer.",
+      action: "report",               // frontend will trigger /report
+      meta: {
+        intent: "report"
+      }
+    };
+  }
+
+  // Normal feature routing
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
   if (canHandleBoundaryRequests(question)) return answerBoundaryRequests({ question, snapshot });
   if (canHandleBinSites(question)) return answerBinSites({ question, snapshot });
@@ -39,27 +81,21 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
   if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
+  // Fallback help
   return {
     answer:
       `Try:\n` +
-      `• Vehicle regs: "vehicle registrations", "vehicle reg DJK-AG", "vehicle reg expiring", "vehicle reg vin 0123"\n` +
-      `• StarFire moves: "starfire moves", "starfire moves last 10", "starfire receiver 456789", "starfire moves from 8R370"\n` +
-      `• Pre-checks: "precheck templates", "precheck template spring startup", "precheck items", "precheck item tire"\n` +
-      `• RTK: "rtk towers", "rtk network 4010", "rtk tower Divernon", "rtk freq 464.05"\n` +
-      `• Products: "products summary", "seed list", "seed search 114", "chemical roundup", "fertilizer dap", "grain bags products"\n` +
-      `• Grain bags: "grain bags summary", "grain bags on hand", "grain bags events", "grain bags field 0501", "grain bags sku Up North 10x500"\n` +
-      `• Readiness latest: "readiness latest", "readiness top 10", "readiness bottom 10", "readiness <field name>"\n` +
-      `• Field Maintenance: "field maintenance pending", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
-      `• Farms: "farms", "farm Pisgah", "active farms", "unused farms"\n` +
-      `• Equipment: "equipment summary", "equipment type starfire", "equipment search 8R410"\n` +
-      `• Boundaries: "boundaries open"\n` +
-      `• Bin Sites: "binsites summary"\n` +
-      `• Bin Movements: "bins net last 7 days"\n` +
-      `• Aerial: "aerial summary"\n` +
-      `• Trials: "trials compare fungicide"\n` +
+      `• Vehicle regs: "vehicle registrations", "vehicle reg expiring"\n` +
+      `• StarFire: "starfire moves", "starfire receiver 456789"\n` +
+      `• Pre-checks: "precheck templates", "precheck items"\n` +
+      `• RTK: "rtk towers", "rtk network 4010"\n` +
+      `• Products: "products summary", "seed list"\n` +
       `• Grain: "grain summary"\n` +
-      `• Fields: "list fields"\n` +
-      `• Weather: "field <name> rain yesterday"`,
+      `• Fields: "list fields"\n\n` +
+      `When ready, just say:\n` +
+      `• "make this into a report"\n` +
+      `• "print this"\n` +
+      `• "export this as a pdf"`,
     meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
   };
 }
