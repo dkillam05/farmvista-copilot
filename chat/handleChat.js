@@ -8,6 +8,7 @@ import { canHandleAerialApplications, answerAerialApplications } from "../featur
 import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials.js";
 import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 import { canHandleFieldReadinessLatest, answerFieldReadinessLatest } from "../features/fieldReadinessLatest.js";
+import { canHandleGrainBagEvents, answerGrainBagEvents } from "../features/grainBagEvents.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
@@ -22,6 +23,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFieldTrials(question)) return answerFieldTrials({ question, snapshot });
   if (canHandleFieldReadinessWeather(question)) return answerFieldReadinessWeather({ question, snapshot });
   if (canHandleFieldReadinessLatest(question)) return answerFieldReadinessLatest({ question, snapshot });
+  if (canHandleGrainBagEvents(question)) return answerGrainBagEvents({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
@@ -30,6 +32,7 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
+      `• Grain bags: "grain bags summary", "grain bags on hand", "grain bags events", "grain bags field 0501", "grain bags sku Up North 10x500"\n` +
       `• Readiness latest: "readiness latest", "readiness top 10", "readiness bottom 10", "readiness <field name>"\n` +
       `• Field Maintenance: "field maintenance pending", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
       `• Farms: "farms", "farm Pisgah", "active farms", "unused farms"\n` +
