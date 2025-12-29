@@ -1,17 +1,13 @@
 // /features/fieldReadinessLatest.js  (FULL FILE)
-// Rev: 2025-12-29r  (Better answers + farm/field enrichment + more natural queries)
+// Rev: 2025-12-29r+debug  (Adds "readiness debug snapshot" to prove routing + snapshot contents)
 //
-// Fixes (per Dane):
-// ✅ Answers are more useful + “report-like”
+// Fixes kept:
 // ✅ Enrich missing farmName using farms + fields collections
 // ✅ Better defaults: show readiness bands + actionable counts
-// ✅ Better query support:
-//    - “how ready are fields”, “which fields can we plant”, “planting readiness”
-//    - “readiness by farm Pisgah”, “readiness farm Assumption”
-//    - “readiness between 60 and 80”, “readiness 90%+”, “readiness under 60”
-//    - “readiness field 0100”, “readiness 0710-CodyWaggner”
-// ✅ Top/bottom lists include farm + field and show computedAt/runKey
-// ✅ Keeps snapshot-safe behavior (no external calls)
+// ✅ Better query support
+//
+// NEW:
+// ✅ Debug command: "readiness debug snapshot" shows snapshot + collection presence
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -101,31 +97,25 @@ function extractAfter(q, label) {
 }
 
 function parseBetween(q) {
-  // readiness between 60 and 80
   let m = /\bbetween\s+(\d{1,3})\s*(?:%|percent)?\s+and\s+(\d{1,3})/i.exec(q);
   if (m) {
     const a = Math.max(0, Math.min(100, Number(m[1]) || 0));
     const b = Math.max(0, Math.min(100, Number(m[2]) || 0));
     return { min: Math.min(a, b), max: Math.max(a, b) };
   }
-
-  // readiness 60-80
   m = /\b(\d{1,3})\s*-\s*(\d{1,3})\b/.exec(q);
   if (m) {
     const a = Math.max(0, Math.min(100, Number(m[1]) || 0));
     const b = Math.max(0, Math.min(100, Number(m[2]) || 0));
     return { min: Math.min(a, b), max: Math.max(a, b) };
   }
-
   return { min: null, max: null };
 }
 
 function parseMinMax(q) {
-  // 90%+  OR  90+  OR  90 and up
   let m = /(\d{1,3})\s*%?\s*(and\s*up|\+|or\s*more)/i.exec(q);
   const min = m ? Math.max(0, Math.min(100, Number(m[1]) || 0)) : null;
 
-  // under 60 / below 60
   m = /(under|below|less\s+than)\s+(\d{1,3})\s*%?/i.exec(q);
   const max = m ? Math.max(0, Math.min(100, Number(m[2]) || 100)) : null;
 
@@ -133,7 +123,6 @@ function parseMinMax(q) {
 }
 
 function pickNeedle(q) {
-  // readiness <needle>
   let m =
     /^readiness\s+(.+)$/i.exec(q) ||
     /^field\s+readiness\s+(.+)$/i.exec(q) ||
@@ -150,10 +139,6 @@ function readinessBand(pct) {
   return "0-49";
 }
 
-function sortNewestFirst(a, b) {
-  return (b.__computedMs || 0) - (a.__computedMs || 0);
-}
-
 function fieldLabel(r) {
   return safeStr(r.fieldName).trim() || r.fieldId || r.id || "Field";
 }
@@ -165,6 +150,9 @@ function farmLabel(r) {
 export function canHandleFieldReadinessLatest(question) {
   const q = norm(question);
   if (!q) return false;
+
+  // Debug trigger (always)
+  if (q === "readiness debug snapshot" || q === "readiness debug" || q === "debug readiness") return true;
 
   // direct triggers
   if (q === "readiness" || q === "field readiness" || q === "readiness latest" || q === "field readiness latest") return true;
@@ -185,14 +173,51 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
 
   const json = snapshot?.json || null;
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
+
+  // ✅ DEBUG: tells us immediately if snapshot + collection exist
+  if (qn === "readiness debug snapshot" || qn === "readiness debug" || qn === "debug readiness") {
+    const lines = [];
+    lines.push(`Readiness debug`);
+    lines.push(`• snapshotId: ${snapshotId}`);
+    lines.push(`• snapshot.json: ${json ? "YES" : "NO"}`);
+
+    const colsRoot = json ? getCollectionsRoot(json) : null;
+    lines.push(`• collectionsRoot: ${colsRoot ? "YES" : "NO"}`);
+
+    if (colsRoot) {
+      const keys = Object.keys(colsRoot || {});
+      lines.push(`• collections keys (first 30): ${keys.slice(0, 30).join(", ")}${keys.length > 30 ? " …" : ""}`);
+
+      const rowsTest = colAsArray(colsRoot, "field_readiness_latest");
+      lines.push(`• field_readiness_latest docs: ${rowsTest.length}`);
+
+      const sample = rowsTest.slice(0, 3).map(r => {
+        const name = safeStr(r.fieldName).trim() || safeStr(r.fieldId).trim() || r.id;
+        const pct = clampPct(r.readiness);
+        return `${name}=${pct}%`;
+      });
+      if (sample.length) lines.push(`• sample: ${sample.join(" | ")}`);
+    }
+
+    return { answer: lines.join("\n"), meta: { snapshotId, intent: "readiness_debug" } };
+  }
+
   if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
   if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
-  // main readiness docs
   const rowsRaw = colAsArray(colsRoot, "field_readiness_latest");
-  if (!rowsRaw.length) return { answer: "No field_readiness_latest records found in the snapshot.", meta: { snapshotId } };
+  if (!rowsRaw.length) {
+    const keys = Object.keys(colsRoot || {});
+    return {
+      answer:
+        `I don’t see "field_readiness_latest" in the active snapshot (snapshotId: ${snapshotId}).\n` +
+        `Collections present (first 25): ${keys.slice(0, 25).join(", ")}${keys.length > 25 ? " …" : ""}\n\n` +
+        `Run: "readiness debug snapshot"`,
+      meta: { snapshotId, intent: "readiness_missing_collection" }
+    };
+  }
 
   // enrichment maps
   const farms = colAsArray(colsRoot, "farms");
@@ -205,12 +230,8 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   }
 
   const fieldById = new Map();
-  for (const f of fields) {
-    // typical fields doc has name + farmId/farmName
-    fieldById.set(f.id, f);
-  }
+  for (const f of fields) fieldById.set(f.id, f);
 
-  // normalize/enrich rows
   const rows = rowsRaw.map((r) => {
     const fieldDoc = fieldById.get(r.fieldId || r.id) || null;
 
@@ -246,42 +267,28 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const maxComputed = Math.max(...rows.map((r) => r.__computedMs || 0));
   const computedTxt = maxComputed ? fmtDateTime(maxComputed) : "";
 
-  // filters
   const farmNeedle = extractAfter(q, "farm");
   const fieldNeedle = extractAfter(q, "field");
-  const cropNeedle = extractAfter(q, "crop"); // future-proof (not used in these docs)
-  void cropNeedle;
-
   const fn = norm(farmNeedle);
   const fldn = norm(fieldNeedle);
 
   let list = rows.slice();
+  if (fn) list = list.filter((r) => norm(r.farmName).includes(fn) || norm(r.farmId) === fn);
+  if (fldn) list = list.filter((r) => norm(r.fieldName).includes(fldn) || norm(r.fieldId) === fldn);
 
-  if (fn) {
-    list = list.filter((r) => norm(r.farmName).includes(fn) || norm(r.farmId) === fn);
-  }
-  if (fldn) {
-    list = list.filter((r) => norm(r.fieldName).includes(fldn) || norm(r.fieldId) === fldn);
-  }
-
-  // numeric range filters
   const between = parseBetween(q);
   let { min, max } = parseMinMax(q);
   if (between.min != null) min = between.min;
   if (between.max != null) max = between.max;
-
   if (min != null) list = list.filter((r) => r.__readiness >= min);
   if (max != null) list = list.filter((r) => r.__readiness < max);
 
-  // intent: detail lookup by “readiness <name/id>”
   const needle = pickNeedle(q);
-
   const wantsTop = includesAny(qn, ["top", "highest", "best"]);
   const wantsBottom = includesAny(qn, ["bottom", "lowest", "worst"]);
-  const wantsSummary = includesAny(qn, ["summary", "overview"]) || qn === "readiness" || qn === "readiness latest" || qn === "field readiness" || qn === "field readiness latest";
-  const wantsActionable = includesAny(qn, ["which fields", "can we plant", "can we spray", "can we work", "how ready"]);
+  const wantsActionable = includesAny(qn, ["which fields", "can we plant", "can we spray", "can we work", "how ready"]) || qn.includes("plant right now");
 
-  // If user typed “readiness <something>” and it’s not list commands, treat as lookup
+  // Lookup
   if (needle && !includesAny(qn, ["top", "bottom", "highest", "lowest", "all", "summary", "overview"])) {
     const nn = norm(needle);
     const byId = rows.find((r) => r.fieldId === needle || r.id === needle) || null;
@@ -289,10 +296,7 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
     const r = byId || byName;
 
     if (!r) {
-      return {
-        answer: `No readiness record found for "${needle}". Try "readiness top 10" or "readiness latest".`,
-        meta: { snapshotId, intent: "readiness_lookup" }
-      };
+      return { answer: `No readiness record found for "${needle}". Try "readiness top 10" or "readiness latest".`, meta: { snapshotId } };
     }
 
     const lines = [];
@@ -308,13 +312,10 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
     if (w) lines.push(`• weather fetched: ${w}`);
     if (c) lines.push(`• computed: ${c}`);
 
-    return {
-      answer: lines.join("\n"),
-      meta: { snapshotId, intent: "readiness_lookup", fieldId: r.fieldId || null, readiness: r.__readiness }
-    };
+    return { answer: lines.join("\n"), meta: { snapshotId, intent: "readiness_lookup", fieldId: r.fieldId || null, readiness: r.__readiness } };
   }
 
-  // Top/Bottom lists
+  // Top/Bottom
   if (wantsTop || wantsBottom) {
     const n = parseLimit(q);
     const sorted = list.slice().sort((a, b) => wantsBottom ? (a.__readiness - b.__readiness) : (b.__readiness - a.__readiness));
@@ -323,30 +324,21 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
     const lines = shown.map((r) => {
       const nm = fieldLabel(r);
       const fm = farmLabel(r);
-      const fmBit = fm ? ` • ${fm}` : "";
-      return `• ${fmtInt(r.__readiness)}% — ${nm}${fmBit} (${r.fieldId || r.id || "?"})`;
+      return `• ${fmtInt(r.__readiness)}% — ${nm}${fm ? ` • ${fm}` : ""} (${r.fieldId || r.id || "?"})`;
     });
-
-    const label = wantsBottom ? `Bottom ${shown.length}` : `Top ${shown.length}`;
-    const filterBits = [];
-    if (fn) filterBits.push(`farm~"${farmNeedle}"`);
-    if (fldn) filterBits.push(`field~"${fieldNeedle}"`);
-    if (min != null) filterBits.push(`${min}%+`);
-    if (max != null) filterBits.push(`under ${max}%`);
 
     return {
       answer:
         `Field readiness latest (snapshot ${snapshotId}):\n` +
         (computedTxt ? `• computedAt: ${computedTxt}\n` : "") +
-        (filterBits.length ? `• filter: ${filterBits.join(" • ")}\n` : "") +
         `• matching fields: ${fmtInt(list.length)}\n\n` +
-        `${label}:\n` +
+        `${wantsBottom ? "Bottom" : "Top"} ${shown.length}:\n` +
         (lines.length ? lines.join("\n") : "No matches."),
       meta: { snapshotId, intent: wantsBottom ? "readiness_bottom" : "readiness_top", matching: list.length, shown: shown.length }
     };
   }
 
-  // Default summary (and “actionable” questions)
+  // Summary + actionable list
   const total = list.length;
   const avg = total ? (list.reduce((s, r) => s + r.__readiness, 0) / total) : 0;
   const hi = total ? Math.max(...list.map((r) => r.__readiness)) : 0;
@@ -355,67 +347,27 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const bands = new Map([["90-100", 0], ["70-89", 0], ["50-69", 0], ["0-49", 0]]);
   for (const r of list) bands.set(r.__band, (bands.get(r.__band) || 0) + 1);
 
-  // actionable recommendation: “ready now” = >= 85 by default (tweak later)
   const readyNowThreshold = 85;
   const readyNow = list.filter((r) => r.__readiness >= readyNowThreshold);
   const notReady = list.filter((r) => r.__readiness < readyNowThreshold);
 
-  // show a short “best candidates” list (top 10) when user asks “which fields can we plant”
-  const showCandidates = wantsActionable || qn.includes("plant") || qn.includes("spray") || qn.includes("tillage");
-  let candidates = [];
-  if (showCandidates) {
-    candidates = list.slice().sort((a, b) => b.__readiness - a.__readiness).slice(0, Math.min(10, list.length));
-  }
-
-  const filterBits = [];
-  if (fn) filterBits.push(`farm~"${farmNeedle}"`);
-  if (fldn) filterBits.push(`field~"${fieldNeedle}"`);
-  if (min != null) filterBits.push(`${min}%+`);
-  if (max != null) filterBits.push(`under ${max}%`);
-  if (between.min != null || between.max != null) filterBits.push(`between ${between.min}-${between.max}`);
-
-  const bandLine =
-    `• 90–100: ${fmtInt(bands.get("90-100") || 0)} • 70–89: ${fmtInt(bands.get("70-89") || 0)} • 50–69: ${fmtInt(bands.get("50-69") || 0)} • <50: ${fmtInt(bands.get("0-49") || 0)}`;
-
-  const candidatesLines = candidates.map((r) => {
-    const nm = fieldLabel(r);
-    const fm = farmLabel(r);
-    return `• ${fmtInt(r.__readiness)}% — ${nm}${fm ? ` • ${fm}` : ""}`;
-  });
+  const candidates = list.slice().sort((a, b) => b.__readiness - a.__readiness).slice(0, wantsActionable ? 10 : 15);
+  const lines = candidates.map((r) => `• ${fmtInt(r.__readiness)}% — ${fieldLabel(r)}${farmLabel(r) ? ` • ${farmLabel(r)}` : ""}`);
 
   return {
     answer:
       `Field readiness latest (snapshot ${snapshotId}):\n` +
       (computedTxt ? `• computedAt: ${computedTxt}\n` : "") +
-      (filterBits.length ? `• filter: ${filterBits.join(" • ")}\n` : "") +
       `• fields: ${fmtInt(total)} • avg: ${fmtInt(avg)}% • high: ${fmtInt(hi)}% • low: ${fmtInt(lo)}%\n` +
-      bandLine +
-      `\n\n` +
-      `Ready-now (>=${readyNowThreshold}%): ${fmtInt(readyNow.length)} • Not-ready: ${fmtInt(notReady.length)}` +
-      (showCandidates
-        ? `\n\nBest candidates:\n${candidatesLines.join("\n")}`
-        : "") +
+      `• 90–100: ${fmtInt(bands.get("90-100"))} • 70–89: ${fmtInt(bands.get("70-89"))} • 50–69: ${fmtInt(bands.get("50-69"))} • <50: ${fmtInt(bands.get("0-49"))}\n` +
+      `• Ready-now (>=${readyNowThreshold}%): ${fmtInt(readyNow.length)} • Not-ready: ${fmtInt(notReady.length)}\n\n` +
+      `${wantsActionable ? "Best candidates:" : "Top fields:"}\n` +
+      lines.join("\n") +
       `\n\nTry:\n` +
+      `• readiness debug snapshot\n` +
       `• readiness top 10\n` +
-      `• readiness bottom 10\n` +
       `• readiness under 60\n` +
-      `• readiness 90%+\n` +
-      `• readiness between 60 and 80\n` +
-      `• readiness farm "Assumption-Tville"\n` +
-      `• readiness "0710-CodyWaggner"`,
-    meta: {
-      snapshotId,
-      intent: wantsSummary ? "readiness_summary" : "readiness",
-      total,
-      avg,
-      hi,
-      lo,
-      bands: Object.fromEntries(bands),
-      computedAtMs: maxComputed || null,
-      readyNowThreshold,
-      readyNow: readyNow.length,
-      notReady: notReady.length,
-      matching: list.length
-    }
+      `• readiness farm "Assumption-Tville"`,
+    meta: { snapshotId, intent: "readiness_summary", total, readyNow: readyNow.length }
   };
 }
