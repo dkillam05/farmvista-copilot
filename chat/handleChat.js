@@ -10,6 +10,7 @@ import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
+import { canHandleFieldMaintenance, answerFieldMaintenance } from "../features/fieldMaintenance.js";
 
 export async function handleChat({ question, snapshot }) {
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
@@ -22,10 +23,12 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
+  if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
   return {
     answer:
       `Try:\n` +
+      `• Field Maintenance: "field maintenance open", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
       `• Farms: "farms", "farm Pisgah", "active farms", "unused farms"\n` +
       `• Equipment: "equipment summary", "equipment type starfire", "equipment search 8R410"\n` +
       `• Boundaries: "boundaries open"\n` +
