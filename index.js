@@ -47,8 +47,10 @@ app.post("/chat", async (req, res) => {
   if (!question) return res.status(400).json({ error: "Missing question" });
 
   const threadId = getThreadId(req);
+
   const history = await loadRecentHistory(threadId);
   const state = deriveStateFromHistory(history);
+
   const snap = await loadSnapshot({ force: false });
 
   const out = await handleChat({
@@ -95,59 +97,51 @@ app.post("/chat", async (req, res) => {
 // --------------------
 // Report (PDF)
 // --------------------
-// GET /report?threadId=xxx&mode=recent|conversation
+// Works in ALL cases now:
+// ✅ GET  /report?mode=recent         (threadId inferred from request via getThreadId(req))
+// ✅ GET  /report?threadId=xxx&mode=conversation
+// ✅ POST /report { threadId, mode }
+//
+// mode:
+//   - recent       => last 3 assistant answers
+//   - conversation => all assistant answers in thread
 // --------------------
 app.get("/report", async (req, res) => {
-  const threadId = (req.query?.threadId || "").toString().trim();
-  const mode = (req.query?.mode || "recent").toString();
+  const mode = (req.query?.mode || "recent").toString().trim().toLowerCase();
 
-  if (!threadId) {
-    return res.status(400).json({ error: "Missing threadId" });
+  // ✅ ThreadId can come from:
+  //  1) query param
+  //  2) inferred from request (same as /chat)
+  const threadId = (req.query?.threadId || "").toString().trim() || getThreadId(req);
+
+  try {
+    const pdf = await buildReportPdf({ threadId, mode });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'inline; filename="FarmVista-Report.pdf"');
+    return res.status(200).send(pdf);
+  } catch (e) {
+    console.error("[report] failed:", e?.message || e);
+    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
   }
+});
 
-  const history = await loadRecentHistory(threadId);
-  const assistants = history.filter(h => h.role === "assistant");
+app.post("/report", async (req, res) => {
+  const mode = (req.body?.mode || "recent").toString().trim().toLowerCase();
 
-  if (!assistants.length) {
-    return res.status(400).json({ error: "No assistant content to report" });
+  // ✅ ThreadId can come from:
+  //  1) body
+  //  2) inferred from request
+  const threadId = (req.body?.threadId || "").toString().trim() || getThreadId(req);
+
+  try {
+    const pdf = await buildReportPdf({ threadId, mode });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", 'inline; filename="FarmVista-Report.pdf"');
+    return res.status(200).send(pdf);
+  } catch (e) {
+    console.error("[report] failed:", e?.message || e);
+    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
   }
-
-  const selected =
-    mode === "conversation"
-      ? assistants
-      : assistants.slice(-3);
-
-  const title = inferTitle(history, selected);
-  const bodySections = selected.map((a, i) => ({
-    heading: `Section ${i + 1}`,
-    text: a.text
-  }));
-
-  const html = buildReportHtml({
-    title,
-    sections: bodySections,
-    snapshotId: selected[selected.length - 1]?.meta?.snapshotId || "unknown"
-  });
-
-  const pdfResp = await fetch(
-    "https://farmvista-pdf-300398089669.us-central1.run.app/pdf-html",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ html })
-    }
-  );
-
-  if (!pdfResp.ok) {
-    const t = await pdfResp.text();
-    console.error("[pdf] failed:", t);
-    return res.status(500).json({ error: "PDF generation failed" });
-  }
-
-  const buf = Buffer.from(await pdfResp.arrayBuffer());
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", "inline; filename=FarmVista-Report.pdf");
-  res.send(buf);
 });
 
 // --------------------
@@ -159,21 +153,70 @@ app.listen(PORT, () => {
 });
 
 // --------------------
-// helpers
+// Report builder (single place)
 // --------------------
-function inferTitle(history, sections) {
-  const first = history.find(h => h.role === "user");
-  if (first?.text) return first.text.slice(0, 64);
-  return "FarmVista Report";
+async function buildReportPdf({ threadId, mode }) {
+  if (!threadId) throw new Error("Missing threadId");
+
+  const history = await loadRecentHistory(threadId);
+  const assistants = history.filter(h => h.role === "assistant" && (h.text || "").trim());
+
+  if (!assistants.length) throw new Error("No assistant answers found for this thread.");
+
+  const selected = (mode === "conversation") ? assistants : assistants.slice(-3);
+
+  const title = inferReportTitle(history, selected);
+  const snapshotId = selected[selected.length - 1]?.meta?.snapshotId || "unknown";
+  const generatedAt = new Date().toLocaleString();
+
+  // “Normal FarmVista report feel” (static print-first)
+  const html = buildReportHtml({
+    title,
+    snapshotId,
+    generatedAt,
+    sections: selected.map((a, idx) => ({
+      heading: `Section ${idx + 1}`,
+      text: a.text
+    }))
+  });
+
+  // Your existing PDF service
+  const pdfResp = await fetch(
+    "https://farmvista-pdf-300398089669.us-central1.run.app/pdf-html",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ html })
+    }
+  );
+
+  if (!pdfResp.ok) {
+    const t = await safeReadText(pdfResp);
+    throw new Error(`PDF service failed (${pdfResp.status}): ${t || pdfResp.statusText}`);
+  }
+
+  return Buffer.from(await pdfResp.arrayBuffer());
 }
 
-function buildReportHtml({ title, sections, snapshotId }) {
-  return `
-<!doctype html>
+function inferReportTitle(history, selected) {
+  // Use the most recent user question before the first included assistant answer
+  const firstAssistant = selected[0];
+  const idx = history.indexOf(firstAssistant);
+  for (let i = idx - 1; i >= 0; i--) {
+    if (history[i].role === "user" && (history[i].text || "").trim()) {
+      return String(history[i].text).trim().slice(0, 72);
+    }
+  }
+  return "FarmVista Copilot Report";
+}
+
+function buildReportHtml({ title, snapshotId, generatedAt, sections }) {
+  const safeTitle = esc(title);
+  return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>${esc(title)}</title>
+  <title>${safeTitle}</title>
   <style>
     :root{
       --fv-green:#3B7E46;
@@ -210,7 +253,7 @@ function buildReportHtml({ title, sections, snapshotId }) {
     }
     .title{
       margin:0;
-      font-size:20px;
+      font-size:18px;
       font-weight:950;
       letter-spacing:.06em;
       text-transform:uppercase;
@@ -220,6 +263,7 @@ function buildReportHtml({ title, sections, snapshotId }) {
       color:var(--muted);
       line-height:1.35;
       text-align:right;
+      white-space:nowrap;
     }
     .summary{
       margin-top:10px;
@@ -236,12 +280,14 @@ function buildReportHtml({ title, sections, snapshotId }) {
       margin-top:16px;
       padding-top:14px;
       border-top:1px solid #EEF2F7;
+      break-inside:avoid;
+      page-break-inside:avoid;
     }
     .section h2{
       margin:0 0 8px;
-      font-size:13px;
-      font-weight:900;
-      letter-spacing:.06em;
+      font-size:12px;
+      font-weight:950;
+      letter-spacing:.10em;
       text-transform:uppercase;
       color:#111827;
     }
@@ -264,21 +310,27 @@ function buildReportHtml({ title, sections, snapshotId }) {
       font-size:10px;
       color:var(--muted);
     }
+    @media print{
+      body{ padding:0; background:#fff; }
+      .page{ max-width:none; border-radius:0; box-shadow:none; padding:9mm 10mm; }
+      .meta{ white-space:normal; }
+    }
   </style>
 </head>
 <body>
   <div class="page">
     <header class="hdr">
-      <h1 class="title">${esc(title)}</h1>
+      <h1 class="title">${safeTitle}</h1>
       <div class="meta">
         Snapshot: ${esc(snapshotId)}<br>
-        Generated: ${new Date().toLocaleString()}
+        Generated: ${esc(generatedAt)}
       </div>
     </header>
 
     <div class="summary">
       <strong>FarmVista Copilot Report</strong>
       <span>Sections: ${sections.length}</span>
+      <span>Mode: ${esc(String(sections.length > 3 ? "conversation" : "recent"))}</span>
     </div>
 
     ${sections.map(s => `
@@ -286,11 +338,11 @@ function buildReportHtml({ title, sections, snapshotId }) {
         <h2>${esc(s.heading)}</h2>
         <div class="card">${esc(s.text)}</div>
       </section>
-    `).join('')}
+    `).join("")}
 
     <footer class="footer">
       <div>Prepared via FarmVista Copilot</div>
-      <div>For sharing & printing</div>
+      <div>View / Share / Save</div>
     </footer>
   </div>
 </body>
@@ -302,4 +354,8 @@ function esc(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+async function safeReadText(resp) {
+  try { return await resp.text(); } catch { return ""; }
 }
