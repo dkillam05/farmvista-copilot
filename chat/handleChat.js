@@ -1,4 +1,5 @@
 // /chat/handleChat.js  (FULL FILE)
+// Rev: 2025-12-29s  (Hard-route readiness to Latest; thresholds only when asked)
 
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -41,34 +42,50 @@ function wantsReport(text) {
     (t.includes("everything so far") && (t.includes("report") || t.includes("pdf") || t.includes("print")))
   );
 }
-
 function wantsFullConversation(text) {
   const t = (text || "").toString().toLowerCase();
   return t.includes("everything") || t.includes("entire") || t.includes("whole conversation") || t.includes("so far");
 }
 
 /* --------------------------------------------------
-   READINESS ROUTING GUARD
-   - If user asks about “readiness” generally → Latest
-   - If user asks about weather/rain/forecast/thresholds → Weather module
+   READINESS HARD ROUTING
 -------------------------------------------------- */
-function isReadinessWeatherish(q) {
-  const t = (q || "").toString().toLowerCase();
+function norm(s) {
+  return (s || "").toString().trim().toLowerCase();
+}
+
+function isReadinessIntent(qn) {
+  if (!qn) return false;
+
+  // Direct
+  if (qn.includes("readiness")) return true;
+  if (qn.includes("field readiness")) return true;
+
+  // Natural phrasing
+  if (qn.includes("how ready") && qn.includes("field")) return true;
+  if (qn.includes("which fields") && (qn.includes("plant") || qn.includes("spray") || qn.includes("work") || qn.includes("till"))) return true;
+  if (qn.includes("can we plant") || qn.includes("can we spray") || qn.includes("can we till")) return true;
+
+  return false;
+}
+
+function isWeatherOrThresholdQuestion(qn) {
+  // Only route to the thresholds/weather module if they clearly ask for it.
   return (
-    t.includes("rain") ||
-    t.includes("rainfall") ||
-    t.includes("forecast") ||
-    t.includes("weather") ||
-    t.includes("precip") ||
-    t.includes("snow") ||
-    t.includes("temp") ||
-    t.includes("temperature") ||
-    t.includes("threshold") ||
-    t.includes("thresholds") ||
-    t.includes("operation threshold") ||
-    t.includes("planting threshold") ||
-    t.includes("spraying threshold") ||
-    t.includes("tillage threshold")
+    qn.includes("threshold") ||
+    qn.includes("thresholds") ||
+    qn.includes("operation threshold") ||
+    qn.includes("planting threshold") ||
+    qn.includes("spraying threshold") ||
+    qn.includes("tillage threshold") ||
+    qn.includes("weather") ||
+    qn.includes("forecast") ||
+    qn.includes("rain") ||
+    qn.includes("rainfall") ||
+    qn.includes("precip") ||
+    qn.includes("snow") ||
+    qn.includes("temperature") ||
+    qn.includes("temp")
   );
 }
 
@@ -76,7 +93,7 @@ function isReadinessWeatherish(q) {
    MAIN CHAT ROUTER
 -------------------------------------------------- */
 export async function handleChat({ question, snapshot }) {
-  // 🚨 report trigger (frontend should auto-open + show link)
+  // 🚨 report trigger
   if (wantsReport(question)) {
     const mode = wantsFullConversation(question) ? "conversation" : "recent";
     return {
@@ -89,18 +106,20 @@ export async function handleChat({ question, snapshot }) {
     };
   }
 
-  // ---- Readiness routing FIX ----
-  // If it’s a readiness query and NOT explicitly weather/thresholds → send to Latest first.
-  if (canHandleFieldReadinessLatest(question) && !isReadinessWeatherish(question)) {
+  const qn = norm(question);
+
+  // ✅ HARD OVERRIDE:
+  // If it’s a readiness question AND not explicitly weather/thresholds,
+  // we always use fieldReadinessLatest. No other module gets a chance.
+  if (isReadinessIntent(qn) && !isWeatherOrThresholdQuestion(qn)) {
+    // Even if canHandleFieldReadinessLatest is too strict, we still call it,
+    // because the user clearly asked for readiness.
     return answerFieldReadinessLatest({ question, snapshot });
   }
-  // If it’s weather/threshold oriented (or latest didn’t match) → weather handler
-  if (canHandleFieldReadinessWeather(question)) {
+
+  // If user explicitly asked about thresholds/weather, route to Weather module
+  if (isReadinessIntent(qn) && isWeatherOrThresholdQuestion(qn)) {
     return answerFieldReadinessWeather({ question, snapshot });
-  }
-  // (Also allow latest after weather for edge cases)
-  if (canHandleFieldReadinessLatest(question)) {
-    return answerFieldReadinessLatest({ question, snapshot });
   }
 
   // Other features
@@ -110,6 +129,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleBinMovements(question)) return answerBinMovements({ question, snapshot });
   if (canHandleAerialApplications(question)) return answerAerialApplications({ question, snapshot });
   if (canHandleFieldTrials(question)) return answerFieldTrials({ question, snapshot });
+
   if (canHandleGrainBagEvents(question)) return answerGrainBagEvents({ question, snapshot });
   if (canHandleProducts(question)) return answerProducts({ question, snapshot });
   if (canHandleRtkTowers(question)) return answerRtkTowers({ question, snapshot });
@@ -117,16 +137,18 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleStarfireMoves(question)) return answerStarfireMoves({ question, snapshot });
   if (canHandleVehicleRegistrations(question)) return answerVehicleRegistrations({ question, snapshot });
   if (canHandleCombineMetrics(question)) return answerCombineMetrics({ question, snapshot });
+
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
   if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
+  // fallback
   return {
     answer:
       `Try:\n` +
-      `• Readiness: "readiness summary", "readiness top 10", "readiness bottom 10", "readiness under 60", "readiness farm Assumption"\n` +
-      `• Weather/thresholds: "readiness thresholds", "field 0100 rain yesterday", "field 0513 forecast"\n` +
+      `• Readiness: "readiness summary", "readiness top 10", "readiness bottom 10", "which fields can we plant"\n` +
+      `• Thresholds/weather: "readiness thresholds", "field 0100 rain yesterday", "field 0513 forecast"\n` +
       `• Combine: "combine yield last 10", "combine loss last 10", "yield calibration last 10"\n` +
       `• Fields: "list fields"\n\n` +
       `When ready, say: "make this into a report" / "print this" / "export pdf"`,
