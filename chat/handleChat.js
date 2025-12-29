@@ -27,22 +27,23 @@ function wantsReport(text) {
   const t = text.toLowerCase();
 
   return (
-    t.includes("make this into a report") ||
-    t.includes("make this a report") ||
-    t.includes("turn this into a report") ||
-    t.includes("turn that into a report") ||
-    t.includes("print this") ||
-    t.includes("print that") ||
-    t.includes("print it") ||
-    t.includes("export this") ||
-    t.includes("export that") ||
-    t.includes("export it") ||
+    t.includes("report") ||
+    t.includes("print") ||
     t.includes("pdf") ||
-    t.includes("save this as a pdf") ||
-    t.includes("i want this as a report") ||
-    t.includes("i need this as a report") ||
-    t.includes("can i get this as a report") ||
-    t.includes("can you make this a report")
+    t.includes("export") ||
+    t.includes("make this") ||
+    t.includes("everything so far")
+  );
+}
+
+function wantsFullConversation(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+  return (
+    t.includes("everything") ||
+    t.includes("entire") ||
+    t.includes("whole conversation") ||
+    t.includes("so far")
   );
 }
 
@@ -50,18 +51,25 @@ function wantsReport(text) {
    MAIN CHAT ROUTER
 -------------------------------------------------- */
 export async function handleChat({ question, snapshot }) {
-  // 🚨 FIRST: check for report intent
+  // 🚨 Report intent short-circuit
   if (wantsReport(question)) {
+    const mode = wantsFullConversation(question) ? "conversation" : "recent";
+
     return {
-      answer: "Got it — generating a report from the last answer.",
-      action: "report",               // frontend will trigger /report
+      answer:
+        `✅ **Report generated**\n\n` +
+        `• The PDF has been opened for you.\n` +
+        `• You can re-open it anytime using the link below.`,
+      action: "report",
       meta: {
-        intent: "report"
+        intent: "report",
+        reportMode: mode,
+        reportUrl: `/report?mode=${mode}`
       }
     };
   }
 
-  // Normal feature routing
+  // Normal routing
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
   if (canHandleBoundaryRequests(question)) return answerBoundaryRequests({ question, snapshot });
   if (canHandleBinSites(question)) return answerBinSites({ question, snapshot });
@@ -81,21 +89,13 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
   if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
-  // Fallback help
   return {
     answer:
-      `Try:\n` +
-      `• Vehicle regs: "vehicle registrations", "vehicle reg expiring"\n` +
-      `• StarFire: "starfire moves", "starfire receiver 456789"\n` +
-      `• Pre-checks: "precheck templates", "precheck items"\n` +
-      `• RTK: "rtk towers", "rtk network 4010"\n` +
-      `• Products: "products summary", "seed list"\n` +
-      `• Grain: "grain summary"\n` +
-      `• Fields: "list fields"\n\n` +
-      `When ready, just say:\n` +
+      `Ask a question normally.\n\n` +
+      `When ready, say things like:\n` +
       `• "make this into a report"\n` +
       `• "print this"\n` +
-      `• "export this as a pdf"`,
+      `• "make a report of everything so far"`,
     meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
   };
 }
