@@ -1,3 +1,5 @@
+// index.js  (FULL FILE)
+
 import express from "express";
 
 import { corsMiddleware } from "./utils/cors.js";
@@ -5,6 +7,9 @@ import { getSnapshotStatus, reloadSnapshot, loadSnapshot } from "./context/snaps
 import { handleChat } from "./chat/handleChat.js";
 
 import { getThreadId, loadRecentHistory, deriveStateFromHistory, appendLogTurn } from "./context/copilotLogs.js";
+
+// NEW (reports)
+import { handleReport } from "./report/handleReport.js";
 
 const app = express();
 app.use(express.json({ limit: "4mb" }));
@@ -79,6 +84,71 @@ app.post("/chat", async (req, res) => {
       threadId
     }
   });
+});
+
+// --------------------
+// Report (PDF) — NO SAVING, just view/share
+// --------------------
+// POST /report  { question, title?, paper?, orientation? }
+app.post("/report", async (req, res) => {
+  const question = (req.body?.question || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing question" });
+
+  // Optional presentation knobs (safe defaults)
+  const title = (req.body?.title || "").toString().trim();
+  const paper = (req.body?.paper || "letter").toString().trim();         // letter|a4 (depends on pdf service)
+  const orientation = (req.body?.orientation || "portrait").toString().trim(); // portrait|landscape
+
+  // Ensure snapshot is loaded
+  const snap = await loadSnapshot({ force: false });
+
+  try {
+    const pdfBuf = await handleReport({
+      question,
+      title,
+      paper,
+      orientation,
+      snapshot: snap
+    });
+
+    const safeName = (title || "FarmVista-Report").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${safeName || "FarmVista-Report"}.pdf"`);
+    res.status(200).send(pdfBuf);
+  } catch (e) {
+    console.error("[report] failed:", e?.message || e);
+    res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
+  }
+});
+
+// GET /report?question=... (handy for testing / “open in new tab”)
+app.get("/report", async (req, res) => {
+  const question = (req.query?.question || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing question" });
+
+  const title = (req.query?.title || "").toString().trim();
+  const paper = (req.query?.paper || "letter").toString().trim();
+  const orientation = (req.query?.orientation || "portrait").toString().trim();
+
+  const snap = await loadSnapshot({ force: false });
+
+  try {
+    const pdfBuf = await handleReport({
+      question,
+      title,
+      paper,
+      orientation,
+      snapshot: snap
+    });
+
+    const safeName = (title || "FarmVista-Report").replace(/[^\w\- ]+/g, "").trim().replace(/\s+/g, "-");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${safeName || "FarmVista-Report"}.pdf"`);
+    res.status(200).send(pdfBuf);
+  } catch (e) {
+    console.error("[report] failed:", e?.message || e);
+    res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
+  }
 });
 
 // --------------------
