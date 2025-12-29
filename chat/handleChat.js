@@ -14,31 +14,34 @@ import { canHandleRtkTowers, answerRtkTowers } from "../features/rtkTowers.js";
 import { canHandleSeasonalPrecheck, answerSeasonalPrecheck } from "../features/seasonalPrecheck.js";
 import { canHandleStarfireMoves, answerStarfireMoves } from "../features/starfireMoves.js";
 import { canHandleVehicleRegistrations, answerVehicleRegistrations } from "../features/vehicleRegistrations.js";
+import { canHandleCombineMetrics, answerCombineMetrics } from "../features/combineMetrics.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
 import { canHandleFieldMaintenance, answerFieldMaintenance } from "../features/fieldMaintenance.js";
 
 /* --------------------------------------------------
-   REPORT INTENT DETECTION
+   REPORT INTENT DETECTION (no buttons)
 -------------------------------------------------- */
 function wantsReport(text) {
-  if (!text) return false;
-  const t = text.toLowerCase();
+  const t = (text || "").toString().toLowerCase();
+  if (!t) return false;
 
+  // broad but safe: requires a “report-ish” verb/noun
   return (
-    t.includes("report") ||
-    t.includes("print") ||
-    t.includes("pdf") ||
-    t.includes("export") ||
-    t.includes("make this") ||
-    t.includes("everything so far")
+    t.includes("make") && (t.includes("report") || t.includes("pdf") || t.includes("print")) ||
+    t.includes("turn") && (t.includes("report") || t.includes("pdf")) ||
+    t.includes("export") && (t.includes("pdf") || t.includes("report")) ||
+    t.includes("print this") ||
+    t.includes("print that") ||
+    t.includes("make this into a report") ||
+    t.includes("make a report of") ||
+    t.includes("report of everything") ||
+    t.includes("everything so far") && (t.includes("report") || t.includes("pdf") || t.includes("print"))
   );
 }
-
 function wantsFullConversation(text) {
-  if (!text) return false;
-  const t = text.toLowerCase();
+  const t = (text || "").toString().toLowerCase();
   return (
     t.includes("everything") ||
     t.includes("entire") ||
@@ -51,25 +54,20 @@ function wantsFullConversation(text) {
    MAIN CHAT ROUTER
 -------------------------------------------------- */
 export async function handleChat({ question, snapshot }) {
-  // 🚨 Report intent short-circuit
+  // 🚨 report trigger (frontend should: auto-open + also show link)
   if (wantsReport(question)) {
     const mode = wantsFullConversation(question) ? "conversation" : "recent";
-
     return {
       answer:
-        `✅ **Report generated**\n\n` +
-        `• The PDF has been opened for you.\n` +
-        `• You can re-open it anytime using the link below.`,
+        `✅ Report ready.\n` +
+        `I’m opening the PDF now.\n\n` +
+        `Open again: /report?mode=${mode}`,
       action: "report",
-      meta: {
-        intent: "report",
-        reportMode: mode,
-        reportUrl: `/report?mode=${mode}`
-      }
+      meta: { intent: "report", reportMode: mode, reportUrl: `/report?mode=${mode}` }
     };
   }
 
-  // Normal routing
+  // Feature routing
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
   if (canHandleBoundaryRequests(question)) return answerBoundaryRequests({ question, snapshot });
   if (canHandleBinSites(question)) return answerBinSites({ question, snapshot });
@@ -84,6 +82,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleSeasonalPrecheck(question)) return answerSeasonalPrecheck({ question, snapshot });
   if (canHandleStarfireMoves(question)) return answerStarfireMoves({ question, snapshot });
   if (canHandleVehicleRegistrations(question)) return answerVehicleRegistrations({ question, snapshot });
+  if (canHandleCombineMetrics(question)) return answerCombineMetrics({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
@@ -91,11 +90,15 @@ export async function handleChat({ question, snapshot }) {
 
   return {
     answer:
-      `Ask a question normally.\n\n` +
-      `When ready, say things like:\n` +
-      `• "make this into a report"\n` +
-      `• "print this"\n` +
-      `• "make a report of everything so far"`,
+      `Try:\n` +
+      `• Combine: "combine yield last 10", "combine loss last 10", "yield calibration last 10", "combine yield field 1027", "combine loss combine x9"\n` +
+      `• Vehicle regs: "vehicle registrations", "vehicle reg expiring"\n` +
+      `• StarFire: "starfire moves", "starfire receiver 456789"\n` +
+      `• Pre-checks: "precheck templates", "precheck items"\n` +
+      `• RTK: "rtk towers", "rtk network 4010"\n` +
+      `• Products: "products summary", "seed list"\n` +
+      `• Fields: "list fields"\n\n` +
+      `When ready, say: "make this into a report" / "print this" / "export pdf"`,
     meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
   };
 }
