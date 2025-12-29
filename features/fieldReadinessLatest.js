@@ -1,4 +1,17 @@
 // /features/fieldReadinessLatest.js  (FULL FILE)
+// Rev: 2025-12-29r  (Better answers + farm/field enrichment + more natural queries)
+//
+// Fixes (per Dane):
+// ✅ Answers are more useful + “report-like”
+// ✅ Enrich missing farmName using farms + fields collections
+// ✅ Better defaults: show readiness bands + actionable counts
+// ✅ Better query support:
+//    - “how ready are fields”, “which fields can we plant”, “planting readiness”
+//    - “readiness by farm Pisgah”, “readiness farm Assumption”
+//    - “readiness between 60 and 80”, “readiness 90%+”, “readiness under 60”
+//    - “readiness field 0100”, “readiness 0710-CodyWaggner”
+// ✅ Top/bottom lists include farm + field and show computedAt/runKey
+// ✅ Keeps snapshot-safe behavior (no external calls)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -33,7 +46,7 @@ function parseTime(v) {
 }
 
 function fmtDateTime(ms) {
-  if (!ms) return null;
+  if (!ms) return "";
   try {
     return new Date(ms).toLocaleString(undefined, {
       month: "short",
@@ -43,7 +56,7 @@ function fmtDateTime(ms) {
       minute: "2-digit"
     });
   } catch {
-    return null;
+    return "";
   }
 }
 
@@ -62,12 +75,61 @@ function fmtInt(n) {
   return v.toLocaleString();
 }
 
-function clamp01(v) {
+function clampPct(v) {
   const n = Number(v);
   if (!Number.isFinite(n)) return 0;
   if (n < 0) return 0;
   if (n > 100) return 100;
   return n;
+}
+
+function includesAny(qn, arr) {
+  return arr.some((s) => qn.includes(s));
+}
+
+function parseLimit(q) {
+  const m = /\b(top|bottom|last)\s+(\d{1,3})\b/i.exec(q);
+  if (!m) return 10;
+  const n = Number(m[2]) || 10;
+  return Math.max(1, Math.min(50, n));
+}
+
+function extractAfter(q, label) {
+  const re = new RegExp(`\\b${label}\\b\\s+(.+)$`, "i");
+  const m = re.exec(q);
+  return m ? stripQuotes(m[1]) : "";
+}
+
+function parseBetween(q) {
+  // readiness between 60 and 80
+  let m = /\bbetween\s+(\d{1,3})\s*(?:%|percent)?\s+and\s+(\d{1,3})/i.exec(q);
+  if (m) {
+    const a = Math.max(0, Math.min(100, Number(m[1]) || 0));
+    const b = Math.max(0, Math.min(100, Number(m[2]) || 0));
+    return { min: Math.min(a, b), max: Math.max(a, b) };
+  }
+
+  // readiness 60-80
+  m = /\b(\d{1,3})\s*-\s*(\d{1,3})\b/.exec(q);
+  if (m) {
+    const a = Math.max(0, Math.min(100, Number(m[1]) || 0));
+    const b = Math.max(0, Math.min(100, Number(m[2]) || 0));
+    return { min: Math.min(a, b), max: Math.max(a, b) };
+  }
+
+  return { min: null, max: null };
+}
+
+function parseMinMax(q) {
+  // 90%+  OR  90+  OR  90 and up
+  let m = /(\d{1,3})\s*%?\s*(and\s*up|\+|or\s*more)/i.exec(q);
+  const min = m ? Math.max(0, Math.min(100, Number(m[1]) || 0)) : null;
+
+  // under 60 / below 60
+  m = /(under|below|less\s+than)\s+(\d{1,3})\s*%?/i.exec(q);
+  const max = m ? Math.max(0, Math.min(100, Number(m[2]) || 100)) : null;
+
+  return { min, max };
 }
 
 function pickNeedle(q) {
@@ -80,21 +142,39 @@ function pickNeedle(q) {
   return m ? stripQuotes(m[1]) : "";
 }
 
-function includesAny(qn, arr) {
-  return arr.some((s) => qn.includes(s));
+function readinessBand(pct) {
+  const r = clampPct(pct);
+  if (r >= 90) return "90-100";
+  if (r >= 70) return "70-89";
+  if (r >= 50) return "50-69";
+  return "0-49";
+}
+
+function sortNewestFirst(a, b) {
+  return (b.__computedMs || 0) - (a.__computedMs || 0);
+}
+
+function fieldLabel(r) {
+  return safeStr(r.fieldName).trim() || r.fieldId || r.id || "Field";
+}
+
+function farmLabel(r) {
+  return safeStr(r.farmName).trim() || "";
 }
 
 export function canHandleFieldReadinessLatest(question) {
   const q = norm(question);
   if (!q) return false;
 
-  // broad triggers
+  // direct triggers
   if (q === "readiness" || q === "field readiness" || q === "readiness latest" || q === "field readiness latest") return true;
   if (q.startsWith("readiness")) return true;
   if (q.startsWith("field readiness")) return true;
 
-  // common alt phrasing
-  if (q.includes("readiness") && (q.includes("top") || q.includes("bottom") || q.includes("highest") || q.includes("lowest"))) return true;
+  // natural phrasing
+  if (q.includes("how ready") && q.includes("field")) return true;
+  if (q.includes("which fields") && (q.includes("plant") || q.includes("spray") || q.includes("work"))) return true;
+  if (q.includes("planting readiness") || q.includes("spraying readiness") || q.includes("tillage readiness")) return true;
 
   return false;
 }
@@ -110,107 +190,232 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const colsRoot = getCollectionsRoot(json);
   if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
-  const rows = colAsArray(colsRoot, "field_readiness_latest").map((r) => ({
-    ...r,
-    __computedMs: parseTime(r.computedAt) || null,
-    __wxMs: parseTime(r.weatherFetchedAt) || null,
-    __readiness: clamp01(r.readiness)
-  }));
+  // main readiness docs
+  const rowsRaw = colAsArray(colsRoot, "field_readiness_latest");
+  if (!rowsRaw.length) return { answer: "No field_readiness_latest records found in the snapshot.", meta: { snapshotId } };
 
-  if (!rows.length) return { answer: "No field_readiness_latest records found in the snapshot.", meta: { snapshotId } };
+  // enrichment maps
+  const farms = colAsArray(colsRoot, "farms");
+  const fields = colAsArray(colsRoot, "fields");
 
-  // overall snapshot freshness (most common computedAt)
-  const maxComputed = Math.max(...rows.map((r) => r.__computedMs || 0));
-  const computedTxt = fmtDateTime(maxComputed);
-
-  // detail lookup?  "readiness <field name/id>"
-  const needle = pickNeedle(q);
-  if (needle && !includesAny(qn, ["top", "bottom", "highest", "lowest", "all", "summary"])) {
-    const byId = rows.find((r) => r.fieldId === needle || r.id === needle) || null;
-    const nn = norm(needle);
-
-    const byName =
-      rows.find((r) => norm(r.fieldName).includes(nn)) ||
-      null;
-
-    const r = byId || byName;
-    if (!r) {
-      return { answer: `No readiness record found for "${needle}". Try "readiness top 10" or "readiness latest".`, meta: { snapshotId } };
-    }
-
-    const lines = [];
-    lines.push(`Field readiness: ${safeStr(r.fieldName).trim() || r.fieldId} (${r.fieldId})`);
-    lines.push(`• readiness: ${fmtInt(r.__readiness)}%`);
-    if (r.farmId) lines.push(`• farmId: ${r.farmId}`);
-    if (r.farmName) lines.push(`• farm: ${r.farmName}`);
-    if (r.runKey) lines.push(`• runKey: ${r.runKey}`);
-    if (r.timezone) lines.push(`• timezone: ${r.timezone}`);
-
-    const c = fmtDateTime(r.__computedMs);
-    const w = fmtDateTime(r.__wxMs);
-    if (w) lines.push(`• weather fetched: ${w}`);
-    if (c) lines.push(`• computed: ${c}`);
-
-    if (r.wetBiasApplied != null) lines.push(`• wetBiasApplied: ${safeStr(r.wetBiasApplied)}`);
-
-    return { answer: lines.join("\n"), meta: { snapshotId, fieldId: r.fieldId, readiness: r.__readiness } };
+  const farmById = new Map();
+  for (const f of farms) {
+    const name = safeStr(f.name).trim();
+    if (f.id) farmById.set(f.id, name || f.id);
   }
 
-  // top/bottom
-  let n = 10;
-  let m = /(top|bottom)\s+(\d{1,3})/i.exec(q);
-  if (m) n = Math.max(1, Math.min(50, Number(m[2]) || 10));
-  const wantsTop = qn.includes("top") || qn.includes("highest") || qn.includes("best");
-  const wantsBottom = qn.includes("bottom") || qn.includes("lowest") || qn.includes("worst");
+  const fieldById = new Map();
+  for (const f of fields) {
+    // typical fields doc has name + farmId/farmName
+    fieldById.set(f.id, f);
+  }
+
+  // normalize/enrich rows
+  const rows = rowsRaw.map((r) => {
+    const fieldDoc = fieldById.get(r.fieldId || r.id) || null;
+
+    const farmId =
+      safeStr(r.farmId).trim() ||
+      safeStr(fieldDoc?.farmId).trim() ||
+      "";
+
+    const farmName =
+      safeStr(r.farmName).trim() ||
+      safeStr(fieldDoc?.farmName).trim() ||
+      safeStr(farmById.get(farmId)).trim() ||
+      "";
+
+    const fieldName =
+      safeStr(r.fieldName).trim() ||
+      safeStr(fieldDoc?.name).trim() ||
+      safeStr(fieldDoc?.fieldName).trim() ||
+      "";
+
+    return {
+      ...r,
+      farmId: farmId || r.farmId || "",
+      farmName: farmName || r.farmName || "",
+      fieldName: fieldName || r.fieldName || "",
+      __computedMs: parseTime(r.computedAt) || null,
+      __wxMs: parseTime(r.weatherFetchedAt) || null,
+      __readiness: clampPct(r.readiness),
+      __band: readinessBand(r.readiness)
+    };
+  });
+
+  const maxComputed = Math.max(...rows.map((r) => r.__computedMs || 0));
+  const computedTxt = maxComputed ? fmtDateTime(maxComputed) : "";
 
   // filters
-  let min = null, max = null;
-  m = /(\d{1,3})\s*%?\s*(and\s*up|\+|or\s*more)/i.exec(q);
-  if (m) min = Math.max(0, Math.min(100, Number(m[1]) || 0));
-  m = /(under|below)\s+(\d{1,3})\s*%?/i.exec(q);
-  if (m) max = Math.max(0, Math.min(100, Number(m[2]) || 100));
+  const farmNeedle = extractAfter(q, "farm");
+  const fieldNeedle = extractAfter(q, "field");
+  const cropNeedle = extractAfter(q, "crop"); // future-proof (not used in these docs)
+  void cropNeedle;
+
+  const fn = norm(farmNeedle);
+  const fldn = norm(fieldNeedle);
 
   let list = rows.slice();
+
+  if (fn) {
+    list = list.filter((r) => norm(r.farmName).includes(fn) || norm(r.farmId) === fn);
+  }
+  if (fldn) {
+    list = list.filter((r) => norm(r.fieldName).includes(fldn) || norm(r.fieldId) === fldn);
+  }
+
+  // numeric range filters
+  const between = parseBetween(q);
+  let { min, max } = parseMinMax(q);
+  if (between.min != null) min = between.min;
+  if (between.max != null) max = between.max;
+
   if (min != null) list = list.filter((r) => r.__readiness >= min);
   if (max != null) list = list.filter((r) => r.__readiness < max);
 
-  // sort for output
-  if (wantsBottom) list.sort((a, b) => a.__readiness - b.__readiness);
-  else list.sort((a, b) => b.__readiness - a.__readiness); // default/top-ish
+  // intent: detail lookup by “readiness <name/id>”
+  const needle = pickNeedle(q);
 
-  // summary mode (default)
-  const total = rows.length;
-  const avg = rows.reduce((s, r) => s + r.__readiness, 0) / (total || 1);
-  const hi = Math.max(...rows.map((r) => r.__readiness));
-  const lo = Math.min(...rows.map((r) => r.__readiness));
+  const wantsTop = includesAny(qn, ["top", "highest", "best"]);
+  const wantsBottom = includesAny(qn, ["bottom", "lowest", "worst"]);
+  const wantsSummary = includesAny(qn, ["summary", "overview"]) || qn === "readiness" || qn === "readiness latest" || qn === "field readiness" || qn === "field readiness latest";
+  const wantsActionable = includesAny(qn, ["which fields", "can we plant", "can we spray", "can we work", "how ready"]);
 
-  // pick shown
-  const showCount = (wantsTop || wantsBottom) ? n : Math.min(15, list.length);
-  const shown = list.slice(0, showCount);
+  // If user typed “readiness <something>” and it’s not list commands, treat as lookup
+  if (needle && !includesAny(qn, ["top", "bottom", "highest", "lowest", "all", "summary", "overview"])) {
+    const nn = norm(needle);
+    const byId = rows.find((r) => r.fieldId === needle || r.id === needle) || null;
+    const byName = rows.find((r) => norm(fieldLabel(r)).includes(nn)) || null;
+    const r = byId || byName;
 
-  const lines = shown.map((r) => {
-    const nm = safeStr(r.fieldName).trim() || r.fieldId;
-    const farm = safeStr(r.farmName).trim();
-    const farmBit = farm ? ` • ${farm}` : "";
-    return `• ${fmtInt(r.__readiness)}% — ${nm}${farmBit} (${r.fieldId})`;
+    if (!r) {
+      return {
+        answer: `No readiness record found for "${needle}". Try "readiness top 10" or "readiness latest".`,
+        meta: { snapshotId, intent: "readiness_lookup" }
+      };
+    }
+
+    const lines = [];
+    lines.push(`Field readiness: ${fieldLabel(r)} (${r.fieldId || r.id || "?"})`);
+    if (farmLabel(r)) lines.push(`• farm: ${farmLabel(r)}${r.farmId ? ` (${r.farmId})` : ""}`);
+    lines.push(`• readiness: ${fmtInt(r.__readiness)}%`);
+    if (r.wetBiasApplied != null) lines.push(`• wetBiasApplied: ${safeStr(r.wetBiasApplied)}`);
+    if (r.runKey) lines.push(`• runKey: ${r.runKey}`);
+    if (r.timezone) lines.push(`• timezone: ${r.timezone}`);
+
+    const w = r.__wxMs ? fmtDateTime(r.__wxMs) : "";
+    const c = r.__computedMs ? fmtDateTime(r.__computedMs) : "";
+    if (w) lines.push(`• weather fetched: ${w}`);
+    if (c) lines.push(`• computed: ${c}`);
+
+    return {
+      answer: lines.join("\n"),
+      meta: { snapshotId, intent: "readiness_lookup", fieldId: r.fieldId || null, readiness: r.__readiness }
+    };
+  }
+
+  // Top/Bottom lists
+  if (wantsTop || wantsBottom) {
+    const n = parseLimit(q);
+    const sorted = list.slice().sort((a, b) => wantsBottom ? (a.__readiness - b.__readiness) : (b.__readiness - a.__readiness));
+    const shown = sorted.slice(0, n);
+
+    const lines = shown.map((r) => {
+      const nm = fieldLabel(r);
+      const fm = farmLabel(r);
+      const fmBit = fm ? ` • ${fm}` : "";
+      return `• ${fmtInt(r.__readiness)}% — ${nm}${fmBit} (${r.fieldId || r.id || "?"})`;
+    });
+
+    const label = wantsBottom ? `Bottom ${shown.length}` : `Top ${shown.length}`;
+    const filterBits = [];
+    if (fn) filterBits.push(`farm~"${farmNeedle}"`);
+    if (fldn) filterBits.push(`field~"${fieldNeedle}"`);
+    if (min != null) filterBits.push(`${min}%+`);
+    if (max != null) filterBits.push(`under ${max}%`);
+
+    return {
+      answer:
+        `Field readiness latest (snapshot ${snapshotId}):\n` +
+        (computedTxt ? `• computedAt: ${computedTxt}\n` : "") +
+        (filterBits.length ? `• filter: ${filterBits.join(" • ")}\n` : "") +
+        `• matching fields: ${fmtInt(list.length)}\n\n` +
+        `${label}:\n` +
+        (lines.length ? lines.join("\n") : "No matches."),
+      meta: { snapshotId, intent: wantsBottom ? "readiness_bottom" : "readiness_top", matching: list.length, shown: shown.length }
+    };
+  }
+
+  // Default summary (and “actionable” questions)
+  const total = list.length;
+  const avg = total ? (list.reduce((s, r) => s + r.__readiness, 0) / total) : 0;
+  const hi = total ? Math.max(...list.map((r) => r.__readiness)) : 0;
+  const lo = total ? Math.min(...list.map((r) => r.__readiness)) : 0;
+
+  const bands = new Map([["90-100", 0], ["70-89", 0], ["50-69", 0], ["0-49", 0]]);
+  for (const r of list) bands.set(r.__band, (bands.get(r.__band) || 0) + 1);
+
+  // actionable recommendation: “ready now” = >= 85 by default (tweak later)
+  const readyNowThreshold = 85;
+  const readyNow = list.filter((r) => r.__readiness >= readyNowThreshold);
+  const notReady = list.filter((r) => r.__readiness < readyNowThreshold);
+
+  // show a short “best candidates” list (top 10) when user asks “which fields can we plant”
+  const showCandidates = wantsActionable || qn.includes("plant") || qn.includes("spray") || qn.includes("tillage");
+  let candidates = [];
+  if (showCandidates) {
+    candidates = list.slice().sort((a, b) => b.__readiness - a.__readiness).slice(0, Math.min(10, list.length));
+  }
+
+  const filterBits = [];
+  if (fn) filterBits.push(`farm~"${farmNeedle}"`);
+  if (fldn) filterBits.push(`field~"${fieldNeedle}"`);
+  if (min != null) filterBits.push(`${min}%+`);
+  if (max != null) filterBits.push(`under ${max}%`);
+  if (between.min != null || between.max != null) filterBits.push(`between ${between.min}-${between.max}`);
+
+  const bandLine =
+    `• 90–100: ${fmtInt(bands.get("90-100") || 0)} • 70–89: ${fmtInt(bands.get("70-89") || 0)} • 50–69: ${fmtInt(bands.get("50-69") || 0)} • <50: ${fmtInt(bands.get("0-49") || 0)}`;
+
+  const candidatesLines = candidates.map((r) => {
+    const nm = fieldLabel(r);
+    const fm = farmLabel(r);
+    return `• ${fmtInt(r.__readiness)}% — ${nm}${fm ? ` • ${fm}` : ""}`;
   });
-
-  const modeLabel = wantsBottom ? `Bottom ${showCount}` : (wantsTop ? `Top ${showCount}` : `Latest snapshot`);
 
   return {
     answer:
       `Field readiness latest (snapshot ${snapshotId}):\n` +
       (computedTxt ? `• computedAt: ${computedTxt}\n` : "") +
+      (filterBits.length ? `• filter: ${filterBits.join(" • ")}\n` : "") +
       `• fields: ${fmtInt(total)} • avg: ${fmtInt(avg)}% • high: ${fmtInt(hi)}% • low: ${fmtInt(lo)}%\n` +
-      ((min != null || max != null) ? `• filter: ${min != null ? `${min}%+` : ""}${(min != null && max != null) ? " " : ""}${max != null ? `under ${max}%` : ""}\n` : "") +
-      `\n${modeLabel}:\n` +
-      lines.join("\n") +
+      bandLine +
+      `\n\n` +
+      `Ready-now (>=${readyNowThreshold}%): ${fmtInt(readyNow.length)} • Not-ready: ${fmtInt(notReady.length)}` +
+      (showCandidates
+        ? `\n\nBest candidates:\n${candidatesLines.join("\n")}`
+        : "") +
       `\n\nTry:\n` +
       `• readiness top 10\n` +
       `• readiness bottom 10\n` +
       `• readiness under 60\n` +
       `• readiness 90%+\n` +
+      `• readiness between 60 and 80\n` +
+      `• readiness farm "Assumption-Tville"\n` +
       `• readiness "0710-CodyWaggner"`,
-    meta: { snapshotId, total, avg, hi, lo, shown: shown.length, matching: list.length, computedAtMs: maxComputed || null }
+    meta: {
+      snapshotId,
+      intent: wantsSummary ? "readiness_summary" : "readiness",
+      total,
+      avg,
+      hi,
+      lo,
+      bands: Object.fromEntries(bands),
+      computedAtMs: maxComputed || null,
+      readyNowThreshold,
+      readyNow: readyNow.length,
+      notReady: notReady.length,
+      matching: list.length
+    }
   };
 }
