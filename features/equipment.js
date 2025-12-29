@@ -53,8 +53,22 @@ function buildMakeMap(makesArr){
   return { byId, byLower };
 }
 
+function buildModelMap(modelsArr){
+  const byId = new Map();
+  const byLower = new Map();
+  for (const m of modelsArr) {
+    const id = safeStr(m.id).trim();
+    const name = safeStr(m.name).trim();
+    const lower = safeStr(m.nameLower).trim().toLowerCase() || norm(name);
+    const makeId = safeStr(m.makeId).trim();
+
+    if (id) byId.set(id, { id, name: name || id, makeId });
+    if (lower) byLower.set(lower, { id, name: name || id, makeId });
+  }
+  return { byId, byLower };
+}
+
 function effectiveMakeName(e, makeMap){
-  // Prefer equipment doc makeName, else resolve makeId via map
   const mn = safeStr(e.makeName).trim();
   if (mn) return mn;
   const id = safeStr(e.makeId).trim();
@@ -62,9 +76,17 @@ function effectiveMakeName(e, makeMap){
   return "";
 }
 
-function summarizeOne(e, makeMap){
+function effectiveModelName(e, modelMap){
+  const mn = safeStr(e.modelName).trim();
+  if (mn) return mn;
+  const id = safeStr(e.modelId).trim();
+  if (id && modelMap.byId.has(id)) return modelMap.byId.get(id).name;
+  return "";
+}
+
+function summarizeOne(e, makeMap, modelMap){
   const make = effectiveMakeName(e, makeMap);
-  const model = safeStr(e.modelName).trim();
+  const model = effectiveModelName(e, modelMap);
   const name = safeStr(e.name).trim() || `${make} ${model}`.trim() || "Equipment";
 
   const type = safeStr(e.type).trim() || "unknown";
@@ -122,14 +144,17 @@ export function answerEquipment({ question, snapshot }){
   if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
   const makesArr = colAsArray(colsRoot, "equipment-makes");
+  const modelsArr = colAsArray(colsRoot, "equipment-models");
   const makeMap = buildMakeMap(makesArr);
+  const modelMap = buildModelMap(modelsArr);
 
   const items = colAsArray(colsRoot, "equipment").map(e => ({
     ...e,
     __createdMs: parseTime(e.createdAt) || null,
     __updatedMs: parseTime(e.updatedAt) || null,
     __status: normalizeStatus(e.status),
-    __makeResolved: effectiveMakeName(e, makeMap)
+    __makeResolved: effectiveMakeName(e, makeMap),
+    __modelResolved: effectiveModelName(e, modelMap)
   }));
 
   if (!items.length) return { answer: "No equipment records found in the snapshot.", meta: { snapshotId } };
@@ -138,6 +163,7 @@ export function answerEquipment({ question, snapshot }){
   if (qn === "equipment" || qn === "equipment summary") {
     const byType = groupCount(items, x => x.type);
     const byMake = groupCount(items, x => x.__makeResolved || x.makeName || x.makeId);
+    const byModel = groupCount(items, x => x.__modelResolved || x.modelName || x.modelId);
     const byStatus = groupCount(items, x => x.status);
 
     return {
@@ -146,14 +172,16 @@ export function answerEquipment({ question, snapshot }){
         `• Total: ${items.length}\n` +
         `• By type: ${topPairs(byType)}\n` +
         `• By make: ${topPairs(byMake)}\n` +
+        `• By model: ${topPairs(byModel)}\n` +
         `• By status: ${topPairs(byStatus)}\n\n` +
         `Try:\n` +
         `• equipment type starfire\n` +
         `• equipment make John Deere\n` +
-        `• equipment search SF6000\n` +
+        `• equipment model SF6000\n` +
+        `• equipment search 8R410\n` +
         `• equipment <id>\n` +
         `• equipment qr <id>`,
-      meta: { snapshotId, total: items.length, makesKnown: makesArr.length }
+      meta: { snapshotId, total: items.length, makesKnown: makesArr.length, modelsKnown: modelsArr.length }
     };
   }
 
@@ -162,7 +190,7 @@ export function answerEquipment({ question, snapshot }){
   if (m) {
     const type = m[1].trim();
     const list = items.filter(x => norm(x.type) === norm(type));
-    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap));
+    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
       answer: `Equipment type "${type}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
@@ -170,7 +198,7 @@ export function answerEquipment({ question, snapshot }){
     };
   }
 
-  // equipment make <makeName> (matches makeName OR resolved makeId)
+  // equipment make <makeName>
   m = /^equipment\s+make\s+(.+)\s*$/i.exec(q);
   if (m) {
     const makeNeedle = m[1].trim();
@@ -184,11 +212,33 @@ export function answerEquipment({ question, snapshot }){
       return resolved.includes(nn) || raw.includes(nn) || byIdName.includes(nn);
     });
 
-    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap));
+    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
       answer: `Equipment make "${makeNeedle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
       meta: { snapshotId, make: makeNeedle, count: list.length }
+    };
+  }
+
+  // equipment model <modelName> (matches resolved model, raw modelName, or modelId)
+  m = /^equipment\s+model\s+(.+)\s*$/i.exec(q);
+  if (m) {
+    const modelNeedle = m[1].trim();
+    const nn = norm(modelNeedle);
+
+    const list = items.filter(x => {
+      const resolved = norm(x.__modelResolved);
+      const raw = norm(x.modelName);
+      const id = safeStr(x.modelId).trim();
+      const byIdName = id && modelMap.byId.has(id) ? norm(modelMap.byId.get(id).name) : "";
+      return resolved.includes(nn) || raw.includes(nn) || byIdName.includes(nn) || norm(id) === nn;
+    });
+
+    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
+
+    return {
+      answer: `Equipment model "${modelNeedle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
+      meta: { snapshotId, model: modelNeedle, count: list.length }
     };
   }
 
@@ -203,6 +253,7 @@ export function answerEquipment({ question, snapshot }){
         x.name,
         x.__makeResolved,
         x.makeName,
+        x.__modelResolved,
         x.modelName,
         x.serial,
         x.type,
@@ -213,7 +264,7 @@ export function answerEquipment({ question, snapshot }){
       return blob.includes(nn);
     });
 
-    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap));
+    const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
       answer: `Equipment search "${needle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
@@ -256,7 +307,7 @@ export function answerEquipment({ question, snapshot }){
     const updated = fmtDate(found.__updatedMs);
 
     const make = effectiveMakeName(found, makeMap);
-    const model = safeStr(found.modelName).trim();
+    const model = effectiveModelName(found, modelMap);
 
     const lines = [];
     lines.push(`Equipment: ${safeStr(found.name).trim() || "(No name)"} (${found.id})`);
@@ -290,7 +341,8 @@ export function answerEquipment({ question, snapshot }){
       `• equipment summary\n` +
       `• equipment type starfire\n` +
       `• equipment make John Deere\n` +
-      `• equipment search SF6000\n` +
+      `• equipment model SF6000\n` +
+      `• equipment search 8R410\n` +
       `• equipment <id>\n` +
       `• equipment qr <id>`,
     meta: { snapshotId }
