@@ -9,6 +9,7 @@ import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials
 import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 import { canHandleFieldReadinessLatest, answerFieldReadinessLatest } from "../features/fieldReadinessLatest.js";
 import { canHandleGrainBagEvents, answerGrainBagEvents } from "../features/grainBagEvents.js";
+import { canHandleProducts, answerProducts } from "../features/products.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
@@ -24,6 +25,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFieldReadinessWeather(question)) return answerFieldReadinessWeather({ question, snapshot });
   if (canHandleFieldReadinessLatest(question)) return answerFieldReadinessLatest({ question, snapshot });
   if (canHandleGrainBagEvents(question)) return answerGrainBagEvents({ question, snapshot });
+  if (canHandleProducts(question)) return answerProducts({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
@@ -32,6 +34,7 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
+      `• Products: "products summary", "seed list", "seed search 114", "chemical roundup", "fertilizer dap", "grain bags products"\n` +
       `• Grain bags: "grain bags summary", "grain bags on hand", "grain bags events", "grain bags field 0501", "grain bags sku Up North 10x500"\n` +
       `• Readiness latest: "readiness latest", "readiness top 10", "readiness bottom 10", "readiness <field name>"\n` +
       `• Field Maintenance: "field maintenance pending", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
