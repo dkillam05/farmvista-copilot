@@ -7,6 +7,7 @@ import { canHandleBinMovements, answerBinMovements } from "../features/binMoveme
 import { canHandleAerialApplications, answerAerialApplications } from "../features/aerialApplications.js";
 import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials.js";
 import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
+import { canHandleFieldReadinessLatest, answerFieldReadinessLatest } from "../features/fieldReadinessLatest.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
@@ -20,6 +21,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleAerialApplications(question)) return answerAerialApplications({ question, snapshot });
   if (canHandleFieldTrials(question)) return answerFieldTrials({ question, snapshot });
   if (canHandleFieldReadinessWeather(question)) return answerFieldReadinessWeather({ question, snapshot });
+  if (canHandleFieldReadinessLatest(question)) return answerFieldReadinessLatest({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
@@ -28,7 +30,8 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
-      `• Field Maintenance: "field maintenance open", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
+      `• Readiness latest: "readiness latest", "readiness top 10", "readiness bottom 10", "readiness <field name>"\n` +
+      `• Field Maintenance: "field maintenance pending", "field maintenance needs approved", "field maintenance by farm Pisgah", "field maintenance topic washout"\n` +
       `• Farms: "farms", "farm Pisgah", "active farms", "unused farms"\n` +
       `• Equipment: "equipment summary", "equipment type starfire", "equipment search 8R410"\n` +
       `• Boundaries: "boundaries open"\n` +
