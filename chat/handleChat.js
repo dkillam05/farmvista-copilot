@@ -1,5 +1,6 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2025-12-29-hardroute (Readiness is hard-routed to fieldReadinessLatest)
+// Rev: 2025-12-29-hardroute-clean (Removed fieldReadinessWeather; readiness always uses fieldReadinessLatest)
+// NOTE: Dane is deleting /features/fieldReadinessWeather.js — this file removes all refs so build won't break.
 
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -9,7 +10,6 @@ import { canHandleAerialApplications, answerAerialApplications } from "../featur
 import { canHandleFieldTrials, answerFieldTrials } from "../features/fieldTrials.js";
 
 import { answerFieldReadinessLatest } from "../features/fieldReadinessLatest.js";
-import { canHandleFieldReadinessWeather, answerFieldReadinessWeather } from "../features/fieldReadinessWeather.js";
 
 import { canHandleGrainBagEvents, answerGrainBagEvents } from "../features/grainBagEvents.js";
 import { canHandleProducts, answerProducts } from "../features/products.js";
@@ -42,6 +42,7 @@ function wantsReport(text) {
     (t.includes("everything so far") && (t.includes("report") || t.includes("pdf") || t.includes("print")))
   );
 }
+
 function wantsFullConversation(text) {
   const t = (text || "").toString().toLowerCase();
   return t.includes("everything") || t.includes("entire") || t.includes("whole conversation") || t.includes("so far");
@@ -52,7 +53,7 @@ const norm = (s) => (s || "").toString().trim().toLowerCase();
 function isReadinessQuery(qn) {
   if (!qn) return false;
 
-  // Always include debug keyphrases
+  // Debug phrases (force readiness)
   if (qn.includes("readiness debug")) return true;
 
   // direct
@@ -65,26 +66,6 @@ function isReadinessQuery(qn) {
   if (qn.includes("can we plant") || qn.includes("can we spray") || qn.includes("can we work") || qn.includes("can we till")) return true;
 
   return false;
-}
-
-function isExplicitWeatherOrThreshold(qn) {
-  // Only route to the weather/threshold module if the user clearly asked for it
-  return (
-    qn.includes("threshold") ||
-    qn.includes("thresholds") ||
-    qn.includes("operation threshold") ||
-    qn.includes("planting threshold") ||
-    qn.includes("spraying threshold") ||
-    qn.includes("tillage threshold") ||
-    qn.includes("rain") ||
-    qn.includes("rainfall") ||
-    qn.includes("forecast") ||
-    qn.includes("weather") ||
-    qn.includes("precip") ||
-    qn.includes("snow") ||
-    qn.includes("temp") ||
-    qn.includes("temperature")
-  );
 }
 
 /* --------------------------------------------------
@@ -106,15 +87,9 @@ export async function handleChat({ question, snapshot }) {
 
   const qn = norm(question);
 
-  // ✅ HARD ROUTE READINESS:
-  // - Any readiness-type query goes to fieldReadinessLatest UNLESS the user explicitly asked weather/thresholds.
-  if (isReadinessQuery(qn) && !isExplicitWeatherOrThreshold(qn)) {
+  // ✅ Readiness ALWAYS uses fieldReadinessLatest now
+  if (isReadinessQuery(qn)) {
     return answerFieldReadinessLatest({ question, snapshot });
-  }
-
-  // thresholds/weather readiness only when explicitly requested
-  if (isReadinessQuery(qn) && isExplicitWeatherOrThreshold(qn)) {
-    return answerFieldReadinessWeather({ question, snapshot });
   }
 
   // other features
@@ -143,7 +118,6 @@ export async function handleChat({ question, snapshot }) {
     answer:
       `Try:\n` +
       `• Readiness: "readiness summary", "which fields can we plant right now", "readiness top 10", "readiness debug snapshot"\n` +
-      `• Thresholds/weather: "readiness thresholds", "field 0100 rain yesterday", "field 0513 forecast"\n` +
       `• Combine: "combine yield last 10", "combine loss last 10", "yield calibration last 10"\n` +
       `• Fields: "list fields"\n\n` +
       `When ready, say: "make this into a report" / "print this" / "export pdf"`,
