@@ -1,3 +1,4 @@
+import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
 import { canHandleBinSites, answerBinSites } from "../features/binSites.js";
 import { canHandleBinMovements, answerBinMovements } from "../features/binMovements.js";
@@ -8,6 +9,7 @@ import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 
 export async function handleChat({ question, snapshot }) {
+  if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
   if (canHandleBoundaryRequests(question)) return answerBoundaryRequests({ question, snapshot });
   if (canHandleBinSites(question)) return answerBinSites({ question, snapshot });
   if (canHandleBinMovements(question)) return answerBinMovements({ question, snapshot });
@@ -20,7 +22,8 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
-      `• Boundaries: "boundaries open", "boundary <id>"\n` +
+      `• Equipment: "equipment summary", "equipment type starfire", "equipment search 8R410"\n` +
+      `• Boundaries: "boundaries open"\n` +
       `• Bin Sites: "binsites summary"\n` +
       `• Bin Movements: "bins net last 7 days"\n` +
       `• Aerial: "aerial summary"\n` +
