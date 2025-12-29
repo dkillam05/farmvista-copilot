@@ -13,6 +13,7 @@ import { canHandleProducts, answerProducts } from "../features/products.js";
 import { canHandleRtkTowers, answerRtkTowers } from "../features/rtkTowers.js";
 import { canHandleSeasonalPrecheck, answerSeasonalPrecheck } from "../features/seasonalPrecheck.js";
 import { canHandleStarfireMoves, answerStarfireMoves } from "../features/starfireMoves.js";
+import { canHandleVehicleRegistrations, answerVehicleRegistrations } from "../features/vehicleRegistrations.js";
 import { canHandleGrain, answerGrain } from "../features/grain.js";
 import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
@@ -32,6 +33,7 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleRtkTowers(question)) return answerRtkTowers({ question, snapshot });
   if (canHandleSeasonalPrecheck(question)) return answerSeasonalPrecheck({ question, snapshot });
   if (canHandleStarfireMoves(question)) return answerStarfireMoves({ question, snapshot });
+  if (canHandleVehicleRegistrations(question)) return answerVehicleRegistrations({ question, snapshot });
   if (canHandleGrain(question)) return answerGrain({ question, snapshot });
   if (canHandleFields(question)) return answerFields({ question, snapshot });
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
@@ -40,6 +42,7 @@ export async function handleChat({ question, snapshot }) {
   return {
     answer:
       `Try:\n` +
+      `• Vehicle regs: "vehicle registrations", "vehicle reg DJK-AG", "vehicle reg expiring", "vehicle reg vin 0123"\n` +
       `• StarFire moves: "starfire moves", "starfire moves last 10", "starfire receiver 456789", "starfire moves from 8R370"\n` +
       `• Pre-checks: "precheck templates", "precheck template spring startup", "precheck items", "precheck item tire"\n` +
       `• RTK: "rtk towers", "rtk network 4010", "rtk tower Divernon", "rtk freq 464.05"\n` +
