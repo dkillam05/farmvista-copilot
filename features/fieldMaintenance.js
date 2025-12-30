@@ -1,4 +1,5 @@
 // /features/fieldMaintenance.js  (FULL FILE)
+// Rev: 2025-12-30-human-maint (Human phrasing tolerant; no CLI "Try:" menus; no snapshotId in user text)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -62,20 +63,10 @@ function stripQuotes(s) {
   return t;
 }
 
-function pickNeedle(q) {
-  // "field maintenance <needle>" (id or text search)
-  let m =
-    /^field\s+maintenance\s+(.+)$/i.exec(q) ||
-    /^maintenance\s+(.+)$/i.exec(q) ||
-    /^fieldmaint\s+(.+)$/i.exec(q);
-  return m ? stripQuotes(m[1]) : "";
-}
-
 function normalizeStatus(s) {
   const t = norm(s);
   if (!t) return "";
-  // keep your actual status strings, but allow flexible matching
-  return t.replace(/\s+/g, " ").trim();
+  return t.replace(/\s+/g, " ").trim().replace(/\.+$/,"");
 }
 
 function topicName(t) {
@@ -99,10 +90,8 @@ function resolveTopic(needle, topicIndex) {
 
   if (topicIndex.byId.has(needle)) return topicIndex.byId.get(needle);
 
-  // exact match on nameLower/name/label
   if (topicIndex.byName.has(nn)) return topicIndex.byName.get(nn);
 
-  // contains match
   for (const [k, t] of topicIndex.byName.entries()) {
     if (k.includes(nn)) return t;
   }
@@ -136,32 +125,112 @@ function lineForItem(it, topicIndex) {
   return `• ${head} (${it.id}) — ${bits.join(" • ")}`;
 }
 
+// ---- Human-ish query parsing ----
+function pickNeedle(q) {
+  // "field maintenance <needle>" (id or text search)
+  let m =
+    /^field\s+maintenance\s+(.+)$/i.exec(q) ||
+    /^maintenance\s+(.+)$/i.exec(q) ||
+    /^fieldmaint\s+(.+)$/i.exec(q);
+  return m ? stripQuotes(m[1]) : "";
+}
+
+function parseHumanFilters(qRaw) {
+  const q = (qRaw || "").toString().trim();
+  const qn = norm(q);
+
+  const out = {
+    // optional filters
+    statusNeedle: "",
+    farmNeedle: "",
+    fieldNeedle: "",
+    topicNeedle: "",
+    // detail id candidate (exact match handled later)
+    needle: pickNeedle(q)
+  };
+
+  // status words anywhere in sentence
+  // Examples:
+  // "pending maintenance", "maintenance needs approved", "open maintenance"
+  if (/\bneeds\s+approved\b/i.test(q)) out.statusNeedle = "needs approved";
+  else if (/\bpending\b/i.test(q)) out.statusNeedle = "pending";
+  else if (/\bcomplete(d)?\b/i.test(q)) out.statusNeedle = "completed";
+  else if (/\bopen\b/i.test(q)) out.statusNeedle = "pending"; // your default mapping
+
+  // explicit patterns:
+  // "maintenance by farm Pisgah" OR "maintenance for farm Pisgah"
+  let m =
+    /^field\s+maintenance\s+(by|for)\s+farm\s+(.+)$/i.exec(q) ||
+    /^maintenance\s+(by|for)\s+farm\s+(.+)$/i.exec(q);
+  if (m) out.farmNeedle = stripQuotes(m[2]);
+
+  // "maintenance by field North 80" OR "maintenance for field North 80"
+  m =
+    /^field\s+maintenance\s+(by|for)\s+field\s+(.+)$/i.exec(q) ||
+    /^maintenance\s+(by|for)\s+field\s+(.+)$/i.exec(q);
+  if (m) out.fieldNeedle = stripQuotes(m[2]);
+
+  // "maintenance topic washout"
+  m =
+    /^field\s+maintenance\s+topic\s+(.+)$/i.exec(q) ||
+    /^maintenance\s+topic\s+(.+)$/i.exec(q);
+  if (m) out.topicNeedle = stripQuotes(m[1]);
+
+  // softer:
+  // "maintenance for Pisgah" => assume farm if no explicit field/topic
+  if (!out.farmNeedle && !out.fieldNeedle && !out.topicNeedle) {
+    const softFarm = /^maintenance\s+(for|at|in)\s+(.+)$/i.exec(q);
+    if (softFarm && softFarm[2]) out.farmNeedle = stripQuotes(softFarm[2]);
+  }
+
+  // softer:
+  // "maintenance on field North 80"
+  if (!out.fieldNeedle) {
+    const softField = /\b(on|for)\s+field\s+(.+)$/i.exec(q);
+    if (softField && softField[2]) out.fieldNeedle = stripQuotes(softField[2]);
+  }
+
+  // if the only needle is a known status word, treat it as status
+  if (!out.statusNeedle && out.needle) {
+    const n = normalizeStatus(out.needle);
+    if (["pending", "needs approved", "needsapproved", "approved", "completed", "complete", "open"].some(x => n === x)) {
+      out.statusNeedle = (n === "open") ? "pending" : out.needle;
+      out.needle = "";
+    }
+  }
+
+  // normalize empties
+  out.statusNeedle = out.statusNeedle ? String(out.statusNeedle) : "";
+  out.farmNeedle = out.farmNeedle ? String(out.farmNeedle) : "";
+  out.fieldNeedle = out.fieldNeedle ? String(out.fieldNeedle) : "";
+  out.topicNeedle = out.topicNeedle ? String(out.topicNeedle) : "";
+
+  return out;
+}
+
 export function canHandleFieldMaintenance(question) {
   const q = norm(question);
   if (!q) return false;
 
+  // direct mentions
   if (q === "fieldmaintenance" || q === "field maintenance" || q === "maintenance") return true;
 
-  if (q.startsWith("field maintenance")) return true;
-  if (q.startsWith("fieldmaintenance")) return true;
-  if (q.startsWith("maintenance ")) return true;
-
-  // common filters
+  // common words people will use
   if (q.includes("maintenance")) return true;
+  if (q.includes("work order") || q.includes("work orders")) return true;
 
   return false;
 }
 
-export function answerFieldMaintenance({ question, snapshot }) {
+export function answerFieldMaintenance({ question, snapshot, intent }) {
   const q = (question || "").toString().trim();
-  const qn = norm(q);
 
   const json = snapshot?.json || null;
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
   if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
-  if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
+  if (!colsRoot) return { answer: "I can’t find maintenance collections in this snapshot right now.", meta: { snapshotId } };
 
   const items = colAsArray(colsRoot, "fieldMaintenance").map((r) => ({
     ...r,
@@ -179,35 +248,29 @@ export function answerFieldMaintenance({ question, snapshot }) {
   const topicIndex = buildTopicIndex(topics);
 
   if (!items.length) {
-    return { answer: "No fieldMaintenance records found in the snapshot.", meta: { snapshotId } };
+    return { answer: "No field maintenance records were found in the snapshot.", meta: { snapshotId } };
   }
 
-  // ---- parse filters from question ----
-  // supported:
-  //  - "field maintenance open|pending|needs approved|completed"
-  //  - "field maintenance by farm <name>"
-  //  - "field maintenance by field <name>"
-  //  - "field maintenance topic <name>"
-  //  - "field maintenance <id>" (details)
-  const needle = pickNeedle(q);
+  // parse filters from question (human-friendly)
+  const f = parseHumanFilters(q);
 
   // details by exact id
-  if (needle && items.some((x) => x.id === needle)) {
-    const it = items.find((x) => x.id === needle);
+  if (f.needle && items.some((x) => x.id === f.needle)) {
+    const it = items.find((x) => x.id === f.needle);
     const lines = [];
     lines.push(`Field Maintenance: ${it.id}`);
+
     const farmTxt = safeStr(it.farmName).trim();
     const fieldTxt = safeStr(it.fieldName).trim();
-    if (farmTxt) lines.push(`• farm: ${farmTxt} (${safeStr(it.farmId)})`);
-    if (fieldTxt) lines.push(`• field: ${fieldTxt} (${safeStr(it.fieldId)})`);
+    if (farmTxt) lines.push(`• farm: ${farmTxt}${it.farmId ? ` (${safeStr(it.farmId)})` : ""}`);
+    if (fieldTxt) lines.push(`• field: ${fieldTxt}${it.fieldId ? ` (${safeStr(it.fieldId)})` : ""}`);
     if (it.status) lines.push(`• status: ${it.status}`);
     if (it.priority != null) lines.push(`• priority: ${safeStr(it.priority)}`);
-    if (it.topicLabel) lines.push(`• topic: ${it.topicLabel}`);
-    if (it.topicId) {
-      const t = topicIndex.byId.get(it.topicId) || null;
-      if (t) lines.push(`• topicId: ${it.topicId} (${topicName(t)})`);
-      else lines.push(`• topicId: ${it.topicId}`);
-    }
+
+    const t = it.topicId ? (topicIndex.byId.get(it.topicId) || null) : null;
+    const topicTxt = safeStr(it.topicLabel).trim() || (t ? topicName(t) : "");
+    if (topicTxt) lines.push(`• topic: ${topicTxt}`);
+
     if (it.notes) lines.push(`• notes: ${it.notes}`);
 
     const submitted = fmtDateTime(it.__submittedMs);
@@ -233,59 +296,35 @@ export function answerFieldMaintenance({ question, snapshot }) {
     return { answer: lines.join("\n"), meta: { snapshotId, id: it.id } };
   }
 
-  // status filter
-  let statusNeedle = "";
-  if (needle) {
-    // "field maintenance pending"
-    if (needle === "open") statusNeedle = "pending"; // you can treat open as pending by default
-    else statusNeedle = needle;
-  }
-
-  // by farm
-  let farmNeedle = "";
-  let m = /^field\s+maintenance\s+by\s+farm\s+(.+)$/i.exec(q) || /^maintenance\s+by\s+farm\s+(.+)$/i.exec(q);
-  if (m) farmNeedle = stripQuotes(m[1]);
-
-  // by field
-  let fieldNeedle = "";
-  m = /^field\s+maintenance\s+by\s+field\s+(.+)$/i.exec(q) || /^maintenance\s+by\s+field\s+(.+)$/i.exec(q);
-  if (m) fieldNeedle = stripQuotes(m[1]);
-
-  // by topic
-  let topicNeedle = "";
-  m = /^field\s+maintenance\s+topic\s+(.+)$/i.exec(q) || /^maintenance\s+topic\s+(.+)$/i.exec(q);
-  if (m) topicNeedle = stripQuotes(m[1]);
-
   // apply filters
   let list = items.slice();
 
-  if (statusNeedle) {
-    const sn = normalizeStatus(statusNeedle);
-    // allow "needs approved" / "needs-approved" / etc
+  if (f.statusNeedle) {
+    const sn = normalizeStatus(f.statusNeedle);
     list = list.filter((it) => normalizeStatus(it.status).includes(sn));
   }
 
-  if (farmNeedle) {
-    const fn = norm(farmNeedle);
-    list = list.filter((it) => norm(it.farmName).includes(fn) || safeStr(it.farmId) === farmNeedle);
+  if (f.farmNeedle) {
+    const fn = norm(f.farmNeedle);
+    list = list.filter((it) => norm(it.farmName).includes(fn) || safeStr(it.farmId) === f.farmNeedle);
   }
 
-  if (fieldNeedle) {
-    const fln = norm(fieldNeedle);
-    list = list.filter((it) => norm(it.fieldName).includes(fln) || safeStr(it.fieldId) === fieldNeedle);
+  if (f.fieldNeedle) {
+    const fln = norm(f.fieldNeedle);
+    list = list.filter((it) => norm(it.fieldName).includes(fln) || safeStr(it.fieldId) === f.fieldNeedle);
   }
 
-  if (topicNeedle) {
-    const resolved = resolveTopic(topicNeedle, topicIndex);
+  if (f.topicNeedle) {
+    const resolved = resolveTopic(f.topicNeedle, topicIndex);
     if (resolved) {
       list = list.filter((it) => it.topicId === resolved.id || norm(it.topicLabel) === norm(topicName(resolved)));
     } else {
-      const tn = norm(topicNeedle);
+      const tn = norm(f.topicNeedle);
       list = list.filter((it) => norm(it.topicLabel).includes(tn));
     }
   }
 
-  // summary counts (always helpful)
+  // summary counts
   const total = items.length;
   const byStatus = new Map();
   for (const it of items) {
@@ -305,33 +344,34 @@ export function answerFieldMaintenance({ question, snapshot }) {
 
   const lines = shown.map((it) => lineForItem(it, topicIndex));
 
-  // build status summary line
   const statusBits = Array.from(byStatus.entries())
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([s, n]) => `${s}: ${n}`);
 
   const filters = [];
-  if (statusNeedle) filters.push(`status~"${statusNeedle}"`);
-  if (farmNeedle) filters.push(`farm~"${farmNeedle}"`);
-  if (fieldNeedle) filters.push(`field~"${fieldNeedle}"`);
-  if (topicNeedle) filters.push(`topic~"${topicNeedle}"`);
+  if (f.statusNeedle) filters.push(`status~"${f.statusNeedle}"`);
+  if (f.farmNeedle) filters.push(`farm~"${f.farmNeedle}"`);
+  if (f.fieldNeedle) filters.push(`field~"${f.fieldNeedle}"`);
+  if (f.topicNeedle) filters.push(`topic~"${f.topicNeedle}"`);
+
+  if (!list.length) {
+    return {
+      answer:
+        `No field maintenance items matched that request.\n\n` +
+        `Summary: ${fmtInt(total)} total • ${statusBits.join(" • ")}`,
+      meta: { snapshotId, total, matching: 0, shown: 0, filters }
+    };
+  }
 
   return {
     answer:
-      `Field Maintenance (snapshot ${snapshotId}):\n` +
+      `Field Maintenance:\n` +
       `• total: ${fmtInt(total)}\n` +
       `• statuses: ${statusBits.join(" • ")}\n` +
       (filters.length ? `• filter: ${filters.join(" • ")}\n` : "") +
       `\n` +
-      (list.length
-        ? lines.join("\n") + (list.length > maxShow ? `\n\n(Showing newest ${maxShow} of ${list.length})` : "")
-        : `No matches.\n`) +
-      `\n\nTry:\n` +
-      `• field maintenance pending\n` +
-      `• field maintenance needs approved\n` +
-      `• field maintenance by farm Pisgah\n` +
-      `• field maintenance topic washout\n` +
-      `• field maintenance <id>`,
-    meta: { snapshotId, total, matching: list.length, shown: shown.length }
+      lines.join("\n") +
+      (list.length > maxShow ? `\n\n(Showing newest ${maxShow} of ${list.length})` : ""),
+    meta: { snapshotId, total, matching: list.length, shown: shown.length, filters }
   };
 }
