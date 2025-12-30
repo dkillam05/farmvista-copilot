@@ -1,3 +1,6 @@
+// /features/fields.js  (FULL FILE)
+// Rev: 2025-12-30-human-fields (Fix nestedCandidates comma + human phrasing + no CLI "Try:" menus)
+
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 const isNum = (s) => /^[0-9]+$/.test((s || "").toString().trim());
 
@@ -112,13 +115,14 @@ export function findFieldsRoot(snapshotJson) {
   }
 
   // 2) Nested common patterns
+  // ✅ FIXED: missing comma after ["fv","fields"]
   const nestedCandidates = [
     ["collections", "fields"],
     ["collections", "fieldList"],
     ["data", "fields"],
     ["export", "fields"],
     ["snapshot", "fields"],
-    ["fv", "fields"]
+    ["fv", "fields"],
     ["data", "__collections__", "fields"],
     ["__collections__", "fields"],
   ];
@@ -245,15 +249,37 @@ function findField(fields, needleRaw) {
   );
 }
 
+function wantsList(qn) {
+  if (!qn) return false;
+  return (
+    qn === "fields" ||
+    qn === "field list" ||
+    qn === "fields list" ||
+    qn === "list fields" ||
+    qn === "show fields" ||
+    qn === "show me fields" ||
+    qn === "show all fields" ||
+    qn === "all fields"
+  );
+}
+
 export function canHandleFields(question) {
   const q = norm(question);
   if (!q) return false;
-  if (["fields", "list fields", "show fields", "field list", "debug fields"].includes(q)) return true;
+
+  // list-ish
+  if (wantsList(q)) return true;
+
+  // debug
+  if (q === "debug fields" || q === "fields debug") return true;
+
+  // detail
   if (/^(field|show field|open field)\s*[:#]?\s*.+$/i.test(question)) return true;
+
   return false;
 }
 
-export function answerFields({ question, snapshot }) {
+export function answerFields({ question, snapshot, intent }) {
   const q = (question || "").toString().trim();
   const qn = norm(q);
 
@@ -269,18 +295,26 @@ export function answerFields({ question, snapshot }) {
 
   const { key: fieldsKey, arr: fields, method, topKeys } = findFieldsRoot(json);
 
-  if (qn === "debug fields") {
+  const debugRequested = (qn === "debug fields" || qn === "fields debug");
+
+  if (debugRequested) {
     return {
-      answer: `Fields source: ${fieldsKey || "(not found)"} — count: ${fields.length}${method ? ` — via ${method}` : ""}`,
-      meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method, topKeys: (topKeys || []).slice(0, 30) }
+      answer:
+        `Fields diagnostic:\n` +
+        `• Source: ${fieldsKey || "(not found)"}\n` +
+        `• Count: ${fields.length}\n` +
+        (method ? `• Method: ${method}\n` : "") +
+        (topKeys && topKeys.length ? `• Top keys: ${topKeys.slice(0, 18).join(", ")}` : ""),
+      meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method, topKeys: (topKeys || []).slice(0, 30), diagnostic: true }
     };
   }
 
-  if (["fields", "list fields", "show fields", "field list"].includes(qn)) {
+  // List
+  if (wantsList(qn) || (intent && intent.topic === "fields" && intent.mode === "list")) {
     if (!fields.length) {
       return {
-        answer: "I still can’t locate fields in the snapshot. Run “debug fields”.",
-        meta: { snapshotId, fieldsKey, fieldsCount: 0, method, topKeys: (topKeys || []).slice(0, 30) }
+        answer: "I can’t locate fields in the snapshot right now.",
+        meta: { snapshotId, fieldsKey, fieldsCount: 0, method }
       };
     }
 
@@ -303,6 +337,7 @@ export function answerFields({ question, snapshot }) {
     };
   }
 
+  // Detail
   const m =
     /^field\s*[:#]?\s*(.+)$/i.exec(q) ||
     /^show\s+field\s*[:#]?\s*(.+)$/i.exec(q) ||
@@ -311,8 +346,8 @@ export function answerFields({ question, snapshot }) {
   if (m) {
     if (!fields.length) {
       return {
-        answer: "I can’t locate fields in the snapshot yet. Run “debug fields”.",
-        meta: { snapshotId, fieldsKey, fieldsCount: 0, method, topKeys: (topKeys || []).slice(0, 30) }
+        answer: "I can’t locate fields in the snapshot right now.",
+        meta: { snapshotId, fieldsKey, fieldsCount: 0, method }
       };
     }
 
@@ -320,21 +355,29 @@ export function answerFields({ question, snapshot }) {
     const found = findField(fields, needle);
 
     if (!found) {
+      // Human fallback: show a short subset and suggest re-trying with a closer name
+      const sample = fields.slice(0, 12).map(f => `• ${fieldDisplayName(f)}`).join("\n");
       return {
-        answer: `I couldn’t find a field matching “${needle}”. Try “list fields”.`,
-        meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method }
+        answer:
+          `I couldn’t find a field matching “${needle}”.\n\n` +
+          `Here are a few field names to pick from:\n${sample}\n\n` +
+          `If you tell me the closest match, I’ll open it.`,
+        meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method, needle }
       };
     }
 
     const detail = summarizeFieldDetailed(found);
     return {
       answer: `Field details:\n${formatBullets(detail)}`,
-      meta: { snapshotId, fieldsKey, method }
+      meta: { snapshotId, fieldsKey, method, needle }
     };
   }
 
+  // Default (human, no "Try:" menu)
   return {
-    answer: `Try:\n• "list fields"\n• "field North 80"\n• "field 12"\n• "debug fields"`,
+    answer:
+      `I can list your fields or open a specific field.\n` +
+      `For example: “list fields” or “field North 80”.`,
     meta: { snapshotId }
   };
 }
