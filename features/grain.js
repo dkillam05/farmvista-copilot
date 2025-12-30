@@ -1,3 +1,6 @@
+// /features/grain.js  (FULL FILE)
+// Rev: 2025-12-30-human-grain (Human phrasing tolerant; no CLI "Try:" menus; keep data logic intact)
+
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
 function getCollectionsRoot(snapshotJson){
@@ -7,7 +10,6 @@ function getCollectionsRoot(snapshotJson){
   if (d.data && d.data.__collections__ && typeof d.data.__collections__ === "object") return d.data.__collections__;
   // Some snapshots may already store just __collections__
   if (d.__collections__ && typeof d.__collections__ === "object") return d.__collections__;
-  // Or may be flattened
   return null;
 }
 
@@ -33,7 +35,6 @@ function fmtInt(n){
 
 function fmtBu(n){
   const v = Number(n) || 0;
-  // show 0 decimals if big, 1 if small-ish
   const digits = v >= 1000 ? 0 : 1;
   return v.toLocaleString(undefined, { maximumFractionDigits: digits });
 }
@@ -46,7 +47,6 @@ function guessBagsOnHand(d){
 }
 
 function guessCornBuPerBag(d){
-  // Common fields we’ve seen in your KPI logic + likely variants
   const keys = ["cornBuPerBag", "bagCornBu", "bushelsPerBag", "capacityCornBu", "ratedCornBu"];
   for (const k of keys) {
     if (d[k] != null && Number.isFinite(Number(d[k]))) return Number(d[k]);
@@ -63,23 +63,55 @@ function guessSkuLabel(d){
   );
 }
 
+// Human-ish intent detection helpers
+function wantsSummary(qn){
+  if (!qn) return false;
+  if (qn === "grain" || qn === "grain summary" || qn === "summary grain") return true;
+  if (qn === "show grain" || qn === "show me grain" || qn === "grain overview") return true;
+  return false;
+}
+
+function wantsBags(qn){
+  if (!qn) return false;
+  return (
+    qn.includes("grain bag") ||
+    qn.includes("grain bags") ||
+    qn.includes("bag inventory") ||
+    qn.includes("bags on hand") ||
+    qn === "bags" ||
+    qn === "bag" ||
+    qn === "show bags"
+  );
+}
+
+function wantsBins(qn){
+  if (!qn) return false;
+  return (
+    qn.includes("grain bin") ||
+    qn.includes("grain bins") ||
+    qn === "bins" ||
+    qn === "bin" ||
+    qn === "show bins"
+  );
+}
+
 export function canHandleGrain(question){
   const q = norm(question);
   if (!q) return false;
 
-  if (q === "grain" || q === "grain summary") return true;
-  if (q.includes("grain bag") || q.includes("grain bags")) return true;
-  if (q.includes("bag inventory") || q.includes("bags on hand")) return true;
-  if (q.includes("bin") || q.includes("bins")) return true;
+  if (wantsSummary(q)) return true;
+  if (wantsBags(q)) return true;
+  if (wantsBins(q)) return true;
 
   // quick commands
   if (q.startsWith("sku ")) return true;
   if (q.startsWith("grain sku ")) return true;
+  if (q.startsWith("bags sku ")) return true;
 
   return false;
 }
 
-export function answerGrain({ question, snapshot }){
+export function answerGrain({ question, snapshot, intent }){
   const q = (question || "").toString().trim();
   const qn = norm(q);
 
@@ -96,7 +128,7 @@ export function answerGrain({ question, snapshot }){
   const colsRoot = getCollectionsRoot(json);
   if (!colsRoot) {
     return {
-      answer: "I can’t find Firefoo collections in this snapshot (expected data.__collections__).",
+      answer: "I can’t find grain collections in this snapshot right now.",
       meta: { snapshotId }
     };
   }
@@ -107,10 +139,10 @@ export function answerGrain({ question, snapshot }){
   const binMoves = colAsArray(colsRoot, "binMovements");               // bin movement log
 
   // ---------
-  // SKU filter: "grain sku x" or "sku x"
+  // SKU filter: "grain sku x" or "sku x" or "bags sku x"
   // ---------
   let skuNeedle = null;
-  let m = /^grain\s+sku\s+(.+)$/i.exec(q) || /^sku\s+(.+)$/i.exec(q);
+  let m = /^grain\s+sku\s+(.+)$/i.exec(q) || /^sku\s+(.+)$/i.exec(q) || /^bags\s+sku\s+(.+)$/i.exec(q);
   if (m) skuNeedle = (m[1] || "").trim();
 
   // ---------
@@ -162,33 +194,29 @@ export function answerGrain({ question, snapshot }){
   // ---------
   // Decide response type
   // ---------
-  if (qn === "grain" || qn === "grain summary") {
+  const mode = intent && intent.mode ? String(intent.mode) : null;
+
+  if (wantsSummary(qn) || mode === "summary") {
     const parts = [];
-    parts.push(`Grain summary (snapshot ${snapshotId}):`);
+    parts.push(`Grain summary:`);
+
     parts.push(`• Grain bag SKUs: ${fmtInt(bagMoves.length)}`);
     parts.push(`• Bags on hand: ${fmtInt(bagSum.totalBags)}`);
-
-    // corn-rated bu only (we’ll add crop conversion later if you want)
     if (bagSum.totalCornBu > 0) parts.push(`• Corn-rated bushels on hand: ${fmtBu(bagSum.totalCornBu)} bu`);
 
     parts.push(`• Bin sites: ${fmtInt(binsCount)}`);
     parts.push(`• Bin movement records: ${fmtInt(binMovesCount)}`);
     parts.push(`• Grain bag event records: ${fmtInt(bagEvents.length)}`);
 
-    parts.push(`\nTry:`);
-    parts.push(`• "grain bags"`);
-    parts.push(`• "grain sku <text>"`);
-    parts.push(`• "grain bins"`);
-
     return { answer: parts.join("\n"), meta: { snapshotId } };
   }
 
-  if (qn.includes("grain bag") || qn.includes("grain bags") || qn.includes("bag inventory") || qn.includes("bags on hand") || skuNeedle) {
+  if (wantsBags(qn) || skuNeedle || mode === "bags") {
     if (!bagMoves.length) {
-      return { answer: "No inventoryGrainBagMovements records found in the snapshot.", meta: { snapshotId } };
+      return { answer: "No grain bag inventory records were found in the snapshot.", meta: { snapshotId } };
     }
 
-    const title = skuNeedle ? `Grain bags (filtered by “${skuNeedle}”)` : "Grain bags on hand";
+    const title = skuNeedle ? `Grain bags on hand (filtered by “${skuNeedle}”)` : "Grain bags on hand";
     const lines = [];
 
     const show = bagSum.perSku.slice(0, 40); // keep it readable
@@ -207,6 +235,14 @@ export function answerGrain({ question, snapshot }){
     totals.push(`Totals: ${fmtInt(bagSum.totalBags)} bags`);
     if (bagSum.totalCornBu > 0) totals.push(`${fmtBu(bagSum.totalCornBu)} corn-rated bu`);
 
+    // If SKU filter produced nothing, say it plainly
+    if (skuNeedle && bagSum.perSku.length === 0) {
+      return {
+        answer: `I didn’t find any grain bag SKUs on hand that match “${skuNeedle}”.`,
+        meta: { snapshotId, skuFilter: skuNeedle, skuCount: bagMovesFiltered.length }
+      };
+    }
+
     return {
       answer: `${title}:\n\n${lines.join("\n")}\n\n${totals.join(" • ")}${footer}`,
       meta: {
@@ -217,9 +253,9 @@ export function answerGrain({ question, snapshot }){
     };
   }
 
-  if (qn.includes("grain bin") || qn.includes("grain bins") || qn === "bins") {
+  if (wantsBins(qn) || mode === "bins") {
     if (!binSites.length) {
-      return { answer: "No binSites records found in the snapshot.", meta: { snapshotId } };
+      return { answer: "No bin sites were found in the snapshot.", meta: { snapshotId } };
     }
 
     const names = binSites.slice(0, 30).map((b, i) => {
@@ -241,8 +277,11 @@ export function answerGrain({ question, snapshot }){
     };
   }
 
+  // Default (human, not a command menu)
   return {
-    answer: `Try:\n• "grain summary"\n• "grain bags"\n• "grain sku <text>"\n• "grain bins"`,
+    answer:
+      `I can summarize grain, show grain bags on hand, or list bin sites.\n` +
+      `For example: “grain summary”, “grain bags”, or “grain bins”.`,
     meta: { snapshotId }
   };
 }
