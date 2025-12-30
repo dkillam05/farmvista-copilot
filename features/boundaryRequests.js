@@ -1,5 +1,5 @@
 // /features/boundaryRequests.js  (FULL FILE)
-// Rev: 2025-12-30-human-boundaries (Human phrasing tolerant; no CLI "Try:" menus; no snapshotId in user text)
+// Rev: 2025-12-30-boundaries-fields (Adds: list fields with open boundary requests; human defaults; no Try:)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -65,9 +65,19 @@ function wantsSummary(qn){
     qn === "boundary requests" ||
     qn === "boundaries summary" ||
     qn === "boundary summary" ||
+    qn.includes("boundary request") ||
     qn.includes("boundary fixes") ||
-    qn.includes("field boundary") ||
-    qn.includes("boundary request")
+    qn.includes("field boundary")
+  );
+}
+
+function wantsFieldsList(qn){
+  if (!qn) return false;
+  // human phrasing we want to catch
+  return (
+    (qn.includes("field") || qn.includes("fields")) &&
+    (qn.includes("boundary") || qn.includes("boundaries")) &&
+    (qn.includes("need") || qn.includes("have") || qn.includes("with") || qn.includes("list") || qn.includes("show"))
   );
 }
 
@@ -76,11 +86,11 @@ export function canHandleBoundaryRequests(question){
   if (!q) return false;
 
   if (wantsSummary(q)) return true;
+  if (wantsFieldsList(q)) return true;
 
   if (q.startsWith("boundaries")) return true;
   if (q.startsWith("boundary ")) return true;
 
-  // very common phrasing
   if (q.includes("boundary") && (q.includes("open") || q.includes("closed") || q.includes("fix"))) return true;
 
   return false;
@@ -106,6 +116,51 @@ export function answerBoundaryRequests({ question, snapshot, intent }){
 
   if (!reqs.length) return { answer: "No boundary requests were found in the snapshot.", meta: { snapshotId } };
 
+  // ---------- NEW: fields list (open requests grouped by field) ----------
+  if (wantsFieldsList(qn) || (intent && intent.mode === "fields")) {
+    const open = reqs.filter(r => r.__status === "open");
+    if (!open.length) {
+      return { answer: "No fields currently have open boundary requests.", meta: { snapshotId, open: 0 } };
+    }
+
+    // group by field (include farm)
+    const map = new Map(); // key => { farm, field, count, latestMs, ids[] }
+    for (const r of open) {
+      const farm = safeStr(r.farm).trim();
+      const field = safeStr(r.field).trim();
+      const key = `${farm}||${field}`.toLowerCase();
+
+      const whenMs = r.__updatedMs || r.__createdMs || 0;
+
+      if (!map.has(key)) {
+        map.set(key, { farm, field, count: 0, latestMs: 0, ids: [] });
+      }
+      const row = map.get(key);
+      row.count += 1;
+      row.latestMs = Math.max(row.latestMs, whenMs);
+      row.ids.push(r.id);
+    }
+
+    const grouped = [...map.values()]
+      .sort((a,b)=> (b.count - a.count) || (b.latestMs - a.latestMs))
+      .slice(0, 50);
+
+    const lines = grouped.map(g => {
+      const label = `${g.farm || "Farm?"} • ${g.field || "Field?"}`;
+      const idPart = g.ids.slice(0, 4).join(", ") + (g.ids.length > 4 ? ` …+${g.ids.length - 4}` : "");
+      const reqLabel = g.count === 1 ? "request" : "requests";
+      return `• ${label} — ${g.count} ${reqLabel} (${idPart})`;
+    });
+
+    return {
+      answer:
+        `Fields with open boundary requests (${open.length} total requests):\n\n` +
+        lines.join("\n") +
+        (map.size > 50 ? `\n\n(Showing first 50 fields)` : ""),
+      meta: { snapshotId, openRequests: open.length, fieldsWithOpen: map.size }
+    };
+  }
+
   // ---------- summary ----------
   if (wantsSummary(qn) || (intent && intent.mode === "summary")) {
     const total = reqs.length;
@@ -123,8 +178,6 @@ export function answerBoundaryRequests({ question, snapshot, intent }){
   }
 
   // ---------- open/closed ----------
-  // Support:
-  // "boundaries open", "open boundaries", "boundary requests open"
   let m = /^boundaries\s+(open|closed)\s*$/i.exec(q) ||
           /^(open|closed)\s+boundaries\s*$/i.exec(q) ||
           /^boundary\s+requests\s+(open|closed)\s*$/i.exec(q);
@@ -140,7 +193,6 @@ export function answerBoundaryRequests({ question, snapshot, intent }){
   }
 
   // ---------- by farm ----------
-  // "boundaries farm Lowder", "boundaries for farm Lowder"
   m = /^boundaries\s+(farm|for\s+farm)\s+(.+)\s*$/i.exec(q);
   if (m) {
     const needle = (m[2] || "").trim();
@@ -155,7 +207,6 @@ export function answerBoundaryRequests({ question, snapshot, intent }){
   }
 
   // ---------- by field ----------
-  // "boundaries field 1323-Masonic N", "boundaries for field ..."
   m = /^boundaries\s+(field|for\s+field)\s+(.+)\s*$/i.exec(q);
   if (m) {
     const needle = (m[2] || "").trim();
@@ -198,11 +249,10 @@ export function answerBoundaryRequests({ question, snapshot, intent }){
     return { answer: lines.join("\n"), meta: { snapshotId, boundaryId: found.id } };
   }
 
-  // Default human fallback
   return {
     answer:
-      `I can summarize boundary requests, show open/closed, or filter by farm/field.\n` +
-      `For example: “open boundaries”, “boundaries farm Lowder”, or “boundary <id>”.`,
+      `I can summarize boundary requests, show open/closed, or list fields with open boundary requests.\n` +
+      `For example: “open boundaries” or “fields with boundary requests”.`,
     meta: { snapshotId }
   };
 }
