@@ -1,5 +1,5 @@
 // index.js  (FULL FILE)
-// Rev: 2025-12-30-report-polish (Professional report template + company logo + cleaner sections)
+// Rev: 2025-12-30-report-human (Recent report = last meaningful answer; strip dev text; hide snapshot/revision from user)
 
 import express from "express";
 
@@ -190,7 +190,7 @@ async function buildReportPdf({ threadId, mode, titleOverride }) {
 
   const history = await loadRecentHistory(threadId);
 
-  // Keep ONLY assistant answers that are meaningful (drop “Try: …”, “Report ready”, etc.)
+  // Keep ONLY assistant answers that are meaningful
   const assistants = history
     .filter(h => h.role === "assistant" && (h.text || "").trim())
     .map(h => ({ ...h, text: String(h.text || "") }))
@@ -198,13 +198,10 @@ async function buildReportPdf({ threadId, mode, titleOverride }) {
 
   if (!assistants.length) throw new Error("No assistant answers found for this thread.");
 
-  // Choose turns
-  const selected = (mode === "conversation") ? assistants : assistants.slice(-3);
-
-  // Stamp with current snapshot
-  const snap = await loadSnapshot({ force: false });
-  const snapshotId = snap.activeSnapshotId || "unknown";
-  const revision = getRevision() || "unknown";
+  // Choose turns:
+  // - recent: last meaningful answer ONLY (last topic only)
+  // - conversation: keep all meaningful answers
+  const selected = (mode === "conversation") ? assistants : assistants.slice(-1);
 
   const company = await loadCompanyHeaderSafe();
 
@@ -215,19 +212,24 @@ async function buildReportPdf({ threadId, mode, titleOverride }) {
   const generatedAtStr = generatedAt.toLocaleString(undefined, { year:"numeric", month:"short", day:"numeric", hour:"numeric", minute:"2-digit" });
   const generatedDateOnly = generatedAt.toLocaleDateString(undefined, { year:"numeric", month:"short", day:"numeric" });
 
+  const sections = selected.map((a, idx) => {
+    const cleanText = sanitizeForReport(a.text);
+    return {
+      heading: makeSectionHeading(cleanText, idx),
+      text: cleanText
+    };
+  }).filter(s => (s.text || "").trim());
+
+  if (!sections.length) throw new Error("No reportable content found.");
+
   const html = buildFarmVistaStyleReportHtml({
     title,
     subtitle: "Generated from FarmVista Copilot responses (share / print ready).",
     company,
-    snapshotId,
-    revision,
     generatedAtStr,
     generatedDateOnly,
     mode,
-    sections: selected.map((a, idx) => ({
-      heading: makeSectionHeading(a.text, idx),
-      text: a.text
-    }))
+    sections
   });
 
   // Convert HTML -> PDF via your existing service
@@ -247,24 +249,43 @@ async function buildReportPdf({ threadId, mode, titleOverride }) {
 
 function isJunkAssistantTurn(text) {
   const t = String(text || "").trim();
-
-  // Drop the generic help blocks and report-trigger chatter
   if (!t) return true;
 
   const low = t.toLowerCase();
 
-  // Your help menu / prompts
+  // PDF marker output
+  if (low.startsWith("[[fv_pdf]]:")) return true;
+
+  // Report trigger chatter
+  if (low.includes("report ready") && low.includes("opening the pdf")) return true;
+
+  // Old CLI-style help blocks
   if (low.startsWith("try:")) return true;
-  if (low.includes("when ready, say:")) return true;
-
-  // Report trigger output
-  if (low.includes("report ready") && low.includes("open again:")) return true;
-
-  // Debug signatures you might not want in the PDF (optional)
-  // (Keep FV readiness output; remove only the debug marker if you want)
-  // if (low.includes("readiness debug")) return true;
 
   return false;
+}
+
+function sanitizeForReport(text) {
+  let t = String(text || "").trim();
+  if (!t) return "";
+
+  // Remove bracketed internal markers like [FV-READINESS-LATEST]
+  t = t.replace(/^\[[^\]]+\]\s*/gm, "");
+
+  // Remove "Snapshot ..." / "Revision ..." lines (user should not see internals)
+  t = t.replace(/^\s*(snapshot|revision)\s*:\s*.*$/gmi, "");
+
+  // Remove any leftover CLI menu blocks starting with "Try:"
+  // (wipe from "Try:" to end)
+  t = t.replace(/\n?^\s*Try:\s*[\s\S]*$/gmi, "");
+
+  // Remove obvious "Rev: 2025-..." style tags if they appear in content
+  t = t.replace(/^\s*Rev:\s*.*$/gmi, "");
+
+  // Collapse excessive blank lines
+  t = t.replace(/\n{3,}/g, "\n\n").trim();
+
+  return t;
 }
 
 function inferReportTitle(history, selected) {
@@ -285,11 +306,9 @@ function makeSectionHeading(text, idx) {
   const lines = String(text || "").split("\n").map(s => s.trim()).filter(Boolean);
   const first = lines[0] || `Section ${idx + 1}`;
 
-  // Strip known noisy prefixes
   const cleaned = first
-    .replace(/^\[[^\]]+\]\s*/g, "")     // [FV-READINESS-LATEST]
     .replace(/^field readiness latest\s*/i, "Field Readiness")
-    .replace(/^combine\s*/i, "Combine ")
+    .replace(/^equipment summary\s*/i, "Equipment Summary")
     .trim();
 
   return cleaned.slice(0, 64) || `Section ${idx + 1}`;
@@ -318,7 +337,7 @@ async function loadCompanyHeaderSafe() {
   }
 }
 
-function buildFarmVistaStyleReportHtml({ title, subtitle, company, snapshotId, revision, generatedAtStr, generatedDateOnly, mode, sections }) {
+function buildFarmVistaStyleReportHtml({ title, subtitle, company, generatedAtStr, generatedDateOnly, mode, sections }) {
   const co = company || {};
   const coName = esc(co.name || "Dowson Farms");
   const coLine = esc(co.address || "");
@@ -328,8 +347,6 @@ function buildFarmVistaStyleReportHtml({ title, subtitle, company, snapshotId, r
 
   const safeTitle = esc(title || "FarmVista Report");
   const safeSubtitle = esc(subtitle || "");
-  const safeSnap = esc(snapshotId || "unknown");
-  const safeRev = esc(revision || "unknown");
   const safeMode = esc(mode || "recent");
 
   return `<!doctype html>
@@ -451,7 +468,6 @@ function buildFarmVistaStyleReportHtml({ title, subtitle, company, snapshotId, r
       <div class="meta">
         <div><strong>FarmVista Report</strong></div>
         <div>Generated: ${esc(generatedAtStr)}</div>
-        <div>Snapshot: ${safeSnap}</div>
         <div>Mode: ${safeMode}</div>
       </div>
     </header>
@@ -463,7 +479,6 @@ function buildFarmVistaStyleReportHtml({ title, subtitle, company, snapshotId, r
       <div class="pill"><span class="k">Sections</span><span class="v">${sections.length}</span></div>
       <div class="pill"><span class="k">Prepared</span><span class="v">${esc(co.name || "FarmVista")}</span></div>
       <div class="pill"><span class="k">Date</span><span class="v">${esc(generatedDateOnly)}</span></div>
-      <div class="pill"><span class="k">Revision</span><span class="v">${safeRev}</span></div>
     </div>
 
     ${sections.map((s, idx) => `
