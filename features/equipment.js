@@ -1,3 +1,6 @@
+// /features/equipment.js  (FULL FILE)
+// Rev: 2025-12-30-human-equip (Human phrasing tolerant; no CLI "Try:" menus; no id=list failure)
+
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
 function getCollectionsRoot(snapshotJson){
@@ -92,7 +95,6 @@ function summarizeOne(e, makeMap, modelMap){
   const type = safeStr(e.type).trim() || "unknown";
   const status = safeStr(e.status).trim() || "unknown";
   const year = (e.year != null) ? String(e.year) : "";
-  const serial = safeStr(e.serial).trim();
 
   const hrs =
     (e.engineHours != null) ? `eng ${e.engineHours}h` :
@@ -106,9 +108,8 @@ function summarizeOne(e, makeMap, modelMap){
   bits.push(type);
   bits.push(status);
   if (hrs) bits.push(hrs);
-  if (serial) bits.push(`SN ${serial}`);
 
-  return `• ${name} (${e.id}) — ${bits.join(" • ")}`;
+  return `• ${name} — ${bits.join(" • ")}`;
 }
 
 function groupCount(list, getter){
@@ -132,7 +133,7 @@ export function canHandleEquipment(question){
   return false;
 }
 
-export function answerEquipment({ question, snapshot }){
+export function answerEquipment({ question, snapshot, intent }){
   const q = (question || "").toString().trim();
   const qn = norm(q);
 
@@ -159,8 +160,11 @@ export function answerEquipment({ question, snapshot }){
 
   if (!items.length) return { answer: "No equipment records found in the snapshot.", meta: { snapshotId } };
 
-  // equipment summary
-  if (qn === "equipment" || qn === "equipment summary") {
+  // If normalizeIntent provided a mode, honor it (prevents "equipment list" => id=list failures)
+  const mode = (intent && intent.mode) ? String(intent.mode) : null;
+
+  // SUMMARY
+  if (qn === "equipment" || qn === "equipment summary" || mode === "summary") {
     const byType = groupCount(items, x => x.type);
     const byMake = groupCount(items, x => x.__makeResolved || x.makeName || x.makeId);
     const byModel = groupCount(items, x => x.__modelResolved || x.modelName || x.modelId);
@@ -168,19 +172,12 @@ export function answerEquipment({ question, snapshot }){
 
     return {
       answer:
-        `Equipment summary (snapshot ${snapshotId}):\n` +
+        `Equipment summary:\n` +
         `• Total: ${items.length}\n` +
         `• By type: ${topPairs(byType)}\n` +
         `• By make: ${topPairs(byMake)}\n` +
         `• By model: ${topPairs(byModel)}\n` +
-        `• By status: ${topPairs(byStatus)}\n\n` +
-        `Try:\n` +
-        `• equipment type starfire\n` +
-        `• equipment make John Deere\n` +
-        `• equipment model SF6000\n` +
-        `• equipment search 8R410\n` +
-        `• equipment <id>\n` +
-        `• equipment qr <id>`,
+        `• By status: ${topPairs(byStatus)}`,
       meta: { snapshotId, total: items.length, makesKnown: makesArr.length, modelsKnown: modelsArr.length }
     };
   }
@@ -220,7 +217,7 @@ export function answerEquipment({ question, snapshot }){
     };
   }
 
-  // equipment model <modelName> (matches resolved model, raw modelName, or modelId)
+  // equipment model <modelName>
   m = /^equipment\s+model\s+(.+)\s*$/i.exec(q);
   if (m) {
     const modelNeedle = m[1].trim();
@@ -277,28 +274,51 @@ export function answerEquipment({ question, snapshot }){
   if (m) {
     const id = m[1].trim();
     const found = items.find(x => x.id === id) || null;
-    if (!found) return { answer: `No equipment found with id ${id}.`, meta: { snapshotId } };
+    if (!found) return { answer: `I couldn't find an equipment item with that QR id.`, meta: { snapshotId } };
 
     const qr = found.qr || {};
     const img = qr.image || {};
     const lines = [];
     lines.push(`Equipment: ${safeStr(found.name).trim() || found.id}`);
-    lines.push(`• id: ${found.id}`);
     if (qr.token) lines.push(`• qr token: ${qr.token}`);
     if (img.url) lines.push(`• qr url: ${img.url}`);
 
     return { answer: lines.join("\n"), meta: { snapshotId, id } };
   }
 
-  // equipment <id>
+  // equipment <id> (explicit id lookups only)
+  // If normalizeIntent decided "search", we avoid this path entirely.
   m = /^equipment\s+([a-zA-Z0-9_-]+)\s*$/i.exec(q);
   if (m) {
     const id = m[1].trim();
     const found = items.find(x => x.id === id) || null;
 
     if (!found) {
+      // Human fallback: treat as search, not "you did it wrong"
+      const nn = norm(id);
+      const list = items.filter(x => {
+        const blob = [
+          x.name,
+          x.__makeResolved,
+          x.makeName,
+          x.__modelResolved,
+          x.modelName,
+          x.serial,
+          x.type
+        ].map(safeStr).join(" ").toLowerCase();
+        return blob.includes(nn);
+      });
+
+      const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
+      if (list.length) {
+        return {
+          answer: `Here’s what I found for "${id}" (${list.length}):\n\n` + show.join("\n"),
+          meta: { snapshotId, needle: id, count: list.length }
+        };
+      }
+
       return {
-        answer: `No equipment found with id ${id}. Try "equipment search <text>" instead.`,
+        answer: `I didn’t find any equipment that matches "${id}".`,
         meta: { snapshotId }
       };
     }
@@ -310,7 +330,7 @@ export function answerEquipment({ question, snapshot }){
     const model = effectiveModelName(found, modelMap);
 
     const lines = [];
-    lines.push(`Equipment: ${safeStr(found.name).trim() || "(No name)"} (${found.id})`);
+    lines.push(`Equipment: ${safeStr(found.name).trim() || "(No name)"}`);
     if (found.type) lines.push(`• type: ${found.type}`);
     if (found.status) lines.push(`• status: ${found.status}`);
     if (make || model) lines.push(`• make/model: ${[make, model].filter(Boolean).join(" ")}`);
@@ -335,16 +355,11 @@ export function answerEquipment({ question, snapshot }){
     return { answer: lines.join("\n"), meta: { snapshotId, id } };
   }
 
+  // Final fallback (no CLI menu)
   return {
     answer:
-      `Try:\n` +
-      `• equipment summary\n` +
-      `• equipment type starfire\n` +
-      `• equipment make John Deere\n` +
-      `• equipment model SF6000\n` +
-      `• equipment search 8R410\n` +
-      `• equipment <id>\n` +
-      `• equipment qr <id>`,
+      `I can summarize equipment, filter by type/make/model, or search by a keyword.\n` +
+      `If you tell me what you’re looking for (ex: “John Deere”, “StarFire”, “sprayer”, “8R410”), I’ll narrow it down.`,
     meta: { snapshotId }
   };
 }
