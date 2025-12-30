@@ -1,9 +1,5 @@
 // /features/fieldReadinessLatest.js  (FULL FILE)
-// Rev: 2025-12-29r+debug2
-//
-// NEW:
-// ✅ Command: "readiness debug snapshot" prints what backend sees
-// ✅ Signature line: [FV-READINESS-LATEST] so you know it's not thresholds
+// Rev: 2025-12-30-human-readiness (Keep debug command, but normal output is clean: no FV tags, no snapshotId, no Try: menu)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -90,7 +86,7 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
   const json = snapshot?.json || null;
 
-  // ✅ DEBUG COMMAND
+  // ✅ DEBUG COMMANDS (explicit only)
   if (qn === "readiness debug snapshot" || qn === "readiness debug" || qn === "debug readiness") {
     const lines = [];
     lines.push(`[FV-READINESS-LATEST] Readiness debug`);
@@ -118,11 +114,10 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
     return { answer: lines.join("\n"), meta: { snapshotId, intent: "readiness_debug" } };
   }
 
+  // Normal user-facing errors (clean)
   if (!json) {
     return {
-      answer:
-        `[FV-READINESS-LATEST] I can’t access snapshot.json right now (snapshotId: ${snapshotId}).\n` +
-        `Run: "readiness debug snapshot"`,
+      answer: `Field readiness isn’t available right now.`,
       meta: { snapshotId, intent: "readiness_error_no_snapshot" }
     };
   }
@@ -130,21 +125,15 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const colsRoot = getCollectionsRoot(json);
   if (!colsRoot) {
     return {
-      answer:
-        `[FV-READINESS-LATEST] I can’t find Firefoo collections in this snapshot (snapshotId: ${snapshotId}).\n` +
-        `Run: "readiness debug snapshot"`,
+      answer: `Field readiness isn’t available right now.`,
       meta: { snapshotId, intent: "readiness_error_no_collections" }
     };
   }
 
   const rowsRaw = colAsArray(colsRoot, "field_readiness_latest");
   if (!rowsRaw.length) {
-    const keys = Object.keys(colsRoot);
     return {
-      answer:
-        `[FV-READINESS-LATEST] No "field_readiness_latest" docs found (snapshotId: ${snapshotId}).\n` +
-        `Collections present (first 25): ${keys.slice(0, 25).join(", ")}${keys.length > 25 ? " …" : ""}\n\n` +
-        `Run: "readiness debug snapshot"`,
+      answer: `Field readiness data wasn’t found in the snapshot.`,
       meta: { snapshotId, intent: "readiness_error_missing_collection" }
     };
   }
@@ -169,7 +158,12 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
   const readyNow = rows.filter(r => r.__readiness >= readyNowThreshold);
   const notReady = rows.filter(r => r.__readiness < readyNowThreshold);
 
-  const actionable = qn.includes("which fields") || qn.includes("can we plant") || qn.includes("plant right now") || qn.includes("how ready");
+  const actionable =
+    qn.includes("which fields") ||
+    qn.includes("can we plant") ||
+    qn.includes("plant right now") ||
+    qn.includes("how ready");
+
   const sorted = rows.slice().sort((a,b)=> b.__readiness - a.__readiness);
   const shown = sorted.slice(0, actionable ? 10 : 15);
 
@@ -181,14 +175,13 @@ export function answerFieldReadinessLatest({ question, snapshot }) {
 
   return {
     answer:
-      `[FV-READINESS-LATEST] Field readiness latest (snapshot ${snapshotId}):\n` +
-      (computedTxt ? `• computedAt: ${computedTxt}\n` : "") +
-      `• fields: ${fmtInt(rows.length)}\n` +
+      `Field readiness (latest):\n` +
+      (computedTxt ? `• Updated: ${computedTxt}\n` : "") +
+      `• Fields: ${fmtInt(rows.length)}\n` +
       `• 90–100: ${fmtInt(bands.get("90-100"))} • 70–89: ${fmtInt(bands.get("70-89"))} • 50–69: ${fmtInt(bands.get("50-69"))} • <50: ${fmtInt(bands.get("0-49"))}\n` +
-      `• Ready-now (>=${readyNowThreshold}%): ${fmtInt(readyNow.length)} • Not-ready: ${fmtInt(notReady.length)}\n\n` +
+      `• Ready now (≥${readyNowThreshold}%): ${fmtInt(readyNow.length)} • Not ready: ${fmtInt(notReady.length)}\n\n` +
       `${actionable ? "Best candidates:" : "Top fields:"}\n` +
-      lines.join("\n") +
-      `\n\nTry:\n• readiness debug snapshot\n• readiness top 10\n• readiness under 60`,
-    meta: { snapshotId, intent: "readiness_latest", total: rows.length, readyNow: readyNow.length }
+      lines.join("\n"),
+    meta: { snapshotId, intent: "readiness_latest", total: rows.length, readyNow: readyNow.length, computedAt: maxComputed || null }
   };
 }
