@@ -1,5 +1,5 @@
 // index.js  (FULL FILE)
-// Rev: 2025-12-29-revision-tag  (Adds Cloud Run revision + snapshotId to responses for hard proof)
+// Rev: 2025-12-30-chat-guard  (Hard try/catch around /chat to avoid 503s and expose real errors)
 
 import express from "express";
 
@@ -19,7 +19,6 @@ app.use(express.json({ limit: "4mb" }));
 app.use(corsMiddleware());
 
 function getRevision() {
-  // Cloud Run sets K_REVISION automatically (also K_SERVICE / K_CONFIGURATION)
   return process.env.K_REVISION || process.env.K_SERVICE || null;
 }
 
@@ -39,98 +38,89 @@ app.get("/health", (req, res) => {
 // Snapshot status / reload
 // --------------------
 app.get("/context/status", async (req, res) => {
-  // add revision here too so you can prove which revision served the status
   const s = await getSnapshotStatus();
-  res.json({
-    ...s,
-    revision: getRevision()
-  });
+  res.json({ ...s, revision: getRevision() });
 });
 
 app.post("/context/reload", async (req, res) => {
   const r = await reloadSnapshot();
-  res.json({
-    ...r,
-    revision: getRevision()
-  });
+  res.json({ ...r, revision: getRevision() });
 });
 
 // --------------------
-// Chat
+// Chat  (GUARDED)
 // --------------------
 app.post("/chat", async (req, res) => {
-  const question = (req.body?.question || "").toString().trim();
-  if (!question) return res.status(400).json({ error: "Missing question" });
-
-  const threadId = getThreadId(req);
-
-  const history = await loadRecentHistory(threadId);
-  const state = deriveStateFromHistory(history);
-
-  const snap = await loadSnapshot({ force: false });
-
-  const out = await handleChat({
-    question,
-    snapshot: snap,
-    history,
-    state
-  });
-
-  const intent =
-    out?.meta?.intent ||
-    (Array.isArray(out?.meta?.intents) ? out.meta.intents[0] : null) ||
-    null;
-
   try {
-    await appendLogTurn({
-      threadId,
-      role: "user",
-      text: question,
-      intent: null,
-      meta: { snapshotId: snap.activeSnapshotId || null, revision: getRevision() }
+    const question = (req.body?.question || "").toString().trim();
+    if (!question) return res.status(400).json({ error: "Missing question", revision: getRevision() });
+
+    const threadId = getThreadId(req);
+    const history = await loadRecentHistory(threadId);
+    const state = deriveStateFromHistory(history);
+
+    const snap = await loadSnapshot({ force: false });
+
+    const out = await handleChat({
+      question,
+      snapshot: snap,
+      history,
+      state
     });
 
-    await appendLogTurn({
-      threadId,
-      role: "assistant",
-      text: out?.answer || "",
-      intent,
-      meta: { ...(out?.meta || null), revision: getRevision(), snapshotId: snap.activeSnapshotId || null }
+    const intent =
+      out?.meta?.intent ||
+      (Array.isArray(out?.meta?.intents) ? out.meta.intents[0] : null) ||
+      null;
+
+    try {
+      await appendLogTurn({
+        threadId,
+        role: "user",
+        text: question,
+        intent: null,
+        meta: { snapshotId: snap.activeSnapshotId || null, revision: getRevision() }
+      });
+
+      await appendLogTurn({
+        threadId,
+        role: "assistant",
+        text: out?.answer || "",
+        intent,
+        meta: { ...(out?.meta || null), revision: getRevision(), snapshotId: snap.activeSnapshotId || null }
+      });
+    } catch (e) {
+      console.warn("[copilot_logs] logging failed:", e?.message || e);
+    }
+
+    return res.json({
+      ...out,
+      meta: {
+        ...(out?.meta || {}),
+        threadId,
+        snapshotId: snap.activeSnapshotId || null,
+        gcsPath: snap.gcsPath || null,
+        revision: getRevision()
+      }
     });
   } catch (e) {
-    console.warn("[copilot_logs] logging failed:", e?.message || e);
+    // ✅ This is the key: no more mysterious 503s.
+    console.error("[/chat] crash:", e?.stack || e);
+    return res.status(200).json({
+      answer: `Backend error in /chat: ${e?.message || String(e)}`,
+      meta: {
+        error: true,
+        revision: getRevision()
+      }
+    });
   }
-
-  res.json({
-    ...out,
-    meta: {
-      ...(out?.meta || {}),
-      threadId,
-      snapshotId: snap.activeSnapshotId || null,
-      gcsPath: snap.gcsPath || null,
-      revision: getRevision()
-    }
-  });
 });
 
 // --------------------
-// Report (PDF)
-// --------------------
-// Works in ALL cases now:
-// ✅ GET  /report?mode=recent         (threadId inferred from request via getThreadId(req))
-// ✅ GET  /report?threadId=xxx&mode=conversation
-// ✅ POST /report { threadId, mode }
-//
-// mode:
-//   - recent       => last 3 assistant answers
-//   - conversation => all assistant answers in thread
+// Report (PDF)  (unchanged)
 // --------------------
 app.get("/report", async (req, res) => {
   const mode = (req.query?.mode || "recent").toString().trim().toLowerCase();
-
-  // ✅ ThreadId can come from:
-  //  1) query param
-  //  2) inferred from request (same as /chat)
   const threadId = (req.query?.threadId || "").toString().trim() || getThreadId(req);
 
   try {
@@ -146,10 +136,6 @@ app.get("/report", async (req, res) => {
 
 app.post("/report", async (req, res) => {
   const mode = (req.body?.mode || "recent").toString().trim().toLowerCase();
-
-  // ✅ ThreadId can come from:
-  //  1) body
-  //  2) inferred from request
   const threadId = (req.body?.threadId || "").toString().trim() || getThreadId(req);
 
   try {
@@ -172,7 +158,7 @@ app.listen(PORT, () => {
 });
 
 // --------------------
-// Report builder (single place)
+// Report builder (same as your current)
 // --------------------
 async function buildReportPdf({ threadId, mode }) {
   if (!threadId) throw new Error("Missing threadId");
@@ -184,27 +170,21 @@ async function buildReportPdf({ threadId, mode }) {
 
   const selected = (mode === "conversation") ? assistants : assistants.slice(-3);
 
-  // Load snapshot to stamp report with the *current* snapshotId used by this revision
   const snap = await loadSnapshot({ force: false });
   const snapshotId = snap.activeSnapshotId || selected[selected.length - 1]?.meta?.snapshotId || "unknown";
-  const revision = getRevision() || "unknown";
-
-  const title = inferReportTitle(history, selected);
   const generatedAt = new Date().toLocaleString();
 
-  // “Normal FarmVista report feel” (static print-first)
   const html = buildReportHtml({
-    title,
+    title: inferReportTitle(history, selected),
     snapshotId,
     generatedAt,
-    revision,
+    revision: getRevision() || "unknown",
     sections: selected.map((a, idx) => ({
       heading: `Section ${idx + 1}`,
       text: a.text
     }))
   });
 
-  // Your existing PDF service
   const pdfResp = await fetch(
     "https://farmvista-pdf-300398089669.us-central1.run.app/pdf-html",
     {
@@ -223,7 +203,6 @@ async function buildReportPdf({ threadId, mode }) {
 }
 
 function inferReportTitle(history, selected) {
-  // Use the most recent user question before the first included assistant answer
   const firstAssistant = selected[0];
   const idx = history.indexOf(firstAssistant);
   for (let i = idx - 1; i >= 0; i--) {
@@ -242,103 +221,19 @@ function buildReportHtml({ title, snapshotId, generatedAt, revision, sections })
   <meta charset="utf-8">
   <title>${safeTitle}</title>
   <style>
-    :root{
-      --fv-green:#3B7E46;
-      --border:#D1D5DB;
-      --muted:#6B7280;
-      --bg:#F3F4F6;
-    }
+    :root{--fv-green:#3B7E46;--border:#D1D5DB;--muted:#6B7280;--bg:#F3F4F6;}
     *{box-sizing:border-box;}
-    body{
-      margin:0;
-      padding:22px;
-      background:var(--bg);
-      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
-      color:#111827;
-      display:flex;
-      justify-content:center;
-    }
-    .page{
-      width:100%;
-      max-width:980px;
-      background:#fff;
-      border-radius:14px;
-      box-shadow:0 10px 30px rgba(15,23,42,.12);
-      padding:20px 22px 22px;
-    }
-    .hdr{
-      display:grid;
-      grid-template-columns:1fr auto;
-      gap:12px;
-      align-items:flex-start;
-      border-bottom:2px solid var(--fv-green);
-      padding-bottom:12px;
-      margin-bottom:14px;
-    }
-    .title{
-      margin:0;
-      font-size:18px;
-      font-weight:950;
-      letter-spacing:.06em;
-      text-transform:uppercase;
-    }
-    .meta{
-      font-size:11px;
-      color:var(--muted);
-      line-height:1.35;
-      text-align:right;
-      white-space:nowrap;
-    }
-    .summary{
-      margin-top:10px;
-      padding:8px 10px;
-      border-radius:12px;
-      background:linear-gradient(90deg, rgba(59,126,70,.10), transparent);
-      border:1px solid rgba(59,126,70,.22);
-      font-size:11px;
-      display:flex;
-      gap:14px;
-      flex-wrap:wrap;
-    }
-    .section{
-      margin-top:16px;
-      padding-top:14px;
-      border-top:1px solid #EEF2F7;
-      break-inside:avoid;
-      page-break-inside:avoid;
-    }
-    .section h2{
-      margin:0 0 8px;
-      font-size:12px;
-      font-weight:950;
-      letter-spacing:.10em;
-      text-transform:uppercase;
-      color:#111827;
-    }
-    .card{
-      border:1px solid var(--border);
-      border-radius:12px;
-      padding:12px 14px;
-      background:#fff;
-      white-space:pre-wrap;
-      line-height:1.45;
-      font-size:13px;
-    }
-    .footer{
-      margin-top:18px;
-      padding-top:10px;
-      border-top:1px solid var(--border);
-      display:flex;
-      justify-content:space-between;
-      gap:12px;
-      font-size:10px;
-      color:var(--muted);
-    }
-    @media print{
-      body{ padding:0; background:#fff; }
-      .page{ max-width:none; border-radius:0; box-shadow:none; padding:9mm 10mm; }
-      .meta{ white-space:normal; }
-    }
+    body{margin:0;padding:22px;background:var(--bg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;color:#111827;display:flex;justify-content:center;}
+    .page{width:100%;max-width:980px;background:#fff;border-radius:14px;box-shadow:0 10px 30px rgba(15,23,42,.12);padding:20px 22px 22px;}
+    .hdr{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:flex-start;border-bottom:2px solid var(--fv-green);padding-bottom:12px;margin-bottom:14px;}
+    .title{margin:0;font-size:18px;font-weight:950;letter-spacing:.06em;text-transform:uppercase;}
+    .meta{font-size:11px;color:var(--muted);line-height:1.35;text-align:right;white-space:nowrap;}
+    .summary{margin-top:10px;padding:8px 10px;border-radius:12px;background:linear-gradient(90deg, rgba(59,126,70,.10), transparent);border:1px solid rgba(59,126,70,.22);font-size:11px;display:flex;gap:14px;flex-wrap:wrap;}
+    .section{margin-top:16px;padding-top:14px;border-top:1px solid #EEF2F7;break-inside:avoid;page-break-inside:avoid;}
+    .section h2{margin:0 0 8px;font-size:12px;font-weight:950;letter-spacing:.10em;text-transform:uppercase;color:#111827;}
+    .card{border:1px solid var(--border);border-radius:12px;padding:12px 14px;background:#fff;white-space:pre-wrap;line-height:1.45;font-size:13px;}
+    .footer{margin-top:18px;padding-top:10px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;font-size:10px;color:var(--muted);}
+    @media print{body{padding:0;background:#fff;}.page{max-width:none;border-radius:0;box-shadow:none;padding:9mm 10mm;}.meta{white-space:normal;}}
   </style>
 </head>
 <body>
@@ -375,10 +270,7 @@ function buildReportHtml({ title, snapshotId, generatedAt, revision, sections })
 }
 
 function esc(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 async function safeReadText(resp) {
