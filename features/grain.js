@@ -1,5 +1,8 @@
 // /features/grain.js  (FULL FILE)
-// Rev: 2025-12-30-human-grain (Human phrasing tolerant; no CLI "Try:" menus; keep data logic intact)
+// Rev: 2025-12-30-human-grain-okflag
+// Change:
+// ✅ Adds ok:true on successful answers so Truth Gate can pass
+// ✅ Adds ok:false on error/empty states (no logic changes)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -120,6 +123,7 @@ export function answerGrain({ question, snapshot, intent }){
 
   if (!json) {
     return {
+      ok: false,
       answer: "Snapshot is not available right now.",
       meta: { snapshotId, snapshotError: snapshot?.lastError || null }
     };
@@ -128,6 +132,7 @@ export function answerGrain({ question, snapshot, intent }){
   const colsRoot = getCollectionsRoot(json);
   if (!colsRoot) {
     return {
+      ok: false,
       answer: "I can’t find grain collections in this snapshot right now.",
       meta: { snapshotId }
     };
@@ -208,12 +213,25 @@ export function answerGrain({ question, snapshot, intent }){
     parts.push(`• Bin movement records: ${fmtInt(binMovesCount)}`);
     parts.push(`• Grain bag event records: ${fmtInt(bagEvents.length)}`);
 
-    return { answer: parts.join("\n"), meta: { snapshotId } };
+    return { ok: true, answer: parts.join("\n"), meta: { snapshotId } };
   }
 
   if (wantsBags(qn) || skuNeedle || mode === "bags") {
     if (!bagMoves.length) {
-      return { answer: "No grain bag inventory records were found in the snapshot.", meta: { snapshotId } };
+      return {
+        ok: false,
+        answer: "No grain bag inventory records were found in the snapshot.",
+        meta: { snapshotId }
+      };
+    }
+
+    // If SKU filter produced nothing, say it plainly (still a valid/true response)
+    if (skuNeedle && bagSum.perSku.length === 0) {
+      return {
+        ok: true,
+        answer: `I didn’t find any grain bag SKUs on hand that match “${skuNeedle}”.`,
+        meta: { snapshotId, skuFilter: skuNeedle, skuCount: bagMovesFiltered.length }
+      };
     }
 
     const title = skuNeedle ? `Grain bags on hand (filtered by “${skuNeedle}”)` : "Grain bags on hand";
@@ -235,15 +253,8 @@ export function answerGrain({ question, snapshot, intent }){
     totals.push(`Totals: ${fmtInt(bagSum.totalBags)} bags`);
     if (bagSum.totalCornBu > 0) totals.push(`${fmtBu(bagSum.totalCornBu)} corn-rated bu`);
 
-    // If SKU filter produced nothing, say it plainly
-    if (skuNeedle && bagSum.perSku.length === 0) {
-      return {
-        answer: `I didn’t find any grain bag SKUs on hand that match “${skuNeedle}”.`,
-        meta: { snapshotId, skuFilter: skuNeedle, skuCount: bagMovesFiltered.length }
-      };
-    }
-
     return {
+      ok: true,
       answer: `${title}:\n\n${lines.join("\n")}\n\n${totals.join(" • ")}${footer}`,
       meta: {
         snapshotId,
@@ -255,7 +266,7 @@ export function answerGrain({ question, snapshot, intent }){
 
   if (wantsBins(qn) || mode === "bins") {
     if (!binSites.length) {
-      return { answer: "No bin sites were found in the snapshot.", meta: { snapshotId } };
+      return { ok: false, answer: "No bin sites were found in the snapshot.", meta: { snapshotId } };
     }
 
     const names = binSites.slice(0, 30).map((b, i) => {
@@ -268,6 +279,7 @@ export function answerGrain({ question, snapshot, intent }){
     });
 
     return {
+      ok: true,
       answer:
         `Bin sites (${binSites.length}):\n\n` +
         names.join("\n") +
@@ -279,6 +291,7 @@ export function answerGrain({ question, snapshot, intent }){
 
   // Default (human, not a command menu)
   return {
+    ok: true,
     answer:
       `I can summarize grain, show grain bags on hand, or list bin sites.\n` +
       `For example: “grain summary”, “grain bags”, or “grain bins”.`,
