@@ -1,5 +1,5 @@
 // /features/fields.js  (FULL FILE)
-// Rev: 2025-12-30-human-fields (Fix nestedCandidates comma + human phrasing + no CLI "Try:" menus)
+// Rev: 2025-12-30-fields-firefoo-root (Use Firefoo __collections__.fields directly; fix acres=tillable; join farmId->farmName; no CLI Try: menus)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 const isNum = (s) => /^[0-9]+$/.test((s || "").toString().trim());
@@ -24,199 +24,74 @@ function fmtAcres(v) {
   return n % 1 === 0 ? String(n) : n.toFixed(2);
 }
 
-// -----------------------------
-// Field "shape" scoring
-// -----------------------------
-function fieldScore(o) {
-  if (!o || typeof o !== "object") return 0;
+function safeStr(v){ return (v == null) ? "" : String(v); }
 
-  const hasName = !!pick(o, ["name", "fieldName", "label", "title"]);
-  const hasAcres = pick(o, ["acres", "areaAcres", "tillableAcres", "acresTillable", "area"]) != null;
-  const hasFarm = !!pick(o, ["farmName", "farm", "farmLabel"]);
-  const hasFsa = !!pick(o, ["fsaFarm", "fsaFarmNumber", "farmNumber", "tract", "tractNumber", "fsaField", "fsaFieldNumber"]);
-  const hasGeo = !!pick(o, ["lat", "lon", "lng", "latitude", "longitude", "centerLat", "centerLon", "centerLng", "boundaryId", "polygonId", "shapeId", "boundary"]);
-
-  let score = 0;
-  if (hasName) score += 3;
-  if (hasAcres) score += 3;
-  if (hasFarm) score += 2;
-  if (hasFsa) score += 1;
-  if (hasGeo) score += 1;
-
-  return score;
-}
-
-function looksLikeFieldArray(arr) {
-  if (!Array.isArray(arr) || arr.length === 0) return { ok: false, score: 0 };
-  const sample = arr.slice(0, 25).filter(v => v && typeof v === "object");
-  if (!sample.length) return { ok: false, score: 0 };
-
-  const scores = sample.map(fieldScore);
-  const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
-
-  // Threshold: needs to look pretty field-ish
-  return { ok: avg >= 3.5, score: avg };
-}
-
-// Some exports store collections as objects-of-objects instead of arrays:
-// { fields: { docId1:{...}, docId2:{...} } }
-function objectOfObjectsToArray(obj) {
-  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
-  const keys = Object.keys(obj);
-  if (keys.length < 1) return null;
-
-  // If most values are objects, convert
-  let objCount = 0;
-  const out = [];
-  for (const k of keys.slice(0, 5000)) {
-    const v = obj[k];
-    if (v && typeof v === "object" && !Array.isArray(v)) {
-      objCount++;
-      out.push({ id: k, ...v });
-    }
-  }
-  if (!out.length) return null;
-
-  // If at least half look like objects, accept
-  if (objCount / Math.min(keys.length, 5000) >= 0.5) return out;
+function getCollectionsRoot(snapshotJson){
+  const d = snapshotJson || {};
+  if (d.data && d.data.__collections__ && typeof d.data.__collections__ === "object") return d.data.__collections__;
+  if (d.__collections__ && typeof d.__collections__ === "object") return d.__collections__;
   return null;
 }
 
-function getAtPath(root, pathParts) {
-  let cur = root;
-  for (const p of pathParts) {
-    if (!cur || typeof cur !== "object") return null;
-    cur = cur[p];
+function colAsArray(colsRoot, name){
+  if (!colsRoot || !colsRoot[name] || typeof colsRoot[name] !== "object") return [];
+  const objMap = colsRoot[name];
+  const out = [];
+  for (const [id, v] of Object.entries(objMap)) {
+    if (v && typeof v === "object") out.push({ id, ...v });
   }
-  return cur;
+  return out;
 }
 
-// Auto-discover fields anywhere in snapshot (depth-limited)
-export function findFieldsRoot(snapshotJson) {
-  const d = snapshotJson || {};
-  const topKeys = (d && typeof d === "object") ? Object.keys(d) : [];
-
-  // 1) Quick common keys (fast path)
-  const directCandidates = [
-    "fields",
-    "fieldList",
-    "fv_fields",
-    "Fields",
-    "FIELDs"
-  ];
-
-  for (const k of directCandidates) {
-    if (Array.isArray(d[k])) return { key: k, arr: d[k], method: "direct" };
-    const asArr = objectOfObjectsToArray(d[k]);
-    if (asArr) {
-      const chk = looksLikeFieldArray(asArr);
-      if (chk.ok) return { key: k, arr: asArr, method: "direct-objectmap" };
-    }
+function buildFarmNameMap(colsRoot){
+  const farms = colAsArray(colsRoot, "farms");
+  const map = new Map();
+  for (const f of farms) {
+    const id = safeStr(f.id).trim();
+    const name = safeStr(f.name).trim();
+    if (id) map.set(id, name || id);
   }
-
-  // 2) Nested common patterns
-  // ✅ FIXED: missing comma after ["fv","fields"]
-  const nestedCandidates = [
-    ["collections", "fields"],
-    ["collections", "fieldList"],
-    ["data", "fields"],
-    ["export", "fields"],
-    ["snapshot", "fields"],
-    ["fv", "fields"],
-    ["data", "__collections__", "fields"],
-    ["__collections__", "fields"],
-  ];
-
-  for (const path of nestedCandidates) {
-    const v = getAtPath(d, path);
-    if (Array.isArray(v)) return { key: path.join("."), arr: v, method: "nested" };
-
-    const asArr = objectOfObjectsToArray(v);
-    if (asArr) {
-      const chk = looksLikeFieldArray(asArr);
-      if (chk.ok) return { key: path.join("."), arr: asArr, method: "nested-objectmap" };
-    }
-  }
-
-  // 3) Brute scan (depth 4), score candidates
-  const best = { key: null, arr: [], score: 0, method: "scan" };
-  const seen = new Set();
-
-  function scan(node, path, depth) {
-    if (!node || typeof node !== "object") return;
-    if (depth > 4) return;
-
-    // Avoid cycles
-    if (seen.has(node)) return;
-    seen.add(node);
-
-    if (Array.isArray(node)) {
-      // Candidate array
-      const chk = looksLikeFieldArray(node);
-      if (chk.ok && chk.score > best.score) {
-        best.key = path || "(root array)";
-        best.arr = node;
-        best.score = chk.score;
-      }
-      return;
-    }
-
-    // Object-of-objects candidate
-    const maybeArr = objectOfObjectsToArray(node);
-    if (maybeArr) {
-      const chk = looksLikeFieldArray(maybeArr);
-      if (chk.ok && chk.score > best.score) {
-        best.key = path || "(root objectmap)";
-        best.arr = maybeArr;
-        best.score = chk.score;
-      }
-    }
-
-    for (const k of Object.keys(node)) {
-      const v = node[k];
-      if (!v || typeof v !== "object") continue;
-      const nextPath = path ? `${path}.${k}` : k;
-      scan(v, nextPath, depth + 1);
-    }
-  }
-
-  scan(d, "", 0);
-
-  if (best.key && best.arr.length) {
-    return { key: best.key, arr: best.arr, method: `scan(score=${best.score.toFixed(2)})`, topKeys };
-  }
-
-  return { key: null, arr: [], method: "not-found", topKeys };
+  return map;
 }
 
-function fieldDisplayName(f) {
+function fieldDisplayName(f, farmNameMap) {
   const name = pick(f, ["name", "fieldName", "label", "title"]) || "";
-  const farm = pick(f, ["farmName", "farm", "farmLabel"]) || "";
-  const id = pick(f, ["id", "fieldId", "docId"]) || "";
+  const id = pick(f, ["id", "fieldId", "docId"]) || f.id || "";
   const num = pick(f, ["fieldNumber", "number"]) || "";
+
+  const farmId = safeStr(pick(f, ["farmId"])).trim();
+  const farmName =
+    safeStr(pick(f, ["farmName", "farm", "farmLabel"])).trim() ||
+    (farmId && farmNameMap && farmNameMap.has(farmId) ? farmNameMap.get(farmId) : "");
+
   const base = name || (num ? `Field ${num}` : id ? String(id) : "Field");
-  return farm ? `${base} (${farm})` : base;
+  return farmName ? `${base} (${farmName})` : base;
 }
 
-function summarizeFieldDetailed(f) {
+function summarizeFieldDetailed(f, farmNameMap) {
   const out = {};
-  out.id = pick(f, ["id", "fieldId", "docId"]);
+  const farmId = safeStr(pick(f, ["farmId"])).trim();
+  const farmName =
+    safeStr(pick(f, ["farmName", "farm", "farmLabel"])).trim() ||
+    (farmId && farmNameMap && farmNameMap.has(farmId) ? farmNameMap.get(farmId) : "");
+
+  out.id = pick(f, ["id", "fieldId", "docId"]) || f.id;
   out.name = pick(f, ["name", "fieldName", "label", "title"]);
-  out.farm = pick(f, ["farmName", "farm", "farmLabel"]);
-  out.acres = fmtAcres(pick(f, ["acres", "areaAcres", "tillableAcres", "acresTillable", "area"]));
+  out.farm = farmName || null;
+  out.farmId = farmId || null;
+
+  // ✅ IMPORTANT: your snapshot uses "tillable" for acres
+  out.acres = fmtAcres(pick(f, ["tillable", "tillableAcres", "acres", "areaAcres", "acresTillable", "area"]));
+
   out.county = pick(f, ["county"]);
   out.state = pick(f, ["state"]);
+  out.status = pick(f, ["status"]);
 
-  out.lat = pick(f, ["lat", "latitude", "centerLat"]);
-  out.lon = pick(f, ["lon", "lng", "longitude", "centerLon", "centerLng"]);
-
-  out.fsaFarm = pick(f, ["fsaFarm", "fsaFarmNumber", "farmNumber"]);
-  out.tract = pick(f, ["tract", "tractNumber"]);
-  out.fsaField = pick(f, ["fsaField", "fsaFieldNumber", "fieldNumber"]);
-
-  out.boundaryId = pick(f, ["boundaryId", "boundary", "shapeId", "polygonId"]);
-  out.soil = pick(f, ["soilType", "soil", "soilClass"]);
-  out.notes = pick(f, ["notes", "note"]);
+  out.rtkTowerId = pick(f, ["rtkTowerId"]);
+  out.hasHEL = pick(f, ["hasHEL"]);
+  out.helAcres = fmtAcres(pick(f, ["helAcres"]));
+  out.hasCRP = pick(f, ["hasCRP"]);
+  out.crpAcres = fmtAcres(pick(f, ["crpAcres"]));
 
   for (const k of Object.keys(out)) {
     if (out[k] == null || out[k] === "") delete out[k];
@@ -228,23 +103,25 @@ function formatBullets(obj) {
   return Object.entries(obj || {}).map(([k, v]) => `• ${k}: ${v}`).join("\n");
 }
 
-function findField(fields, needleRaw) {
+function findField(fields, needleRaw, farmNameMap) {
   const needle = (needleRaw || "").trim();
   const n = norm(needle);
   if (!n) return null;
 
+  // numeric match: fieldNumber OR id
   if (isNum(needle)) {
     return (
       fields.find(f => String(pick(f, ["fieldNumber", "number"]) || "").trim() === needle) ||
-      fields.find(f => String(pick(f, ["id", "fieldId", "docId"]) || "").trim() === needle) ||
+      fields.find(f => String((pick(f, ["id", "fieldId", "docId"]) || f.id || "")).trim() === needle) ||
       null
     );
   }
 
+  // name match
   return (
     fields.find(f => norm(pick(f, ["name", "fieldName", "label", "title"])) === n) ||
     fields.find(f => norm(pick(f, ["name", "fieldName", "label", "title"])).includes(n)) ||
-    fields.find(f => norm(fieldDisplayName(f)).includes(n)) ||
+    fields.find(f => norm(fieldDisplayName(f, farmNameMap)).includes(n)) ||
     null
   );
 }
@@ -267,13 +144,9 @@ export function canHandleFields(question) {
   const q = norm(question);
   if (!q) return false;
 
-  // list-ish
   if (wantsList(q)) return true;
-
-  // debug
   if (q === "debug fields" || q === "fields debug") return true;
 
-  // detail
   if (/^(field|show field|open field)\s*[:#]?\s*.+$/i.test(question)) return true;
 
   return false;
@@ -293,19 +166,28 @@ export function answerFields({ question, snapshot, intent }) {
     };
   }
 
-  const { key: fieldsKey, arr: fields, method, topKeys } = findFieldsRoot(json);
+  const colsRoot = getCollectionsRoot(json);
+  if (!colsRoot) {
+    return {
+      answer: "I can’t find Firefoo collections in this snapshot.",
+      meta: { snapshotId }
+    };
+  }
+
+  // ✅ Authoritative: use Firefoo collection directly
+  const fields = colAsArray(colsRoot, "fields");
+  const farmNameMap = buildFarmNameMap(colsRoot);
 
   const debugRequested = (qn === "debug fields" || qn === "fields debug");
-
   if (debugRequested) {
+    const keys = Object.keys(colsRoot);
     return {
       answer:
         `Fields diagnostic:\n` +
-        `• Source: ${fieldsKey || "(not found)"}\n` +
-        `• Count: ${fields.length}\n` +
-        (method ? `• Method: ${method}\n` : "") +
-        (topKeys && topKeys.length ? `• Top keys: ${topKeys.slice(0, 18).join(", ")}` : ""),
-      meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method, topKeys: (topKeys || []).slice(0, 30), diagnostic: true }
+        `• collectionsRoot: YES\n` +
+        `• fields collection: ${fields.length}\n` +
+        `• collections keys (first 25): ${keys.slice(0, 25).join(", ")}${keys.length > 25 ? " …" : ""}`,
+      meta: { snapshotId, fieldsCount: fields.length, diagnostic: true, keys: keys.slice(0, 50) }
     };
   }
 
@@ -313,27 +195,29 @@ export function answerFields({ question, snapshot, intent }) {
   if (wantsList(qn) || (intent && intent.topic === "fields" && intent.mode === "list")) {
     if (!fields.length) {
       return {
-        answer: "I can’t locate fields in the snapshot right now.",
-        meta: { snapshotId, fieldsKey, fieldsCount: 0, method }
+        answer: "No fields were found in the snapshot.",
+        meta: { snapshotId, fieldsCount: 0 }
       };
     }
 
-    const lines = fields.slice(0, 50).map((f, i) => {
-      const name = fieldDisplayName(f);
-      const acres = fmtAcres(pick(f, ["acres", "areaAcres", "tillableAcres", "acresTillable", "area"]));
-      const farm = pick(f, ["farmName", "farm", "farmLabel"]);
+    const shownMax = 50;
+    const lines = fields.slice(0, shownMax).map((f, i) => {
+      const name = fieldDisplayName(f, farmNameMap);
+      const acres = fmtAcres(pick(f, ["tillable", "tillableAcres", "acres", "areaAcres", "acresTillable", "area"]));
       const bits = [];
       if (acres) bits.push(`${acres} ac`);
-      if (farm && !name.includes(`(${farm})`)) bits.push(farm);
       return `${i + 1}. ${name}${bits.length ? ` — ${bits.join(" • ")}` : ""}`;
     });
 
+    const n = fields.length;
+    const noun = (n === 1) ? "field" : "fields";
+
     return {
       answer:
-        `You have ${fields.length} fields.\n\n` +
+        `You have ${n} ${noun}.\n\n` +
         lines.join("\n") +
-        (fields.length > 50 ? `\n\n(Showing first 50. Ask “field <name>” for details.)` : ""),
-      meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method }
+        (n > shownMax ? `\n\n(Showing first ${shownMax}. Ask “field <name>” for details.)` : ""),
+      meta: { snapshotId, fieldsCount: n }
     };
   }
 
@@ -346,38 +230,35 @@ export function answerFields({ question, snapshot, intent }) {
   if (m) {
     if (!fields.length) {
       return {
-        answer: "I can’t locate fields in the snapshot right now.",
-        meta: { snapshotId, fieldsKey, fieldsCount: 0, method }
+        answer: "No fields were found in the snapshot.",
+        meta: { snapshotId, fieldsCount: 0 }
       };
     }
 
     const needle = (m[1] || "").trim();
-    const found = findField(fields, needle);
+    const found = findField(fields, needle, farmNameMap);
 
     if (!found) {
-      // Human fallback: show a short subset and suggest re-trying with a closer name
-      const sample = fields.slice(0, 12).map(f => `• ${fieldDisplayName(f)}`).join("\n");
+      const sample = fields.slice(0, 12).map(f => `• ${fieldDisplayName(f, farmNameMap)}`).join("\n");
       return {
         answer:
           `I couldn’t find a field matching “${needle}”.\n\n` +
-          `Here are a few field names to pick from:\n${sample}\n\n` +
-          `If you tell me the closest match, I’ll open it.`,
-        meta: { snapshotId, fieldsKey, fieldsCount: fields.length, method, needle }
+          `Here are a few field names to pick from:\n${sample}`,
+        meta: { snapshotId, needle, fieldsCount: fields.length }
       };
     }
 
-    const detail = summarizeFieldDetailed(found);
+    const detail = summarizeFieldDetailed(found, farmNameMap);
     return {
       answer: `Field details:\n${formatBullets(detail)}`,
-      meta: { snapshotId, fieldsKey, method, needle }
+      meta: { snapshotId, needle }
     };
   }
 
-  // Default (human, no "Try:" menu)
   return {
     answer:
       `I can list your fields or open a specific field.\n` +
-      `For example: “list fields” or “field North 80”.`,
+      `For example: “show all fields” or “field 0513”.`,
     meta: { snapshotId }
   };
 }
