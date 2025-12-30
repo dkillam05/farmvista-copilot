@@ -1,3 +1,6 @@
+// /features/boundaryRequests.js  (FULL FILE)
+// Rev: 2025-12-30-human-boundaries (Human phrasing tolerant; no CLI "Try:" menus; no snapshotId in user text)
+
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
 function getCollectionsRoot(snapshotJson){
@@ -30,13 +33,6 @@ function parseTime(v){
   return null;
 }
 
-function fmtDate(ms){
-  if (!ms) return null;
-  try{
-    return new Date(ms).toLocaleString(undefined, { month:"short", day:"numeric", year:"numeric" });
-  }catch{ return null; }
-}
-
 function safeStr(v){ return (v == null) ? "" : String(v); }
 
 function normalizeStatus(v){
@@ -61,17 +57,36 @@ function summarizeOne(r){
   return `• ${r.id} — ${status}${bits.length ? ` • ${bits.join(" • ")}` : ""}`;
 }
 
+function wantsSummary(qn){
+  if (!qn) return false;
+  return (
+    qn === "boundaries" ||
+    qn === "boundary" ||
+    qn === "boundary requests" ||
+    qn === "boundaries summary" ||
+    qn === "boundary summary" ||
+    qn.includes("boundary fixes") ||
+    qn.includes("field boundary") ||
+    qn.includes("boundary request")
+  );
+}
+
 export function canHandleBoundaryRequests(question){
   const q = norm(question);
   if (!q) return false;
 
-  if (q === "boundaries" || q === "boundary" || q === "boundary requests" || q === "boundaries summary") return true;
+  if (wantsSummary(q)) return true;
+
   if (q.startsWith("boundaries")) return true;
   if (q.startsWith("boundary ")) return true;
+
+  // very common phrasing
+  if (q.includes("boundary") && (q.includes("open") || q.includes("closed") || q.includes("fix"))) return true;
+
   return false;
 }
 
-export function answerBoundaryRequests({ question, snapshot }){
+export function answerBoundaryRequests({ question, snapshot, intent }){
   const q = (question || "").toString().trim();
   const qn = norm(q);
 
@@ -80,7 +95,7 @@ export function answerBoundaryRequests({ question, snapshot }){
   if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
-  if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
+  if (!colsRoot) return { answer: "I can’t find boundary request collections in this snapshot right now.", meta: { snapshotId } };
 
   const reqs = colAsArray(colsRoot, "boundary_requests").map(r => ({
     ...r,
@@ -89,32 +104,30 @@ export function answerBoundaryRequests({ question, snapshot }){
     __status: normalizeStatus(r.status)
   }));
 
-  if (!reqs.length) return { answer: "No boundary_requests found in the snapshot.", meta: { snapshotId } };
+  if (!reqs.length) return { answer: "No boundary requests were found in the snapshot.", meta: { snapshotId } };
 
-  // summary
-  if (qn === "boundaries" || qn === "boundary requests" || qn === "boundaries summary") {
+  // ---------- summary ----------
+  if (wantsSummary(qn) || (intent && intent.mode === "summary")) {
     const total = reqs.length;
     const open = reqs.filter(r => r.__status === "open").length;
     const closed = reqs.filter(r => r.__status === "closed").length;
 
     return {
       answer:
-        `Boundary requests summary (snapshot ${snapshotId}):\n` +
+        `Boundary requests summary:\n` +
         `• Total: ${total}\n` +
         `• Open: ${open}\n` +
-        `• Closed: ${closed}\n\n` +
-        `Try:\n` +
-        `• "boundaries open"\n` +
-        `• "boundaries closed"\n` +
-        `• "boundaries farm Lowder"\n` +
-        `• "boundaries field 1323-Masonic N"\n` +
-        `• "boundary <id>"`,
+        `• Closed: ${closed}`,
       meta: { snapshotId, total, open, closed }
     };
   }
 
-  // boundaries open/closed
-  let m = /^boundaries\s+(open|closed)\s*$/i.exec(q);
+  // ---------- open/closed ----------
+  // Support:
+  // "boundaries open", "open boundaries", "boundary requests open"
+  let m = /^boundaries\s+(open|closed)\s*$/i.exec(q) ||
+          /^(open|closed)\s+boundaries\s*$/i.exec(q) ||
+          /^boundary\s+requests\s+(open|closed)\s*$/i.exec(q);
   if (m) {
     const st = norm(m[1]);
     const list = reqs.filter(r => r.__status === st);
@@ -126,10 +139,11 @@ export function answerBoundaryRequests({ question, snapshot }){
     };
   }
 
-  // boundaries farm <name>
-  m = /^boundaries\s+farm\s+(.+)\s*$/i.exec(q);
+  // ---------- by farm ----------
+  // "boundaries farm Lowder", "boundaries for farm Lowder"
+  m = /^boundaries\s+(farm|for\s+farm)\s+(.+)\s*$/i.exec(q);
   if (m) {
-    const needle = m[1].trim();
+    const needle = (m[2] || "").trim();
     const nn = norm(needle);
     const list = reqs.filter(r => norm(r.farm).includes(nn));
     const show = [...list].sort((a,b)=> (b.__updatedMs||0)-(a.__updatedMs||0)).slice(0, 40);
@@ -140,10 +154,11 @@ export function answerBoundaryRequests({ question, snapshot }){
     };
   }
 
-  // boundaries field <name>
-  m = /^boundaries\s+field\s+(.+)\s*$/i.exec(q);
+  // ---------- by field ----------
+  // "boundaries field 1323-Masonic N", "boundaries for field ..."
+  m = /^boundaries\s+(field|for\s+field)\s+(.+)\s*$/i.exec(q);
   if (m) {
-    const needle = m[1].trim();
+    const needle = (m[2] || "").trim();
     const nn = norm(needle);
     const list = reqs.filter(r => norm(r.field).includes(nn));
     const show = [...list].sort((a,b)=> (b.__updatedMs||0)-(a.__updatedMs||0)).slice(0, 40);
@@ -154,14 +169,14 @@ export function answerBoundaryRequests({ question, snapshot }){
     };
   }
 
-  // boundary <id>
+  // ---------- detail: boundary <id> ----------
   m = /^boundary\s+([a-zA-Z0-9_-]+)\s*$/i.exec(q);
   if (m) {
     const id = m[1].trim();
     const found = reqs.find(r => r.id === id) || null;
 
     if (!found) {
-      return { answer: `No boundary request found with id ${id}.`, meta: { snapshotId } };
+      return { answer: `I couldn’t find a boundary request with id "${id}".`, meta: { snapshotId } };
     }
 
     const lines = [];
@@ -180,19 +195,14 @@ export function answerBoundaryRequests({ question, snapshot }){
     const photos = Array.isArray(found.photos) ? found.photos : [];
     lines.push(`• photos: ${photos.length}`);
 
-    lines.push(`\nTip: ask "boundary ${found.id} photos" to list photo URLs (we can add that next).`);
-
     return { answer: lines.join("\n"), meta: { snapshotId, boundaryId: found.id } };
   }
 
+  // Default human fallback
   return {
     answer:
-      `Try:\n` +
-      `• boundaries summary\n` +
-      `• boundaries open\n` +
-      `• boundaries farm Lowder\n` +
-      `• boundaries field 1323-Masonic N\n` +
-      `• boundary <id>`,
+      `I can summarize boundary requests, show open/closed, or filter by farm/field.\n` +
+      `For example: “open boundaries”, “boundaries farm Lowder”, or “boundary <id>”.`,
     meta: { snapshotId }
   };
 }
