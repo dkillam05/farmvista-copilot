@@ -1,6 +1,5 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2025-12-29-hardroute-clean (Removed fieldReadinessWeather; readiness always uses fieldReadinessLatest)
-// NOTE: Dane is deleting /features/fieldReadinessWeather.js — this file removes all refs so build won't break.
+// Rev: 2025-12-30-equip-route (Routes "equipment" phrasing directly to answerEquipment)
 
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -52,18 +51,20 @@ const norm = (s) => (s || "").toString().trim().toLowerCase();
 
 function isReadinessQuery(qn) {
   if (!qn) return false;
-
-  // Debug phrases (force readiness)
-  if (qn.includes("readiness debug")) return true;
-
-  // direct
   if (qn.includes("readiness")) return true;
-  if (qn.includes("field readiness")) return true;
-
-  // natural
   if (qn.includes("how ready") && qn.includes("field")) return true;
   if (qn.includes("which fields") && (qn.includes("plant") || qn.includes("spray") || qn.includes("work") || qn.includes("till"))) return true;
   if (qn.includes("can we plant") || qn.includes("can we spray") || qn.includes("can we work") || qn.includes("can we till")) return true;
+  return false;
+}
+
+function isEquipmentQuery(qn) {
+  // ✅ catches "equipment list", "equipment", "show equipment", etc.
+  if (!qn) return false;
+  if (qn.includes("equipment")) return true;
+
+  // Optional: if you want these to count as equipment too, keep them:
+  if (qn.includes("tractor") || qn.includes("combine") || qn.includes("sprayer") || qn.includes("implement")) return true;
 
   return false;
 }
@@ -79,7 +80,7 @@ export async function handleChat({ question, snapshot }) {
       answer:
         `✅ Report ready.\n` +
         `I’m opening the PDF now.\n\n` +
-        `Open again: /report?mode=${mode}`,
+        `View PDF: /report?mode=${mode}`,
       action: "report",
       meta: { intent: "report", reportMode: mode, reportUrl: `/report?mode=${mode}` }
     };
@@ -87,12 +88,17 @@ export async function handleChat({ question, snapshot }) {
 
   const qn = norm(question);
 
-  // ✅ Readiness ALWAYS uses fieldReadinessLatest now
+  // ✅ Readiness always uses fieldReadinessLatest
   if (isReadinessQuery(qn)) {
     return answerFieldReadinessLatest({ question, snapshot });
   }
 
-  // other features
+  // ✅ Equipment: route even if canHandleEquipment is picky
+  if (isEquipmentQuery(qn)) {
+    return answerEquipment({ question, snapshot });
+  }
+
+  // Other features
   if (canHandleEquipment(question)) return answerEquipment({ question, snapshot });
   if (canHandleBoundaryRequests(question)) return answerBoundaryRequests({ question, snapshot });
   if (canHandleBinSites(question)) return answerBinSites({ question, snapshot });
@@ -113,11 +119,11 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFarms(question)) return answerFarms({ question, snapshot });
   if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
-  // fallback
   return {
     answer:
       `Try:\n` +
-      `• Readiness: "readiness summary", "which fields can we plant right now", "readiness top 10", "readiness debug snapshot"\n` +
+      `• Equipment: "equipment list", "equipment summary", "equipment type tractor", "equipment search 8R"\n` +
+      `• Readiness: "readiness top", "which fields can we plant right now"\n` +
       `• Combine: "combine yield last 10", "combine loss last 10", "yield calibration last 10"\n` +
       `• Fields: "list fields"\n\n` +
       `When ready, say: "make this into a report" / "print this" / "export pdf"`,
