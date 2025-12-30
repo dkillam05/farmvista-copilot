@@ -1,3 +1,18 @@
+// /context/copilotLogs.js  (FULL FILE)
+// Rev: 2025-12-30a
+//
+// Fix (per Dane):
+// ✅ NO MORE 503s when Firestore index is missing.
+//    - loadRecentHistory() gracefully falls back to a threadId-only query (no orderBy),
+//      and if that still fails, returns [].
+//    - appendLogTurn() never throws (best-effort logging).
+// ✅ Keeps your threadId logic EXACTLY.
+// ✅ Keeps deriveStateFromHistory EXACTLY.
+//
+// NOTE:
+// - Best fix is still to CREATE the composite index Google links you to.
+// - This file makes the system resilient even before the index finishes building.
+
 import admin from "firebase-admin";
 
 const COL = "copilot_logs";
@@ -49,32 +64,81 @@ export async function appendLogTurn({ threadId, role, text, intent, meta }) {
     createdAt: nowTs()
   };
 
-  // Add-only (append log)
-  await db.collection(COL).add(doc);
+  // Best-effort logging: never throw (prevents chat failures)
+  try {
+    await db.collection(COL).add(doc);
+  } catch (e) {
+    console.warn("[copilot_logs] appendLogTurn failed:", e?.message || e);
+  }
+}
+
+function isMissingIndexError(e) {
+  const msg = (e?.message || "").toString();
+  // Firestore index missing typically shows FAILED_PRECONDITION and "requires an index"
+  return msg.includes("FAILED_PRECONDITION") && msg.toLowerCase().includes("requires an index");
 }
 
 export async function loadRecentHistory(threadId) {
-  const tid = cleanStr(threadId);
+  const tid = cleanStr(threadId).trim();
   if (!tid) return [];
 
-  // newest first, then reverse for chronological
-  const snap = await db.collection(COL)
-    .where("threadId", "==", tid)
-    .orderBy("createdAt", "desc")
-    .limit(MAX_HISTORY)
-    .get();
+  // 1) Preferred query (chronological via createdAt) — requires composite index
+  try {
+    const snap = await db.collection(COL)
+      .where("threadId", "==", tid)
+      .orderBy("createdAt", "desc")
+      .limit(MAX_HISTORY)
+      .get();
 
-  const rows = [];
-  snap.forEach(d => rows.push({ id: d.id, ...(d.data() || {}) }));
-  rows.reverse();
+    const rows = [];
+    snap.forEach(d => rows.push({ id: d.id, ...(d.data() || {}) }));
+    rows.reverse();
 
-  // Normalize history objects (what chat layer needs)
-  return rows.map(r => ({
-    role: cleanStr(r.role) || "user",
-    text: cleanStr(r.text),
-    intent: r.intent || null,
-    createdAt: r.createdAt || null
-  }));
+    return rows.map(r => ({
+      role: cleanStr(r.role) || "user",
+      text: cleanStr(r.text),
+      intent: r.intent || null,
+      createdAt: r.createdAt || null
+    }));
+  } catch (e) {
+    // If missing index, fall back. Otherwise still fall back, but log.
+    if (isMissingIndexError(e)) {
+      console.warn("[copilot_logs] missing index for history query — using fallback (no orderBy)");
+    } else {
+      console.warn("[copilot_logs] history query failed — using fallback:", e?.message || e);
+    }
+  }
+
+  // 2) Fallback query (no orderBy) — avoids composite index
+  //    NOTE: Firestore will return in unspecified order; we sort client-side when possible.
+  try {
+    const snap = await db.collection(COL)
+      .where("threadId", "==", tid)
+      .limit(MAX_HISTORY)
+      .get();
+
+    const rows = [];
+    snap.forEach(d => rows.push({ id: d.id, ...(d.data() || {}) }));
+
+    // Try to sort by createdAt client-side (if timestamps present)
+    rows.sort((a, b) => {
+      const at = a?.createdAt?.toMillis ? a.createdAt.toMillis() :
+                 (typeof a?.createdAt?.seconds === "number" ? a.createdAt.seconds * 1000 : 0);
+      const bt = b?.createdAt?.toMillis ? b.createdAt.toMillis() :
+                 (typeof b?.createdAt?.seconds === "number" ? b.createdAt.seconds * 1000 : 0);
+      return at - bt;
+    });
+
+    return rows.map(r => ({
+      role: cleanStr(r.role) || "user",
+      text: cleanStr(r.text),
+      intent: r.intent || null,
+      createdAt: r.createdAt || null
+    }));
+  } catch (e) {
+    console.warn("[copilot_logs] fallback history query failed — returning empty history:", e?.message || e);
+    return [];
+  }
 }
 
 export function deriveStateFromHistory(history) {
