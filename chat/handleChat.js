@@ -120,13 +120,14 @@ export async function handleChat({ question, snapshot }) {
   if (canHandleFieldMaintenance(question)) return answerFieldMaintenance({ question, snapshot });
 
   return {
-    answer:
-      `Try:\n` +
-      `• Equipment: "equipment list", "equipment summary", "equipment type tractor", "equipment search 8R"\n` +
-      `• Readiness: "readiness top", "which fields can we plant right now"\n` +
-      `• Combine: "combine yield last 10", "combine loss last 10", "yield calibration last 10"\n` +
-      `• Fields: "list fields"\n\n` +
-      `When ready, say: "make this into a report" / "print this" / "export pdf"`,
-    meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
-  };
+  answer:
+    `I’m still early in development and learning how different questions are phrased.\n\n` +
+    `I may not always interpret your request perfectly yet, but when I do answer, the data itself is accurate and coming directly from FarmVista.\n\n` +
+    `If that didn’t come back the way you expected, try rephrasing a bit. For example:\n` +
+    `• Equipment: “equipment list”, “equipment summary”, “tractors”, “combines”\n` +
+    `• Field readiness: “readiness top”, “which fields can we plant right now”\n` +
+    `• Fields: “list fields”, “fields by farm”\n\n` +
+    `You can also say something like “show me” or “give me a list of …” — I’ll keep improving how I interpret those.`,
+  meta: { snapshotId: snapshot?.activeSnapshotId || "unknown" }
+};
 }
