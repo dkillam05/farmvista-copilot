@@ -27,6 +27,26 @@ function parseGsPath(gsPath) {
   return { bucket: m[1], object: m[2] };
 }
 
+function normalizeUploadedAt(v) {
+  if (!v) return null;
+  try {
+    // Firestore Timestamp
+    if (v && typeof v.toDate === "function") {
+      const d = v.toDate();
+      return d && Number.isFinite(d.getTime()) ? d.toISOString() : null;
+    }
+    // Firefoo export style
+    if (v && typeof v === "object" && typeof v.__time__ === "string") {
+      const ms = Date.parse(v.__time__);
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : v.__time__;
+    }
+    // already a string
+    if (typeof v === "string") return v.trim() || null;
+  } catch {}
+  // fallback
+  try { return String(v); } catch { return null; }
+}
+
 async function readActivePointer() {
   const ref = db.doc(SNAP_DOC_PATH);
   const snap = await ref.get();
@@ -35,7 +55,7 @@ async function readActivePointer() {
   const d = snap.data() || {};
   const activeSnapshotId = (d.activeSnapshotId || "").toString().trim() || null;
   const gcsPath = (d.gcsPath || "").toString().trim() || null;
-  const uploadedAt = (d.uploadedAt || "").toString().trim() || null;
+  const uploadedAt = normalizeUploadedAt(d.uploadedAt);
 
   if (!gcsPath) throw new Error(`copilot_snapshots/active is missing gcsPath`);
   return { activeSnapshotId, gcsPath, uploadedAt };
