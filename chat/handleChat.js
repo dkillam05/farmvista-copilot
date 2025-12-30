@@ -1,5 +1,5 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2025-12-30-normalize-intent (Global normalizeIntent + routes by intent; features stop seeing raw English)
+// Rev: 2025-12-30-normalize-intent-plus (Normalize: equipment + readiness + fields + grain + maintenance + boundaries + humanizeAnswer)
 
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -59,10 +59,33 @@ function isReadinessQuery(qn) {
 }
 
 /* --------------------------------------------------
+   OUTPUT HUMANIZER
+   - Prevents CLI-style "Try:" menus & debug-ish blocks
+     from leaking into normal chat or reports.
+-------------------------------------------------- */
+function humanizeAnswer(out) {
+  if (!out || typeof out !== "object") return out;
+  if (typeof out.answer !== "string") return out;
+
+  let t = out.answer;
+
+  // Remove any trailing "Try:" command menus from old features
+  // (from "\n\nTry:" to end)
+  t = t.replace(/\n{0,2}^\s*Try:\s*[\s\S]*$/gmi, "");
+
+  // Remove leading internal markers like [FV-...]
+  t = t.replace(/^\[[^\]]+\]\s*/gm, "");
+
+  // Trim excess whitespace
+  t = t.replace(/\n{3,}/g, "\n\n").trim();
+
+  return { ...out, answer: t };
+}
+
+/* --------------------------------------------------
    GLOBAL INTENT NORMALIZATION
    - One place that turns messy human phrasing into
      structured intent + a "normalizedQuestion" string.
-   - Feature handlers should not have to parse English.
 -------------------------------------------------- */
 function normalizeIntent(question) {
   const raw = (question || "").toString().trim();
@@ -73,29 +96,22 @@ function normalizeIntent(question) {
     topic: null,
     mode: null,
     args: {},
-    // Some legacy features still expect a string command.
-    // normalizedQuestion lets us keep those working without rewriting.
     normalizedQuestion: raw
   };
 
   if (!qn) return intent;
 
-  // ---- Equipment (high priority) ----
+  // ---- Equipment ----
   const mentionsEquipment =
     qn.includes("equipment") ||
-    qn.includes("tractor") ||
-    qn.includes("tractors") ||
-    qn.includes("combine") ||
-    qn.includes("combines") ||
-    qn.includes("sprayer") ||
-    qn.includes("sprayers") ||
-    qn.includes("implement") ||
-    qn.includes("implements");
+    qn.includes("tractor") || qn.includes("tractors") ||
+    qn.includes("combine") || qn.includes("combines") ||
+    qn.includes("sprayer") || qn.includes("sprayers") ||
+    qn.includes("implement") || qn.includes("implements");
 
   if (mentionsEquipment) {
     intent.topic = "equipment";
 
-    // Human phrasing → summary/list
     const wantsList =
       qn.includes(" list") ||
       qn.endsWith(" list") ||
@@ -112,9 +128,6 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // Friendly patterns for filters
-    // examples:
-    // "equipment type starfire" / "equipment type: starfire"
     let m = /\btype\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
     if (m && m[1]) {
       intent.mode = "type";
@@ -123,14 +136,8 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // "john deere equipment" (common)
-    // If they mention equipment + a make-like phrase without "type/model/search",
-    // treat as a make filter by default.
     if (!/\b(model|search|qr|id|serial|sn|type)\b/i.test(qn) && qn.includes("equipment")) {
-      // heuristic: if they wrote "X equipment" or "equipment X", keep raw as make needle
-      const cleaned = raw
-        .replace(/\bequipment\b/i, "")
-        .trim();
+      const cleaned = raw.replace(/\bequipment\b/i, "").trim();
       if (cleaned && cleaned.length >= 3) {
         intent.mode = "make";
         intent.args.make = cleaned;
@@ -139,7 +146,6 @@ function normalizeIntent(question) {
       }
     }
 
-    // "equipment make John Deere"
     m = /\bmake\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
     if (m && m[1]) {
       intent.mode = "make";
@@ -148,7 +154,6 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // "equipment model 8R 410"
     m = /\bmodel\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
     if (m && m[1]) {
       intent.mode = "model";
@@ -157,7 +162,6 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // "equipment search 8R410" / "find 8R410"
     m = /\b(search|find|lookup)\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
     if (m && m[2]) {
       intent.mode = "search";
@@ -166,7 +170,6 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // "equipment qr <id>"
     m = /\bqr\b\s*:?\s*([a-zA-Z0-9_-]+)\s*$/i.exec(raw);
     if (m && m[1]) {
       intent.mode = "qr";
@@ -175,8 +178,6 @@ function normalizeIntent(question) {
       return intent;
     }
 
-    // If user typed "equipment <something>" and it isn't "summary/list",
-    // DO NOT assume it's an id. Treat it as search instead (fixes: equipment list → id=list).
     if (qn.startsWith("equipment ")) {
       const rest = raw.slice(raw.toLowerCase().indexOf("equipment") + "equipment".length).trim();
       if (rest) {
@@ -187,7 +188,6 @@ function normalizeIntent(question) {
       }
     }
 
-    // Default equipment → summary
     intent.mode = "summary";
     intent.normalizedQuestion = "equipment summary";
     return intent;
@@ -201,7 +201,130 @@ function normalizeIntent(question) {
     return intent;
   }
 
-  // (Keep adding topics over time, but we do NOT need to rewrite everything today.)
+  // ---- Fields ----
+  const mentionsFields =
+    qn === "fields" ||
+    qn.includes("field list") ||
+    qn.includes("list fields") ||
+    qn.includes("show fields") ||
+    qn.includes("show me fields") ||
+    qn.includes("all fields") ||
+    qn.startsWith("field ") ||
+    qn.startsWith("show field") ||
+    qn.startsWith("open field");
+
+  if (mentionsFields) {
+    intent.topic = "fields";
+
+    if (
+      qn === "fields" ||
+      qn.includes("list fields") ||
+      qn.includes("show fields") ||
+      qn.includes("all fields") ||
+      qn.includes("field list")
+    ) {
+      intent.mode = "list";
+      intent.normalizedQuestion = "list fields";
+      return intent;
+    }
+
+    // detail
+    let m = /^(field|show field|open field)\s*[:#]?\s*(.+)$/i.exec(raw);
+    if (m && m[2]) {
+      intent.mode = "detail";
+      intent.args.needle = m[2].trim();
+      intent.normalizedQuestion = `field ${intent.args.needle}`;
+      return intent;
+    }
+
+    // default list
+    intent.mode = "list";
+    intent.normalizedQuestion = "list fields";
+    return intent;
+  }
+
+  // ---- Grain ----
+  const mentionsGrain =
+    qn === "grain" ||
+    qn.includes("grain summary") ||
+    qn.includes("grain bags") ||
+    qn.includes("bag inventory") ||
+    qn.includes("bags on hand") ||
+    qn.includes("grain bins") ||
+    qn === "bins" ||
+    qn.startsWith("grain sku ") ||
+    qn.startsWith("sku ") ||
+    qn.startsWith("bags sku ");
+
+  if (mentionsGrain) {
+    intent.topic = "grain";
+
+    if (qn.startsWith("grain sku ") || qn.startsWith("sku ") || qn.startsWith("bags sku ")) {
+      intent.mode = "bags";
+      intent.normalizedQuestion = raw; // keep original for filter parsing
+      return intent;
+    }
+
+    if (qn.includes("bag") || qn.includes("bags")) {
+      intent.mode = "bags";
+      intent.normalizedQuestion = "grain bags";
+      return intent;
+    }
+
+    if (qn.includes("bin") || qn === "bins") {
+      intent.mode = "bins";
+      intent.normalizedQuestion = "grain bins";
+      return intent;
+    }
+
+    intent.mode = "summary";
+    intent.normalizedQuestion = "grain summary";
+    return intent;
+  }
+
+  // ---- Field Maintenance / Work Orders ----
+  const mentionsMaint =
+    qn === "maintenance" ||
+    qn.includes("field maintenance") ||
+    qn.includes("maintenance ") ||
+    qn.includes("work order") ||
+    qn.includes("work orders") ||
+    qn.includes("needs approved") ||
+    qn.includes("pending maintenance") ||
+    qn.includes("pending work");
+
+  if (mentionsMaint) {
+    intent.topic = "fieldMaintenance";
+    // Let the feature parse human filters itself (we already made it tolerant)
+    intent.normalizedQuestion = raw;
+    return intent;
+  }
+
+  // ---- Boundary Requests ----
+  const mentionsBoundaries =
+    qn.includes("boundary") ||
+    qn.includes("boundaries");
+
+  if (mentionsBoundaries) {
+    intent.topic = "boundaries";
+
+    if (qn.includes("open boundaries") || qn.includes("boundaries open") || qn.includes("open boundary")) {
+      intent.mode = "open";
+      intent.normalizedQuestion = "boundaries open";
+      return intent;
+    }
+
+    if (qn.includes("closed boundaries") || qn.includes("boundaries closed") || qn.includes("closed boundary")) {
+      intent.mode = "closed";
+      intent.normalizedQuestion = "boundaries closed";
+      return intent;
+    }
+
+    // pass-through for "boundary <id>", "boundaries farm X", etc.
+    intent.normalizedQuestion = raw;
+    return intent;
+  }
+
   return intent;
 }
 
@@ -227,12 +350,11 @@ export async function handleChat({ question, snapshot, history, state }) {
   // Readiness: always uses fieldReadinessLatest
   if (intent.topic === "readiness") {
     const out = await answerFieldReadinessLatest({ question, snapshot, history, state });
-    // Preserve existing behavior but tag intent for logs/reports
     out.meta = { ...(out.meta || {}), intent: "readiness" };
-    return out;
+    return humanizeAnswer(out);
   }
 
-  // Equipment: route via intent (no raw-English parsing)
+  // Equipment
   if (intent.topic === "equipment") {
     const out = await answerEquipment({
       question: intent.normalizedQuestion || question,
@@ -240,32 +362,75 @@ export async function handleChat({ question, snapshot, history, state }) {
       intent
     });
     out.meta = { ...(out.meta || {}), intent: "equipment", intentMode: intent.mode || null };
-    return out;
+    return humanizeAnswer(out);
   }
 
-  // Legacy routing for other features (still uses raw English for now)
-  // But we pass normalizedQuestion (when available) to make behavior more forgiving.
+  // Fields
+  if (intent.topic === "fields") {
+    const out = await answerFields({
+      question: intent.normalizedQuestion || question,
+      snapshot,
+      intent
+    });
+    out.meta = { ...(out.meta || {}), intent: "fields", intentMode: intent.mode || null };
+    return humanizeAnswer(out);
+  }
+
+  // Grain
+  if (intent.topic === "grain") {
+    const out = await answerGrain({
+      question: intent.normalizedQuestion || question,
+      snapshot,
+      intent
+    });
+    out.meta = { ...(out.meta || {}), intent: "grain", intentMode: intent.mode || null };
+    return humanizeAnswer(out);
+  }
+
+  // Field Maintenance
+  if (intent.topic === "fieldMaintenance") {
+    const out = await answerFieldMaintenance({
+      question: intent.normalizedQuestion || question,
+      snapshot,
+      intent
+    });
+    out.meta = { ...(out.meta || {}), intent: "fieldMaintenance" };
+    return humanizeAnswer(out);
+  }
+
+  // Boundaries
+  if (intent.topic === "boundaries") {
+    const out = await answerBoundaryRequests({
+      question: intent.normalizedQuestion || question,
+      snapshot,
+      intent
+    });
+    out.meta = { ...(out.meta || {}), intent: "boundaryRequests", intentMode: intent.mode || null };
+    return humanizeAnswer(out);
+  }
+
+  // Legacy routing (still works)
   const qForHandlers = intent.normalizedQuestion || question;
 
-  if (canHandleEquipment(qForHandlers)) return answerEquipment({ question: qForHandlers, snapshot, intent });
-  if (canHandleBoundaryRequests(qForHandlers)) return answerBoundaryRequests({ question: qForHandlers, snapshot });
-  if (canHandleBinSites(qForHandlers)) return answerBinSites({ question: qForHandlers, snapshot });
-  if (canHandleBinMovements(qForHandlers)) return answerBinMovements({ question: qForHandlers, snapshot });
-  if (canHandleAerialApplications(qForHandlers)) return answerAerialApplications({ question: qForHandlers, snapshot });
-  if (canHandleFieldTrials(qForHandlers)) return answerFieldTrials({ question: qForHandlers, snapshot });
+  if (canHandleEquipment(qForHandlers)) return humanizeAnswer(await answerEquipment({ question: qForHandlers, snapshot, intent }));
+  if (canHandleBoundaryRequests(qForHandlers)) return humanizeAnswer(await answerBoundaryRequests({ question: qForHandlers, snapshot, intent }));
+  if (canHandleBinSites(qForHandlers)) return humanizeAnswer(await answerBinSites({ question: qForHandlers, snapshot }));
+  if (canHandleBinMovements(qForHandlers)) return humanizeAnswer(await answerBinMovements({ question: qForHandlers, snapshot }));
+  if (canHandleAerialApplications(qForHandlers)) return humanizeAnswer(await answerAerialApplications({ question: qForHandlers, snapshot }));
+  if (canHandleFieldTrials(qForHandlers)) return humanizeAnswer(await answerFieldTrials({ question: qForHandlers, snapshot }));
 
-  if (canHandleGrainBagEvents(qForHandlers)) return answerGrainBagEvents({ question: qForHandlers, snapshot });
-  if (canHandleProducts(qForHandlers)) return answerProducts({ question: qForHandlers, snapshot });
-  if (canHandleRtkTowers(qForHandlers)) return answerRtkTowers({ question: qForHandlers, snapshot });
-  if (canHandleSeasonalPrecheck(qForHandlers)) return answerSeasonalPrecheck({ question: qForHandlers, snapshot });
-  if (canHandleStarfireMoves(qForHandlers)) return answerStarfireMoves({ question: qForHandlers, snapshot });
-  if (canHandleVehicleRegistrations(qForHandlers)) return answerVehicleRegistrations({ question: qForHandlers, snapshot });
-  if (canHandleCombineMetrics(qForHandlers)) return answerCombineMetrics({ question: qForHandlers, snapshot });
+  if (canHandleGrainBagEvents(qForHandlers)) return humanizeAnswer(await answerGrainBagEvents({ question: qForHandlers, snapshot }));
+  if (canHandleProducts(qForHandlers)) return humanizeAnswer(await answerProducts({ question: qForHandlers, snapshot }));
+  if (canHandleRtkTowers(qForHandlers)) return humanizeAnswer(await answerRtkTowers({ question: qForHandlers, snapshot }));
+  if (canHandleSeasonalPrecheck(qForHandlers)) return humanizeAnswer(await answerSeasonalPrecheck({ question: qForHandlers, snapshot }));
+  if (canHandleStarfireMoves(qForHandlers)) return humanizeAnswer(await answerStarfireMoves({ question: qForHandlers, snapshot }));
+  if (canHandleVehicleRegistrations(qForHandlers)) return humanizeAnswer(await answerVehicleRegistrations({ question: qForHandlers, snapshot }));
+  if (canHandleCombineMetrics(qForHandlers)) return humanizeAnswer(await answerCombineMetrics({ question: qForHandlers, snapshot }));
 
-  if (canHandleGrain(qForHandlers)) return answerGrain({ question: qForHandlers, snapshot });
-  if (canHandleFields(qForHandlers)) return answerFields({ question: qForHandlers, snapshot });
-  if (canHandleFarms(qForHandlers)) return answerFarms({ question: qForHandlers, snapshot });
-  if (canHandleFieldMaintenance(qForHandlers)) return answerFieldMaintenance({ question: qForHandlers, snapshot });
+  if (canHandleGrain(qForHandlers)) return humanizeAnswer(await answerGrain({ question: qForHandlers, snapshot, intent }));
+  if (canHandleFields(qForHandlers)) return humanizeAnswer(await answerFields({ question: qForHandlers, snapshot, intent }));
+  if (canHandleFarms(qForHandlers)) return humanizeAnswer(await answerFarms({ question: qForHandlers, snapshot }));
+  if (canHandleFieldMaintenance(qForHandlers)) return humanizeAnswer(await answerFieldMaintenance({ question: qForHandlers, snapshot, intent }));
 
   return {
     answer:
