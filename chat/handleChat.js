@@ -1,5 +1,5 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2025-12-30-normalize-intent-plus (Normalize: equipment + readiness + fields + grain + maintenance + boundaries + humanizeAnswer)
+// Rev: 2025-12-30-followups (Adds follow-up routing using state.lastIntent; normalizes "fields with boundary requests")
 
 import { canHandleEquipment, answerEquipment } from "../features/equipment.js";
 import { canHandleBoundaryRequests, answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -23,9 +23,7 @@ import { canHandleFields, answerFields } from "../features/fields.js";
 import { canHandleFarms, answerFarms } from "../features/farms.js";
 import { canHandleFieldMaintenance, answerFieldMaintenance } from "../features/fieldMaintenance.js";
 
-/* --------------------------------------------------
-   REPORT INTENT DETECTION (no buttons)
--------------------------------------------------- */
+/* ---------------- Report detection ---------------- */
 function wantsReport(text) {
   const t = (text || "").toString().toLowerCase().trim();
   if (!t) return false;
@@ -49,6 +47,20 @@ function wantsFullConversation(text) {
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
+/* ---------------- Humanize output ---------------- */
+function humanizeAnswer(out) {
+  if (!out || typeof out !== "object") return out;
+  if (typeof out.answer !== "string") return out;
+
+  let t = out.answer;
+  t = t.replace(/\n{0,2}^\s*Try:\s*[\s\S]*$/gmi, "");
+  t = t.replace(/^\[[^\]]+\]\s*/gm, "");
+  t = t.replace(/\n{3,}/g, "\n\n").trim();
+
+  return { ...out, answer: t };
+}
+
+/* ---------------- Readiness detector ---------------- */
 function isReadinessQuery(qn) {
   if (!qn) return false;
   if (qn.includes("readiness")) return true;
@@ -58,36 +70,29 @@ function isReadinessQuery(qn) {
   return false;
 }
 
-/* --------------------------------------------------
-   OUTPUT HUMANIZER
-   - Prevents CLI-style "Try:" menus & debug-ish blocks
-     from leaking into normal chat or reports.
--------------------------------------------------- */
-function humanizeAnswer(out) {
-  if (!out || typeof out !== "object") return out;
-  if (typeof out.answer !== "string") return out;
+/* ---------------- Follow-up detector ---------------- */
+function looksLikeFollowup(qn) {
+  if (!qn) return false;
 
-  let t = out.answer;
+  // short “reaction” questions that should stay on the last topic
+  if (qn.length <= 32) {
+    const triggers = [
+      "only", "why", "how", "what about", "that seems wrong", "doesnt seem right",
+      "are you sure", "really", "huh", "ok", "okay", "list them", "show them",
+      "more", "tell me more", "explain", "details"
+    ];
+    if (triggers.some(x => qn.includes(x))) return true;
+  }
 
-  // Remove any trailing "Try:" command menus from old features
-  // (from "\n\nTry:" to end)
-  t = t.replace(/\n{0,2}^\s*Try:\s*[\s\S]*$/gmi, "");
+  // specific patterns
+  if (qn === "only 1 field?" || qn === "only one field?" || qn === "only 1?" || qn === "only one?") return true;
+  if (qn.includes("list") && qn.includes("them")) return true;
 
-  // Remove leading internal markers like [FV-...]
-  t = t.replace(/^\[[^\]]+\]\s*/gm, "");
-
-  // Trim excess whitespace
-  t = t.replace(/\n{3,}/g, "\n\n").trim();
-
-  return { ...out, answer: t };
+  return false;
 }
 
-/* --------------------------------------------------
-   GLOBAL INTENT NORMALIZATION
-   - One place that turns messy human phrasing into
-     structured intent + a "normalizedQuestion" string.
--------------------------------------------------- */
-function normalizeIntent(question) {
+/* ---------------- Intent normalization ---------------- */
+function normalizeIntent(question, state) {
   const raw = (question || "").toString().trim();
   const qn = norm(raw);
 
@@ -96,104 +101,29 @@ function normalizeIntent(question) {
     topic: null,
     mode: null,
     args: {},
-    normalizedQuestion: raw
+    normalizedQuestion: raw,
+    isFollowup: false
   };
 
   if (!qn) return intent;
 
-  // ---- Equipment ----
-  const mentionsEquipment =
-    qn.includes("equipment") ||
-    qn.includes("tractor") || qn.includes("tractors") ||
-    qn.includes("combine") || qn.includes("combines") ||
-    qn.includes("sprayer") || qn.includes("sprayers") ||
-    qn.includes("implement") || qn.includes("implements");
-
-  if (mentionsEquipment) {
-    intent.topic = "equipment";
-
-    const wantsList =
-      qn.includes(" list") ||
-      qn.endsWith(" list") ||
-      qn.includes("show equipment") ||
-      qn.includes("show me equipment") ||
-      qn.includes("all equipment") ||
-      qn.includes("equipment summary") ||
-      (qn === "equipment") ||
-      qn.includes("equipment overview");
-
-    if (wantsList) {
-      intent.mode = "summary";
-      intent.normalizedQuestion = "equipment summary";
-      return intent;
-    }
-
-    let m = /\btype\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
-    if (m && m[1]) {
-      intent.mode = "type";
-      intent.args.type = m[1].trim();
-      intent.normalizedQuestion = `equipment type ${intent.args.type}`;
-      return intent;
-    }
-
-    if (!/\b(model|search|qr|id|serial|sn|type)\b/i.test(qn) && qn.includes("equipment")) {
-      const cleaned = raw.replace(/\bequipment\b/i, "").trim();
-      if (cleaned && cleaned.length >= 3) {
-        intent.mode = "make";
-        intent.args.make = cleaned;
-        intent.normalizedQuestion = `equipment make ${intent.args.make}`;
-        return intent;
-      }
-    }
-
-    m = /\bmake\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
-    if (m && m[1]) {
-      intent.mode = "make";
-      intent.args.make = m[1].trim();
-      intent.normalizedQuestion = `equipment make ${intent.args.make}`;
-      return intent;
-    }
-
-    m = /\bmodel\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
-    if (m && m[1]) {
-      intent.mode = "model";
-      intent.args.model = m[1].trim();
-      intent.normalizedQuestion = `equipment model ${intent.args.model}`;
-      return intent;
-    }
-
-    m = /\b(search|find|lookup)\b\s*:?\s*([a-z0-9 _-]+)\s*$/i.exec(raw);
-    if (m && m[2]) {
-      intent.mode = "search";
-      intent.args.needle = m[2].trim();
-      intent.normalizedQuestion = `equipment search ${intent.args.needle}`;
-      return intent;
-    }
-
-    m = /\bqr\b\s*:?\s*([a-zA-Z0-9_-]+)\s*$/i.exec(raw);
-    if (m && m[1]) {
-      intent.mode = "qr";
-      intent.args.id = m[1].trim();
-      intent.normalizedQuestion = `equipment qr ${intent.args.id}`;
-      return intent;
-    }
-
-    if (qn.startsWith("equipment ")) {
-      const rest = raw.slice(raw.toLowerCase().indexOf("equipment") + "equipment".length).trim();
-      if (rest) {
-        intent.mode = "search";
-        intent.args.needle = rest;
-        intent.normalizedQuestion = `equipment search ${intent.args.needle}`;
-        return intent;
-      }
-    }
-
-    intent.mode = "summary";
-    intent.normalizedQuestion = "equipment summary";
+  // If it looks like a follow-up, keep the last intent topic
+  if (looksLikeFollowup(qn) && state && state.lastIntent) {
+    intent.isFollowup = true;
+    intent.topic = String(state.lastIntent);
+    intent.normalizedQuestion = raw;
     return intent;
   }
 
-  // ---- Readiness ----
+  // Boundaries: fields with boundary requests
+  if ((qn.includes("field") || qn.includes("fields")) && (qn.includes("boundary") || qn.includes("boundaries"))) {
+    intent.topic = "boundaryRequests";
+    intent.mode = "fields";
+    intent.normalizedQuestion = "fields with boundary requests";
+    return intent;
+  }
+
+  // Readiness
   if (isReadinessQuery(qn)) {
     intent.topic = "readiness";
     intent.mode = "latest";
@@ -201,138 +131,12 @@ function normalizeIntent(question) {
     return intent;
   }
 
-  // ---- Fields ----
-  const mentionsFields =
-    qn === "fields" ||
-    qn.includes("field list") ||
-    qn.includes("list fields") ||
-    qn.includes("show fields") ||
-    qn.includes("show me fields") ||
-    qn.includes("all fields") ||
-    qn.startsWith("field ") ||
-    qn.startsWith("show field") ||
-    qn.startsWith("open field");
-
-  if (mentionsFields) {
-    intent.topic = "fields";
-
-    if (
-      qn === "fields" ||
-      qn.includes("list fields") ||
-      qn.includes("show fields") ||
-      qn.includes("all fields") ||
-      qn.includes("field list")
-    ) {
-      intent.mode = "list";
-      intent.normalizedQuestion = "list fields";
-      return intent;
-    }
-
-    // detail
-    let m = /^(field|show field|open field)\s*[:#]?\s*(.+)$/i.exec(raw);
-    if (m && m[2]) {
-      intent.mode = "detail";
-      intent.args.needle = m[2].trim();
-      intent.normalizedQuestion = `field ${intent.args.needle}`;
-      return intent;
-    }
-
-    // default list
-    intent.mode = "list";
-    intent.normalizedQuestion = "list fields";
-    return intent;
-  }
-
-  // ---- Grain ----
-  const mentionsGrain =
-    qn === "grain" ||
-    qn.includes("grain summary") ||
-    qn.includes("grain bags") ||
-    qn.includes("bag inventory") ||
-    qn.includes("bags on hand") ||
-    qn.includes("grain bins") ||
-    qn === "bins" ||
-    qn.startsWith("grain sku ") ||
-    qn.startsWith("sku ") ||
-    qn.startsWith("bags sku ");
-
-  if (mentionsGrain) {
-    intent.topic = "grain";
-
-    if (qn.startsWith("grain sku ") || qn.startsWith("sku ") || qn.startsWith("bags sku ")) {
-      intent.mode = "bags";
-      intent.normalizedQuestion = raw; // keep original for filter parsing
-      return intent;
-    }
-
-    if (qn.includes("bag") || qn.includes("bags")) {
-      intent.mode = "bags";
-      intent.normalizedQuestion = "grain bags";
-      return intent;
-    }
-
-    if (qn.includes("bin") || qn === "bins") {
-      intent.mode = "bins";
-      intent.normalizedQuestion = "grain bins";
-      return intent;
-    }
-
-    intent.mode = "summary";
-    intent.normalizedQuestion = "grain summary";
-    return intent;
-  }
-
-  // ---- Field Maintenance / Work Orders ----
-  const mentionsMaint =
-    qn === "maintenance" ||
-    qn.includes("field maintenance") ||
-    qn.includes("maintenance ") ||
-    qn.includes("work order") ||
-    qn.includes("work orders") ||
-    qn.includes("needs approved") ||
-    qn.includes("pending maintenance") ||
-    qn.includes("pending work");
-
-  if (mentionsMaint) {
-    intent.topic = "fieldMaintenance";
-    // Let the feature parse human filters itself (we already made it tolerant)
-    intent.normalizedQuestion = raw;
-    return intent;
-  }
-
-  // ---- Boundary Requests ----
-  const mentionsBoundaries =
-    qn.includes("boundary") ||
-    qn.includes("boundaries");
-
-  if (mentionsBoundaries) {
-    intent.topic = "boundaries";
-
-    if (qn.includes("open boundaries") || qn.includes("boundaries open") || qn.includes("open boundary")) {
-      intent.mode = "open";
-      intent.normalizedQuestion = "boundaries open";
-      return intent;
-    }
-
-    if (qn.includes("closed boundaries") || qn.includes("boundaries closed") || qn.includes("closed boundary")) {
-      intent.mode = "closed";
-      intent.normalizedQuestion = "boundaries closed";
-      return intent;
-    }
-
-    // pass-through for "boundary <id>", "boundaries farm X", etc.
-    intent.normalizedQuestion = raw;
-    return intent;
-  }
-
+  // Everything else: leave as raw and let canHandle* decide
   return intent;
 }
 
-/* --------------------------------------------------
-   MAIN CHAT ROUTER
--------------------------------------------------- */
+/* ---------------- Main router ---------------- */
 export async function handleChat({ question, snapshot, history, state }) {
-  // Report trigger
   if (wantsReport(question)) {
     const mode = wantsFullConversation(question) ? "conversation" : "recent";
     return {
@@ -345,73 +149,24 @@ export async function handleChat({ question, snapshot, history, state }) {
     };
   }
 
-  const intent = normalizeIntent(question);
+  const intent = normalizeIntent(question, state);
+  const qForHandlers = intent.normalizedQuestion || question;
 
-  // Readiness: always uses fieldReadinessLatest
+  // Readiness
   if (intent.topic === "readiness") {
-    const out = await answerFieldReadinessLatest({ question, snapshot, history, state });
+    const out = await answerFieldReadinessLatest({ question: qForHandlers, snapshot, history, state });
     out.meta = { ...(out.meta || {}), intent: "readiness" };
     return humanizeAnswer(out);
   }
 
-  // Equipment
-  if (intent.topic === "equipment") {
-    const out = await answerEquipment({
-      question: intent.normalizedQuestion || question,
-      snapshot,
-      intent
-    });
-    out.meta = { ...(out.meta || {}), intent: "equipment", intentMode: intent.mode || null };
-    return humanizeAnswer(out);
-  }
-
-  // Fields
-  if (intent.topic === "fields") {
-    const out = await answerFields({
-      question: intent.normalizedQuestion || question,
-      snapshot,
-      intent
-    });
-    out.meta = { ...(out.meta || {}), intent: "fields", intentMode: intent.mode || null };
-    return humanizeAnswer(out);
-  }
-
-  // Grain
-  if (intent.topic === "grain") {
-    const out = await answerGrain({
-      question: intent.normalizedQuestion || question,
-      snapshot,
-      intent
-    });
-    out.meta = { ...(out.meta || {}), intent: "grain", intentMode: intent.mode || null };
-    return humanizeAnswer(out);
-  }
-
-  // Field Maintenance
-  if (intent.topic === "fieldMaintenance") {
-    const out = await answerFieldMaintenance({
-      question: intent.normalizedQuestion || question,
-      snapshot,
-      intent
-    });
-    out.meta = { ...(out.meta || {}), intent: "fieldMaintenance" };
-    return humanizeAnswer(out);
-  }
-
-  // Boundaries
-  if (intent.topic === "boundaries") {
-    const out = await answerBoundaryRequests({
-      question: intent.normalizedQuestion || question,
-      snapshot,
-      intent
-    });
+  // Boundaries (fields mode)
+  if (intent.topic === "boundaryRequests") {
+    const out = await answerBoundaryRequests({ question: qForHandlers, snapshot, intent });
     out.meta = { ...(out.meta || {}), intent: "boundaryRequests", intentMode: intent.mode || null };
     return humanizeAnswer(out);
   }
 
-  // Legacy routing (still works)
-  const qForHandlers = intent.normalizedQuestion || question;
-
+  // Normal routing
   if (canHandleEquipment(qForHandlers)) return humanizeAnswer(await answerEquipment({ question: qForHandlers, snapshot, intent }));
   if (canHandleBoundaryRequests(qForHandlers)) return humanizeAnswer(await answerBoundaryRequests({ question: qForHandlers, snapshot, intent }));
   if (canHandleBinSites(qForHandlers)) return humanizeAnswer(await answerBinSites({ question: qForHandlers, snapshot }));
@@ -432,10 +187,16 @@ export async function handleChat({ question, snapshot, history, state }) {
   if (canHandleFarms(qForHandlers)) return humanizeAnswer(await answerFarms({ question: qForHandlers, snapshot }));
   if (canHandleFieldMaintenance(qForHandlers)) return humanizeAnswer(await answerFieldMaintenance({ question: qForHandlers, snapshot, intent }));
 
+  // If it was a follow-up but we couldn't answer, don't insult the user with "early in development"
+  if (intent.isFollowup && state && state.lastIntent) {
+    return {
+      answer: `I didn’t catch what you want me to do next. Do you want a list, a summary, or details?`,
+      meta: { snapshotId: snapshot?.activeSnapshotId || "unknown", intent: "followup_unknown", lastIntent: state.lastIntent }
+    };
+  }
+
   return {
-    answer:
-      `I’m still early in development and learning how different questions are phrased.\n\n` +
-      `If that didn’t come back the way you expected, try rephrasing a bit — I’m getting better at interpreting “show me…”, “list…”, and “summarize…”.`,
+    answer: `I didn’t understand that request. If you tell me what area you’re asking about (fields, equipment, grain, maintenance, boundaries, readiness), I’ll pull the right data.`,
     meta: { snapshotId: snapshot?.activeSnapshotId || "unknown", intent: "unknown" }
   };
 }
