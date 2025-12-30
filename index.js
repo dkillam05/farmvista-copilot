@@ -1,4 +1,5 @@
 // index.js  (FULL FILE)
+// Rev: 2025-12-29-revision-tag  (Adds Cloud Run revision + snapshotId to responses for hard proof)
 
 import express from "express";
 
@@ -17,6 +18,11 @@ const app = express();
 app.use(express.json({ limit: "4mb" }));
 app.use(corsMiddleware());
 
+function getRevision() {
+  // Cloud Run sets K_REVISION automatically (also K_SERVICE / K_CONFIGURATION)
+  return process.env.K_REVISION || process.env.K_SERVICE || null;
+}
+
 // --------------------
 // Health
 // --------------------
@@ -24,7 +30,8 @@ app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
     service: "farmvista-copilot",
-    ts: new Date().toISOString()
+    ts: new Date().toISOString(),
+    revision: getRevision()
   });
 });
 
@@ -32,11 +39,20 @@ app.get("/health", (req, res) => {
 // Snapshot status / reload
 // --------------------
 app.get("/context/status", async (req, res) => {
-  res.json(await getSnapshotStatus());
+  // add revision here too so you can prove which revision served the status
+  const s = await getSnapshotStatus();
+  res.json({
+    ...s,
+    revision: getRevision()
+  });
 });
 
 app.post("/context/reload", async (req, res) => {
-  res.json(await reloadSnapshot());
+  const r = await reloadSnapshot();
+  res.json({
+    ...r,
+    revision: getRevision()
+  });
 });
 
 // --------------------
@@ -71,7 +87,7 @@ app.post("/chat", async (req, res) => {
       role: "user",
       text: question,
       intent: null,
-      meta: { snapshotId: snap.activeSnapshotId || null }
+      meta: { snapshotId: snap.activeSnapshotId || null, revision: getRevision() }
     });
 
     await appendLogTurn({
@@ -79,7 +95,7 @@ app.post("/chat", async (req, res) => {
       role: "assistant",
       text: out?.answer || "",
       intent,
-      meta: out?.meta || null
+      meta: { ...(out?.meta || null), revision: getRevision(), snapshotId: snap.activeSnapshotId || null }
     });
   } catch (e) {
     console.warn("[copilot_logs] logging failed:", e?.message || e);
@@ -89,7 +105,10 @@ app.post("/chat", async (req, res) => {
     ...out,
     meta: {
       ...(out?.meta || {}),
-      threadId
+      threadId,
+      snapshotId: snap.activeSnapshotId || null,
+      gcsPath: snap.gcsPath || null,
+      revision: getRevision()
     }
   });
 });
@@ -121,7 +140,7 @@ app.get("/report", async (req, res) => {
     return res.status(200).send(pdf);
   } catch (e) {
     console.error("[report] failed:", e?.message || e);
-    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
+    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e), revision: getRevision() });
   }
 });
 
@@ -140,7 +159,7 @@ app.post("/report", async (req, res) => {
     return res.status(200).send(pdf);
   } catch (e) {
     console.error("[report] failed:", e?.message || e);
-    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e) });
+    return res.status(500).json({ error: "Report generation failed", detail: e?.message || String(e), revision: getRevision() });
   }
 });
 
@@ -149,7 +168,7 @@ app.post("/report", async (req, res) => {
 // --------------------
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
-  console.log(`🚜 FarmVista Copilot running on port ${PORT}`);
+  console.log(`🚜 FarmVista Copilot running on port ${PORT} (rev: ${getRevision() || "unknown"})`);
 });
 
 // --------------------
@@ -165,8 +184,12 @@ async function buildReportPdf({ threadId, mode }) {
 
   const selected = (mode === "conversation") ? assistants : assistants.slice(-3);
 
+  // Load snapshot to stamp report with the *current* snapshotId used by this revision
+  const snap = await loadSnapshot({ force: false });
+  const snapshotId = snap.activeSnapshotId || selected[selected.length - 1]?.meta?.snapshotId || "unknown";
+  const revision = getRevision() || "unknown";
+
   const title = inferReportTitle(history, selected);
-  const snapshotId = selected[selected.length - 1]?.meta?.snapshotId || "unknown";
   const generatedAt = new Date().toLocaleString();
 
   // “Normal FarmVista report feel” (static print-first)
@@ -174,6 +197,7 @@ async function buildReportPdf({ threadId, mode }) {
     title,
     snapshotId,
     generatedAt,
+    revision,
     sections: selected.map((a, idx) => ({
       heading: `Section ${idx + 1}`,
       text: a.text
@@ -210,7 +234,7 @@ function inferReportTitle(history, selected) {
   return "FarmVista Copilot Report";
 }
 
-function buildReportHtml({ title, snapshotId, generatedAt, sections }) {
+function buildReportHtml({ title, snapshotId, generatedAt, revision, sections }) {
   const safeTitle = esc(title);
   return `<!doctype html>
 <html>
@@ -323,7 +347,8 @@ function buildReportHtml({ title, snapshotId, generatedAt, sections }) {
       <h1 class="title">${safeTitle}</h1>
       <div class="meta">
         Snapshot: ${esc(snapshotId)}<br>
-        Generated: ${esc(generatedAt)}
+        Generated: ${esc(generatedAt)}<br>
+        Revision: ${esc(revision)}
       </div>
     </header>
 
