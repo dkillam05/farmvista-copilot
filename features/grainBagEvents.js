@@ -1,4 +1,8 @@
 // /features/grainBagEvents.js  (FULL FILE)
+// Rev: 2025-12-31-okflag
+// Change:
+// ✅ Adds ok:true on successful answers so Truth Gate can pass
+// ✅ Adds ok:false on error/empty states (no logic changes)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -115,10 +119,6 @@ function extractAfter(q, label) {
   return m ? stripQuotes(m[1]) : "";
 }
 
-function addCount(map, key, add) {
-  map.set(key, (map.get(key) || 0) + (Number(add) || 0));
-}
-
 function partialFeetTotal(counts) {
   const arr = counts && Array.isArray(counts.partialFeet) ? counts.partialFeet : [];
   let sum = 0;
@@ -194,10 +194,10 @@ export function answerGrainBagEvents({ question, snapshot }) {
 
   const json = snapshot?.json || null;
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
-  if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
+  if (!json) return { ok: false, answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
-  if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
+  if (!colsRoot) return { ok: false, answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
   const events = colAsArray(colsRoot, "grain_bag_events").map((e) => ({
     ...e,
@@ -214,7 +214,7 @@ export function answerGrainBagEvents({ question, snapshot }) {
   }));
 
   if (!events.length && !inv.length) {
-    return { answer: "No grain bag events or inventory movements found in the snapshot.", meta: { snapshotId } };
+    return { ok: false, answer: "No grain bag events or inventory movements found in the snapshot.", meta: { snapshotId } };
   }
 
   const mode = pickMode(qn);
@@ -235,13 +235,6 @@ export function answerGrainBagEvents({ question, snapshot }) {
   const skuN = norm(skuNeedle);
   const brandN = norm(brandNeedle);
   const locN = norm(locNeedle);
-
-  // if user says "grain bags sku Up North 10x500" without "sku" keyword
-  if (!skuNeedle) {
-    const mm = /\bsku\b\s+(.+)$/i.exec(q);
-    // already handled above; keep for clarity
-    void mm;
-  }
 
   // if user says "grain bags field 0501" (no keyword "field")
   let looseFieldN = "";
@@ -285,12 +278,12 @@ export function answerGrainBagEvents({ question, snapshot }) {
     const totalOnHand = iv.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
 
     return {
+      ok: true,
       answer:
         `Grain bags on hand (inventoryGrainBagMovements) (snapshot ${snapshotId}):\n` +
         `• SKUs: ${iv.length}\n` +
         `• Total onHand: ${fmtInt(totalOnHand)}\n\n` +
-        (lines.length ? lines.join("\n") : "No matching inventory rows.") +
-        `\n\nTry:\n• grain bags on hand\n• grain bags on hand brand Up North\n• grain bags on hand location "Lov Shack"`,
+        (lines.length ? lines.join("\n") : "No matching inventory rows."),
       meta: { snapshotId, skus: iv.length, totalOnHand }
     };
   }
@@ -316,26 +309,17 @@ export function answerGrainBagEvents({ question, snapshot }) {
     const pickUps = list.filter((e) => e.__type === "pickUp").length;
 
     return {
+      ok: true,
       answer:
         `Grain bag ${mode === "events" ? "events" : mode} (snapshot ${snapshotId}):\n` +
         `• matching: ${list.length} (putDown: ${putDowns} • pickUp: ${pickUps})\n\n` +
         (lines.length ? lines.join("\n") : "No matching events.") +
-        (list.length > limit ? `\n\n(Showing last ${limit})` : "") +
-        `\n\nTry:\n` +
-        `• grain bags events last 10\n` +
-        `• grain bags putdowns 2025\n` +
-        `• grain bags pickups 2025\n` +
-        `• grain bags field "0501-Matway S400"\n` +
-        `• grain bags sku "Up North 10x500"`,
+        (list.length > limit ? `\n\n(Showing last ${limit})` : ""),
       meta: { snapshotId, matching: list.length, shown: shown.length, putDowns, pickUps }
     };
   }
 
   // ---- mode: summary (default) ----
-  // compute totals from events:
-  // - putDown adds counts.full + counts.partial
-  // - pickUp removes countsPicked.full + countsPicked.partial
-  // Also show breakdown by cropYear/cropType.
   let putFull = 0, putPart = 0, pickFull = 0, pickPart = 0;
 
   const byYearCrop = new Map(); // key "2025|Corn" => {putFull,putPart,pickFull,pickPart}
@@ -378,6 +362,7 @@ export function answerGrainBagEvents({ question, snapshot }) {
   const invOnHand = iv.reduce((s, r) => s + (Number(r.onHand) || 0), 0);
 
   return {
+    ok: true,
     answer:
       `Grain bags summary (snapshot ${snapshotId}):\n` +
       (lastEventTxt ? `• last event: ${lastEventTxt}\n` : "") +
@@ -387,13 +372,7 @@ export function answerGrainBagEvents({ question, snapshot }) {
       `• net: ${fmtInt(netFull)} full • ${fmtInt(netPart)} partial\n` +
       `• inventory onHand (from inventoryGrainBagMovements): ${fmtInt(invOnHand)}\n\n` +
       `By crop/year (top 10):\n` +
-      (byLines.length ? byLines.join("\n") : "• (no breakdown)") +
-      `\n\nTry:\n` +
-      `• grain bags on hand\n` +
-      `• grain bags events last 10\n` +
-      `• grain bags putdowns 2025 crop corn\n` +
-      `• grain bags pickups 2025\n` +
-      `• grain bags field 0501`,
+      (byLines.length ? byLines.join("\n") : "• (no breakdown)"),
     meta: {
       snapshotId,
       events: ev.length,
