@@ -1,11 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2025-12-31-clarify-anywhere-truth-gate
+// Rev: 2025-12-31-clarify-anywhere-truth-gate-history-fallback
 //
 // Guarantees:
 // 1) ONE routing path per request
 // 2) If ambiguous between multiple valid answers -> ASK (clarify)
-// 3) No feature proof (ok:true) -> BLOCK (Truth Gate)
-// 4) No legacy canHandle* routing
+// 3) 1/2/3 reply resolves even if state.lastIntent is missing (uses history fallback)
+// 4) No feature proof (ok:true) -> BLOCK (Truth Gate)
+// 5) No legacy canHandle* routing
 
 import { answerEquipment } from "../features/equipment.js";
 import { answerBoundaryRequests } from "../features/boundaryRequests.js";
@@ -31,7 +32,7 @@ import { answerFieldMaintenance } from "../features/fieldMaintenance.js";
 -------------------------------------------------- */
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
-function isChoiceReply(txt) {
+function choiceNumber(txt) {
   const t = norm(txt);
   if (!t) return null;
   if (t === "1" || t === "one") return 1;
@@ -65,12 +66,10 @@ function blockedAnswer(reason = "feature-no-data") {
 }
 
 /* --------------------------------------------------
-   Clarify Map (centralized)
-   We encode pending clarify as meta.intent = "clarify:<key>"
-   state.lastIntent should persist that string.
+   Clarify definitions
 -------------------------------------------------- */
 const CLARIFY = {
-  "grain": {
+  grain: {
     prompt: buildClarifyQuestion(["Grain bags", "Grain bins", "Grain summary"]),
     resolve: (n) => {
       if (n === 1) return { topic: "grain", question: "grain bags", intent: { topic: "grain", mode: "bags" } };
@@ -80,8 +79,8 @@ const CLARIFY = {
     }
   },
 
-  // NEW: grain bag "inventory" ambiguity (on-hand vs placed/activity)
-  "grainbags": {
+  // Grain bags ambiguity: inventory vs placed/events
+  grainbags: {
     prompt: buildClarifyQuestion([
       "On-hand inventory (by SKU)",
       "Where bags are placed (putDown / pickUp by field)",
@@ -95,7 +94,7 @@ const CLARIFY = {
     }
   },
 
-  "maintenance": {
+  maintenance: {
     prompt: buildClarifyQuestion(["Pending maintenance", "Needs approved", "All maintenance"]),
     resolve: (n) => {
       if (n === 1) return { topic: "maintenance", question: "pending maintenance", intent: { topic: "maintenance" } };
@@ -105,8 +104,7 @@ const CLARIFY = {
     }
   },
 
-  // bins ambiguity: sites vs movements
-  "bins": {
+  bins: {
     prompt: buildClarifyQuestion(["Bin sites (locations)", "Bin movements (in/out/net)", "Both: sites + movements summary"]),
     resolve: (n) => {
       if (n === 1) return { topic: "binSites", question: "binsites summary", intent: { topic: "binSites" } };
@@ -116,8 +114,7 @@ const CLARIFY = {
     }
   },
 
-  // boundaries ambiguity
-  "boundaries": {
+  boundaries: {
     prompt: buildClarifyQuestion(["Fields with open boundary requests", "Open boundary requests (full list)", "Boundary requests summary"]),
     resolve: (n) => {
       if (n === 1) return { topic: "boundaries", question: "fields with boundary requests", intent: { topic: "boundaries", mode: "fields" } };
@@ -129,27 +126,61 @@ const CLARIFY = {
 };
 
 /* --------------------------------------------------
+   Read last clarify key from state OR history
+   - State can vary depending on how deriveStateFromHistory stores it.
+   - We support:
+     "clarify:grainbags"
+     "grainbags"
+-------------------------------------------------- */
+function getPendingClarifyKey(state, history) {
+  const s = (state?.lastIntent || "").toString().trim();
+  if (s) {
+    if (s.startsWith("clarify:")) return s.slice("clarify:".length);
+    if (CLARIFY[s]) return s;
+  }
+
+  // history fallback (walk backwards)
+  const h = Array.isArray(history) ? history : [];
+  for (let i = h.length - 1; i >= 0; i--) {
+    const msg = h[i] || {};
+    // try common shapes
+    const metaIntent =
+      (msg.meta && msg.meta.intent) ||
+      msg.intent ||
+      (msg.meta && msg.meta.lastIntent) ||
+      "";
+
+    const v = (metaIntent || "").toString().trim();
+    if (!v) continue;
+
+    if (v.startsWith("clarify:")) {
+      const key = v.slice("clarify:".length);
+      if (CLARIFY[key]) return key;
+    }
+    if (CLARIFY[v]) return v;
+  }
+
+  return null;
+}
+
+/* --------------------------------------------------
    Ambiguity detection (ASK instead of guessing)
-   This is the "everywhere" behavior you asked for.
 -------------------------------------------------- */
 function detectAmbiguity(question) {
   const qn = norm(question);
   if (!qn) return null;
 
   // grain broad
-  if (qn === "grain" || qn === "show grain" || qn === "grain inventory") {
-    return "grain";
-  }
+  if (qn === "grain" || qn === "show grain" || qn === "grain inventory") return "grain";
 
   // grain bag inventory / where placed ambiguity
-  // Examples: "grain bag inventory", "grain bags inventory", "grain bags where are they", "bag inventory"
-  const mentionsBags = qn.includes("grain bag") || qn.includes("grain bags") || qn.includes("bag inventory") || qn.includes("bags inventory");
+  const mentionsBags = qn.includes("grain bag") || qn.includes("grain bags") || qn.includes("bag inventory") || qn.includes("bags inventory") || qn === "bags";
   const mentionsInventory = qn.includes("inventory") || qn.includes("on hand") || qn.includes("onhand");
-  const mentionsPlaced = qn.includes("placed") || qn.includes("putdown") || qn.includes("put down") || qn.includes("where") || qn.includes("field");
+  const mentionsPlaced = qn.includes("placed") || qn.includes("putdown") || qn.includes("put down") || qn.includes("where");
   const mentionsEvents = qn.includes("events") || qn.includes("activity") || qn.includes("history");
 
-  // If they broadly mention bags + inventory-ish but don't clearly specify which dataset, ask.
-  if (mentionsBags && (mentionsInventory || mentionsPlaced || qn === "grain bags" || qn === "bags")) {
+  // If they mention bags and aren't already specific, ask
+  if (mentionsBags && (mentionsInventory || mentionsPlaced || mentionsEvents || qn === "grain bags")) {
     const alreadySpecific =
       qn.includes("putdown") || qn.includes("put down") || qn.includes("pickup") || qn.includes("pick up") ||
       qn.includes("events") || qn.includes("activity") || qn.includes("on hand") || qn.includes("onhand") ||
@@ -158,13 +189,10 @@ function detectAmbiguity(question) {
   }
 
   // maintenance broad
-  if (qn === "maintenance" || qn === "show maintenance" || qn === "list maintenance") {
-    return "maintenance";
-  }
+  if (qn === "maintenance" || qn === "show maintenance" || qn === "list maintenance") return "maintenance";
 
-  // bins broad (sites vs movements)
+  // bins broad
   if (qn === "bins" || qn === "bin" || qn === "show bins" || qn === "grain bins") {
-    // If they explicitly said "movements", do not clarify
     if (!qn.includes("movement")) return "bins";
   }
 
@@ -184,13 +212,9 @@ function normalizeIntent(question) {
   const qn = norm(question);
   if (!qn) return null;
 
-  // Friendly list phrases
-  const isList = qn === "list" || qn.includes(" list") || qn.includes("show") || qn.includes("all ");
-
-  if (qn.includes("readiness")) return { topic: "readiness" };
+  if (qn.includes("readiness")) return { topic: "readiness", normalizedQuestion: question };
 
   if (qn.includes("equipment") || qn.includes("tractor") || qn.includes("combine") || qn.includes("sprayer") || qn.includes("implement")) {
-    // If user says "equipment list" treat as summary (not equipment <id>)
     if (qn.includes("equipment list") || qn === "equipment" || qn === "equipment summary") {
       return { topic: "equipment", mode: "summary", normalizedQuestion: "equipment summary" };
     }
@@ -198,7 +222,7 @@ function normalizeIntent(question) {
   }
 
   if (qn.includes("field")) {
-    if (qn.includes("fields list") || qn === "fields" || qn === "list fields" || isList) {
+    if (qn === "fields" || qn === "list fields" || qn.includes("fields list") || qn.includes("show fields")) {
       return { topic: "fields", mode: "list", normalizedQuestion: "list fields" };
     }
     return { topic: "fields", normalizedQuestion: question };
@@ -210,9 +234,13 @@ function normalizeIntent(question) {
   if (qn.includes("rtk")) return { topic: "rtk", normalizedQuestion: question };
   if (qn.includes("farm")) return { topic: "farms", normalizedQuestion: question };
 
-  // bin sites / movements direct
   if (qn.includes("binsite") || qn.includes("bin site") || qn.includes("binsites")) return { topic: "binSites", normalizedQuestion: question };
   if (qn.includes("bin movements") || qn.startsWith("bins ")) return { topic: "binMovements", normalizedQuestion: question };
+
+  // direct grain bag event phrasing
+  if (qn.includes("bag events") || (qn.includes("grain bags") && (qn.includes("events") || qn.includes("putdown") || qn.includes("pickup")))) {
+    return { topic: "grainBagEvents", normalizedQuestion: question };
+  }
 
   return null;
 }
@@ -220,18 +248,26 @@ function normalizeIntent(question) {
 /* --------------------------------------------------
    Main handler
 -------------------------------------------------- */
-export async function handleChat({ question, snapshot, state }) {
-  // 1) Resolve pending clarify (user replied 1/2/3)
-  const last = (state?.lastIntent || "").toString().trim();
-  if (last.startsWith("clarify:")) {
-    const key = last.slice("clarify:".length);
-    const choice = isChoiceReply(question);
-    if (choice && CLARIFY[key]) {
-      const resolved = CLARIFY[key].resolve(choice);
+export async function handleChat({ question, snapshot, history, state }) {
+  const pick = choiceNumber(question);
+
+  // 1) Resolve pending clarify using state OR history
+  if (pick) {
+    const key = getPendingClarifyKey(state, history);
+    if (key && CLARIFY[key]) {
+      const resolved = CLARIFY[key].resolve(pick);
       if (resolved) {
         return await route(resolved.topic, resolved.question, snapshot, resolved.intent || null);
       }
+      // If key exists but resolve failed, re-ask
+      return { answer: CLARIFY[key].prompt, meta: { intent: `clarify:${key}`, clarify: true } };
     }
+
+    // If user sent 1/2/3 but we can't find what it was answering, don't say "unknown"
+    return {
+      answer: "Reply with 1, 2, or 3 to the last question I asked so I can pull the right data.",
+      meta: { intent: "clarify:missing-context", clarify: true }
+    };
   }
 
   // 2) Detect ambiguity and ask
@@ -308,7 +344,7 @@ async function route(topic, question, snapshot, intent) {
       out = await answerBinMovements({ question, snapshot, intent });
       break;
 
-    // Keep these available if you route to them later
+    // keep available
     case "products":
       out = await answerProducts({ question, snapshot, intent });
       break;
@@ -335,8 +371,6 @@ async function route(topic, question, snapshot, intent) {
       return blockedAnswer("no-route");
   }
 
-  // Truth Gate
   if (!enforceTruth(out)) return blockedAnswer("feature-no-data");
-
   return out;
 }
