@@ -1,5 +1,8 @@
 // /features/equipment.js  (FULL FILE)
-// Rev: 2025-12-30-human-equip (Human phrasing tolerant; no CLI "Try:" menus; no id=list failure)
+// Rev: 2025-12-30-human-equip-okflag
+// Change:
+// ✅ Adds ok:true on successful answers so Truth Gate can pass
+// ✅ Adds ok:false on error/empty states (no logic changes)
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -139,10 +142,10 @@ export function answerEquipment({ question, snapshot, intent }){
 
   const json = snapshot?.json || null;
   const snapshotId = snapshot?.activeSnapshotId || "unknown";
-  if (!json) return { answer: "Snapshot is not available right now.", meta: { snapshotId } };
+  if (!json) return { ok: false, answer: "Snapshot is not available right now.", meta: { snapshotId } };
 
   const colsRoot = getCollectionsRoot(json);
-  if (!colsRoot) return { answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
+  if (!colsRoot) return { ok: false, answer: "I can’t find Firefoo collections in this snapshot.", meta: { snapshotId } };
 
   const makesArr = colAsArray(colsRoot, "equipment-makes");
   const modelsArr = colAsArray(colsRoot, "equipment-models");
@@ -158,7 +161,9 @@ export function answerEquipment({ question, snapshot, intent }){
     __modelResolved: effectiveModelName(e, modelMap)
   }));
 
-  if (!items.length) return { answer: "No equipment records found in the snapshot.", meta: { snapshotId } };
+  if (!items.length) {
+    return { ok: false, answer: "No equipment records found in the snapshot.", meta: { snapshotId } };
+  }
 
   // If normalizeIntent provided a mode, honor it (prevents "equipment list" => id=list failures)
   const mode = (intent && intent.mode) ? String(intent.mode) : null;
@@ -171,6 +176,7 @@ export function answerEquipment({ question, snapshot, intent }){
     const byStatus = groupCount(items, x => x.status);
 
     return {
+      ok: true,
       answer:
         `Equipment summary:\n` +
         `• Total: ${items.length}\n` +
@@ -190,6 +196,7 @@ export function answerEquipment({ question, snapshot, intent }){
     const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
+      ok: true,
       answer: `Equipment type "${type}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
       meta: { snapshotId, type, count: list.length }
     };
@@ -212,6 +219,7 @@ export function answerEquipment({ question, snapshot, intent }){
     const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
+      ok: true,
       answer: `Equipment make "${makeNeedle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
       meta: { snapshotId, make: makeNeedle, count: list.length }
     };
@@ -234,6 +242,7 @@ export function answerEquipment({ question, snapshot, intent }){
     const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
+      ok: true,
       answer: `Equipment model "${modelNeedle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
       meta: { snapshotId, model: modelNeedle, count: list.length }
     };
@@ -264,6 +273,7 @@ export function answerEquipment({ question, snapshot, intent }){
     const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
 
     return {
+      ok: true,
       answer: `Equipment search "${needle}" (${list.length}):\n\n` + (show.length ? show.join("\n") : "• none"),
       meta: { snapshotId, needle, count: list.length }
     };
@@ -274,7 +284,7 @@ export function answerEquipment({ question, snapshot, intent }){
   if (m) {
     const id = m[1].trim();
     const found = items.find(x => x.id === id) || null;
-    if (!found) return { answer: `I couldn't find an equipment item with that QR id.`, meta: { snapshotId } };
+    if (!found) return { ok: false, answer: `I couldn't find an equipment item with that QR id.`, meta: { snapshotId } };
 
     const qr = found.qr || {};
     const img = qr.image || {};
@@ -283,11 +293,10 @@ export function answerEquipment({ question, snapshot, intent }){
     if (qr.token) lines.push(`• qr token: ${qr.token}`);
     if (img.url) lines.push(`• qr url: ${img.url}`);
 
-    return { answer: lines.join("\n"), meta: { snapshotId, id } };
+    return { ok: true, answer: lines.join("\n"), meta: { snapshotId, id } };
   }
 
   // equipment <id> (explicit id lookups only)
-  // If normalizeIntent decided "search", we avoid this path entirely.
   m = /^equipment\s+([a-zA-Z0-9_-]+)\s*$/i.exec(q);
   if (m) {
     const id = m[1].trim();
@@ -312,12 +321,14 @@ export function answerEquipment({ question, snapshot, intent }){
       const show = list.slice(0, 40).map(e => summarizeOne(e, makeMap, modelMap));
       if (list.length) {
         return {
+          ok: true,
           answer: `Here’s what I found for "${id}" (${list.length}):\n\n` + show.join("\n"),
           meta: { snapshotId, needle: id, count: list.length }
         };
       }
 
       return {
+        ok: true,
         answer: `I didn’t find any equipment that matches "${id}".`,
         meta: { snapshotId }
       };
@@ -352,11 +363,12 @@ export function answerEquipment({ question, snapshot, intent }){
 
     if (found.notes) lines.push(`• notes: ${safeStr(found.notes).trim()}`);
 
-    return { answer: lines.join("\n"), meta: { snapshotId, id } };
+    return { ok: true, answer: lines.join("\n"), meta: { snapshotId, id } };
   }
 
   // Final fallback (no CLI menu)
   return {
+    ok: true,
     answer:
       `I can summarize equipment, filter by type/make/model, or search by a keyword.\n` +
       `If you tell me what you’re looking for (ex: “John Deere”, “StarFire”, “sprayer”, “8R410”), I’ll narrow it down.`,
