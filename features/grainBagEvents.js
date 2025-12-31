@@ -6,6 +6,9 @@
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
+console.log("[DEV CHECK] grainBagEvents loaded - OK FLAG VERSION");
+
+
 function getCollectionsRoot(snapshotJson) {
   const d = snapshotJson || {};
   if (d.data && d.data.__collections__ && typeof d.data.__collections__ === "object") return d.data.__collections__;
