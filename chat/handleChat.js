@@ -1,209 +1,157 @@
-// /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-clean2
+// /context/copilotLogs.js  (FULL FILE)
+// Rev: 2025-12-30a
 //
-// FIXES:
-// ✅ If user asks "network id", use last RTK Tower mentioned in history and fetch from rtkTowers.
-// ✅ If lastIntent is field_rtk_followup, treat user's reply as the field hint (e.g., "801").
-// ✅ No dumb "try this" text. Minimal follow-ups only.
-
-'use strict';
+// Fix (per Dane):
+// ✅ NO MORE 503s when Firestore index is missing.
+//    - loadRecentHistory() gracefully falls back to a threadId-only query (no orderBy),
+//      and if that still fails, returns [].
+//    - appendLogTurn() never throws (best-effort logging).
+// ✅ Keeps your threadId logic EXACTLY.
+// ✅ Keeps deriveStateFromHistory EXACTLY.
+//
+// NOTE:
+// - Best fix is still to CREATE the composite index Google links you to.
+// - This file makes the system resilient even before the index finishes building.
 
 import admin from "firebase-admin";
-import { lookupFieldBundleByName } from "../data/fieldLookup.js";
 
-export async function handleChat({ question, snapshot, history, state }) {
-  const q = (question || "").toString().trim();
-  const low = q.toLowerCase();
-  const hist = Array.isArray(history) ? history : [];
-  const lastIntent = (state && state.lastIntent) ? String(state.lastIntent) : null;
+const COL = "copilot_logs";
+const MAX_HISTORY = 12;
 
-  if (!admin.apps.length) admin.initializeApp();
-  const db = admin.firestore();
+// Ensure Admin is initialized (safe if already initialized elsewhere)
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+const db = admin.firestore();
 
-  // -------------------------
-  // Follow-up: user replying with field hint (e.g. "801")
-  // -------------------------
-  if (lastIntent === "field_rtk_followup") {
-    return await answerFieldRtk({ db, fieldQuery: q });
+function nowTs() {
+  return admin.firestore.FieldValue.serverTimestamp();
+}
+
+function cleanStr(v) {
+  return (v == null) ? "" : String(v);
+}
+
+// Simple, stable threadId without requiring frontend changes.
+// You *can* override by sending req.body.threadId later.
+export function getThreadId(req) {
+  const bodyThread = cleanStr(req?.body?.threadId).trim();
+  if (bodyThread) return bodyThread;
+
+  const headerThread = cleanStr(req?.headers?.["x-fv-thread"]).trim();
+  if (headerThread) return headerThread;
+
+  const origin = cleanStr(req?.headers?.origin).trim() || "no-origin";
+  const ua = cleanStr(req?.headers?.["user-agent"]).trim() || "no-ua";
+
+  // Keep it short-ish and deterministic
+  const raw = `${origin}::${ua}`;
+  let hash = 0;
+  for (let i = 0; i < raw.length; i++) {
+    hash = ((hash << 5) - hash) + raw.charCodeAt(i);
+    hash |= 0;
   }
+  return `anon-${Math.abs(hash)}`;
+}
 
-  // -------------------------
-  // Network ID follow-up (use last tower mentioned)
-  // -------------------------
-  if (asksNetworkId(low)) {
-    const towerName = getLastTowerNameFromHistory(hist);
-    if (!towerName) {
-      // No context, ask minimal
-      return { answer: "Which tower?", meta: { intent: "tower_network_followup", usedOpenAI: false, model: "builtin" } };
-    }
-
-    const net = await lookupTowerNetworkIdByName(db, towerName);
-    if (net == null) {
-      return { answer: "Which tower?", meta: { intent: "tower_network_followup", usedOpenAI: false, model: "builtin" } };
-    }
-
-    return {
-      answer: `RTK Tower: ${towerName}\nNetwork ID: ${net}`,
-      meta: { intent: "tower_network_result", usedOpenAI: false, model: "builtin", towerName, networkId: net }
-    };
-  }
-
-  // -------------------------
-  // RTK tower for field
-  // -------------------------
-  if (isRtkTowerQuestion(low)) {
-    const fieldQuery = extractFieldQuery(q);
-
-    if (!fieldQuery) {
-      return {
-        answer: "Which field?",
-        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
-      };
-    }
-
-    return await answerFieldRtk({ db, fieldQuery });
-  }
-
-  // -------------------------
-  // Default (short)
-  // -------------------------
-  return {
-    answer: "What do you want to look up?",
-    meta: { intent: "followup", usedOpenAI: false, model: "builtin" }
+export async function appendLogTurn({ threadId, role, text, intent, meta }) {
+  const doc = {
+    threadId: cleanStr(threadId),
+    role: cleanStr(role),          // "user" | "assistant"
+    text: cleanStr(text),
+    intent: intent ? cleanStr(intent) : null,
+    meta: meta && typeof meta === "object" ? meta : null,
+    createdAt: nowTs()
   };
+
+  // Best-effort logging: never throw (prevents chat failures)
+  try {
+    await db.collection(COL).add(doc);
+  } catch (e) {
+    console.warn("[copilot_logs] appendLogTurn failed:", e?.message || e);
+  }
 }
 
-/* =======================================================================
-   Network ID helpers
-======================================================================= */
-
-function asksNetworkId(low) {
-  return /\bnetwork\s*id\b/.test(low) || /\bnetworkid\b/.test(low);
+function isMissingIndexError(e) {
+  const msg = (e?.message || "").toString();
+  // Firestore index missing typically shows FAILED_PRECONDITION and "requires an index"
+  return msg.includes("FAILED_PRECONDITION") && msg.toLowerCase().includes("requires an index");
 }
 
-// Pulls "Girard" from a previous assistant line like:
-// "RTK Tower: Girard (461.65000 MHz)"
-function getLastTowerNameFromHistory(history) {
-  if (!Array.isArray(history) || !history.length) return null;
+export async function loadRecentHistory(threadId) {
+  const tid = cleanStr(threadId).trim();
+  if (!tid) return [];
+
+  // 1) Preferred query (chronological via createdAt) — requires composite index
+  try {
+    const snap = await db.collection(COL)
+      .where("threadId", "==", tid)
+      .orderBy("createdAt", "desc")
+      .limit(MAX_HISTORY)
+      .get();
+
+    const rows = [];
+    snap.forEach(d => rows.push({ id: d.id, ...(d.data() || {}) }));
+    rows.reverse();
+
+    return rows.map(r => ({
+      role: cleanStr(r.role) || "user",
+      text: cleanStr(r.text),
+      intent: r.intent || null,
+      createdAt: r.createdAt || null
+    }));
+  } catch (e) {
+    // If missing index, fall back. Otherwise still fall back, but log.
+    if (isMissingIndexError(e)) {
+      console.warn("[copilot_logs] missing index for history query — using fallback (no orderBy)");
+    } else {
+      console.warn("[copilot_logs] history query failed — using fallback:", e?.message || e);
+    }
+  }
+
+  // 2) Fallback query (no orderBy) — avoids composite index
+  //    NOTE: Firestore will return in unspecified order; we sort client-side when possible.
+  try {
+    const snap = await db.collection(COL)
+      .where("threadId", "==", tid)
+      .limit(MAX_HISTORY)
+      .get();
+
+    const rows = [];
+    snap.forEach(d => rows.push({ id: d.id, ...(d.data() || {}) }));
+
+    // Try to sort by createdAt client-side (if timestamps present)
+    rows.sort((a, b) => {
+      const at = a?.createdAt?.toMillis ? a.createdAt.toMillis() :
+                 (typeof a?.createdAt?.seconds === "number" ? a.createdAt.seconds * 1000 : 0);
+      const bt = b?.createdAt?.toMillis ? b.createdAt.toMillis() :
+                 (typeof b?.createdAt?.seconds === "number" ? b.createdAt.seconds * 1000 : 0);
+      return at - bt;
+    });
+
+    return rows.map(r => ({
+      role: cleanStr(r.role) || "user",
+      text: cleanStr(r.text),
+      intent: r.intent || null,
+      createdAt: r.createdAt || null
+    }));
+  } catch (e) {
+    console.warn("[copilot_logs] fallback history query failed — returning empty history:", e?.message || e);
+    return [];
+  }
+}
+
+export function deriveStateFromHistory(history) {
+  // last assistant intent becomes the default for follow-ups
+  let lastIntent = null;
 
   for (let i = history.length - 1; i >= 0; i--) {
     const h = history[i];
-    if ((h?.role || "") !== "assistant") continue;
-    const text = (h?.text || "").toString();
-
-    const m = text.match(/RTK Tower:\s*([^(\\n]+)\s*(\(|$)/i);
-    if (m && m[1]) return m[1].trim();
-  }
-  return null;
-}
-
-async function lookupTowerNetworkIdByName(db, towerName) {
-  const name = (towerName || "").toString().trim();
-  if (!name) return null;
-
-  try {
-    const snap = await db.collection("rtkTowers")
-      .where("name", "==", name)
-      .limit(1)
-      .get();
-
-    let net = null;
-    snap.forEach(d => {
-      const data = d.data() || {};
-      net = (typeof data.networkId === "number") ? data.networkId : (data.networkId ?? null);
-    });
-
-    return net;
-  } catch {
-    return null;
-  }
-}
-
-/* =======================================================================
-   RTK helpers (clean)
-======================================================================= */
-
-function isRtkTowerQuestion(low) {
-  if (!low) return false;
-  return /\b(rtk|tower)\b/.test(low);
-}
-
-function extractFieldQuery(input) {
-  const s = (input || "").toString().trim();
-  if (!s) return null;
-
-  // "0801-Lloyd N340"
-  const dash = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
-  if (dash && dash[1]) return cleanFieldQuery(dash[1]);
-
-  // "field 801 on?" -> capture after field
-  const fm = s.match(/\bfield\b\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9\s-]{0,40})/i);
-  if (fm && fm[1]) return cleanFieldQuery(fm[1]);
-
-  // Short hint only (avoid swallowing full sentences)
-  if (s.length <= 32 && !/[?]/.test(s) && !/^\s*(what|which)\b/i.test(s)) {
-    return cleanFieldQuery(s);
-  }
-
-  return null;
-}
-
-function cleanFieldQuery(raw) {
-  let t = (raw || "").toString().trim();
-
-  t = t.replace(/[?.,;:]+$/g, "").trim();
-  t = t.replace(/\b(on|for|to|is|the|a|an|assigned|rtk|tower)\b/gi, " ");
-  t = t.replace(/\s+/g, " ").trim();
-
-  const num = t.match(/\b(\d{2,4})\b/);
-  if (num) {
-    const digits = t.replace(/\D/g, "");
-    const mostlyDigits = (digits.length / Math.max(1, t.length)) > 0.35;
-    if (mostlyDigits) return num[1];
-  }
-
-  return t || null;
-}
-
-async function answerFieldRtk({ db, fieldQuery }) {
-  const query = (fieldQuery || "").toString().trim();
-  if (!query) {
-    return { answer: "Which field?", meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" } };
-  }
-
-  const bundle = await lookupFieldBundleByName(db, query);
-
-  if (!bundle?.ok || !bundle?.field) {
-    return { answer: "Which field?", meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" } };
-  }
-
-  const field = bundle.field || {};
-  const farm = bundle.farm || null;
-  const tower = bundle.tower || null;
-
-  if (!field.rtkTowerId) {
-    return {
-      answer: `Field ${field.name || query}: No RTK tower assigned.`,
-      meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null }
-    };
-  }
-
-  const towerLabel = tower?.name || field.rtkTowerId;
-  const freq = (tower?.frequencyMHz || "").toString().trim();
-
-  let answer = `Field ${field.name || query}\nRTK Tower: ${towerLabel}`;
-  if (farm?.name) answer = `Field ${field.name || query} (${farm.name})\nRTK Tower: ${towerLabel}`;
-  if (freq) answer += ` (${freq} MHz)`;
-
-  return {
-    answer,
-    meta: {
-      intent: "field_rtk_result",
-      usedOpenAI: false,
-      model: "builtin",
-      fieldId: field.id || null,
-      farmId: field.farmId || null,
-      rtkTowerId: field.rtkTowerId || null
+    if (h.role === "assistant" && h.intent) {
+      lastIntent = h.intent;
+      break;
     }
-  };
+  }
+
+  return { lastIntent };
 }
