@@ -1,5 +1,5 @@
 {
-  "name": "farmvista-copilot",
+  "name": "farmvista-copilot-min",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google-cloud/storage": "^7.14.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0"
   }
 }
