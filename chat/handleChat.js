@@ -1,389 +1,354 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-acres-v1
+// Rev: 2026-01-02-field-lookup-v1
 //
-// Adds beginner feature:
-// - "How many acres do we have this year?"
-// - Follow-up: Active only vs All (active+archived)
-// - Computes from Firestore fields.tillable (read-only)
+// Adds beginner "field lookup" capability for RTK tower questions:
+// - User asks: "What RTK tower is <field> assigned to?"
+// - If field name is unclear -> ask for field name (follow-up intent)
+// - Then query Firestore: fields -> farms -> rtkTowers
 //
 // Keeps:
-// - Simple follow-up behavior
+// - generic follow-ups (stop guessing)
 // - OpenAI optional (if OPENAI_API_KEY set)
-// - Clean { answer, meta } response
+// - returns { answer, meta }
 
 'use strict';
 
 import admin from "firebase-admin";
 
-/**
- * @param {Object} args
- * @param {string} args.question
- * @param {Object} [args.snapshot]
- * @param {Array<{role:string,text:string,ts?:any,intent?:string,meta?:any}>} [args.history]
- * @param {Object} [args.state]  // expects { lastIntent }
- * @returns {Promise<{answer:string, meta?:Object}>}
- */
 export async function handleChat({ question, snapshot, history, state }) {
   const q = (question || '').toString().trim();
   const low = q.toLowerCase();
   const hist = Array.isArray(history) ? history : [];
   const lastIntent = (state && state.lastIntent) ? String(state.lastIntent) : null;
 
-  // Ensure admin initialized (safe)
+  // Firestore
   if (!admin.apps.length) admin.initializeApp();
   const db = admin.firestore();
 
-  // ------------------------------
-  // ACRES FEATURE (v1)
-  // ------------------------------
-  // If user is replying to our follow-up
-  if (lastIntent === "acres_followup") {
-    const choice = parseActiveAllChoice(low);
-    if (!choice) {
+  // ============================================================
+  // FEATURE: RTK tower for a field (multi-turn)
+  // ============================================================
+
+  // If we're in the follow-up turn, the user reply should just be the field name.
+  if (lastIntent === "field_rtk_followup") {
+    const fieldName = q;
+    if (!fieldName || fieldName.length < 3) {
       return {
-        answer: `Reply with: "active" (active fields only) or "all" (active + archived).`,
-        meta: { intent: "acres_followup", usedOpenAI: false, model: "builtin" }
+        answer: `Type the full field name (example: "0801-Lloyd N340").`,
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
       };
     }
 
-    const out = await computeAcres({ db, mode: choice });
+    const out = await lookupFieldWithFarmAndTower({ db, fieldName });
     return {
-      answer: out,
-      meta: { intent: "acres_result", usedOpenAI: false, model: "builtin", acresMode: choice }
+      answer: out.answer,
+      meta: { intent: out.intent, usedOpenAI: false, model: "builtin", ...(out.meta || {}) }
     };
   }
 
-  // If user is asking the acres question
-  if (isAcresQuestion(low)) {
-    // If they already specified active/all in the question, answer immediately.
-    const choice = parseActiveAllChoice(low);
-    if (choice) {
-      const out = await computeAcres({ db, mode: choice });
+  // If the user is asking about RTK tower assignment
+  if (isRtkTowerQuestion(low)) {
+    const guess = extractLikelyFieldName(q);
+
+    // If we can't confidently extract a field name, ask a solid follow-up.
+    if (!guess) {
       return {
-        answer: out,
-        meta: { intent: "acres_result", usedOpenAI: false, model: "builtin", acresMode: choice }
+        answer: `Which field? Type the field name exactly (example: "0801-Lloyd N340").`,
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
       };
     }
 
-    // Otherwise ask a solid follow-up (short + clear)
+    const out = await lookupFieldWithFarmAndTower({ db, fieldName: guess });
+    // If not found, ask follow-up (maybe the extraction was wrong)
+    if (out.intent === "field_not_found") {
+      return {
+        answer: `I couldn’t find a field named "${guess}". What field are you referring to? (type the exact field name)`,
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+      };
+    }
+
     return {
-      answer: `Do you want acres for **active fields only**, or **all fields** (active + archived)?\nReply: "active" or "all".`,
-      meta: { intent: "acres_followup", usedOpenAI: false, model: "builtin" }
+      answer: out.answer,
+      meta: { intent: out.intent, usedOpenAI: false, model: "builtin", ...(out.meta || {}) }
     };
   }
 
-  // ------------------------------
+  // ============================================================
   // Generic follow-up logic (stop guessing)
-  // ------------------------------
+  // ============================================================
   const followUp = buildFollowUpIfNeeded(q, hist);
   if (followUp) {
     return {
       answer: followUp,
-      meta: {
-        intent: 'followup',
-        model: 'builtin',
-        usedOpenAI: false
-      }
+      meta: { intent: 'followup', model: 'builtin', usedOpenAI: false }
     };
   }
 
-  // ------------------------------
+  // ============================================================
   // OpenAI (optional)
-  // ------------------------------
+  // ============================================================
   const apiKey = (process.env.OPENAI_API_KEY || '').trim();
   const model = (process.env.OPENAI_MODEL || 'gpt-4.1-mini').trim();
-  const useOpenAI = !!apiKey;
 
-  if (useOpenAI) {
+  if (apiKey) {
     try {
-      const answer = await callOpenAIChat({
-        apiKey,
-        model,
-        question: q,
-        history: hist
-      });
-
+      const answer = await callOpenAIChat({ apiKey, model, question: q, history: hist });
       return {
-        answer: (answer || '').trim() || "I didn’t get any text back. Can you rephrase your question?",
-        meta: {
-          intent: 'chat',
-          model,
-          usedOpenAI: true
-        }
+        answer: (answer || '').trim() || "Can you rephrase that?",
+        meta: { intent: 'chat', model, usedOpenAI: true }
       };
-    } catch (e) {
-      const fallback = localAnswer(q, hist);
-      return {
-        answer: fallback,
-        meta: {
-          intent: 'chat',
-          model: 'builtin_fallback',
-          usedOpenAI: false,
-          error: true,
-          errorMessage: e?.message || String(e)
-        }
-      };
+    } catch {
+      // fall through to local
     }
   }
 
   return {
-    answer: localAnswer(q, hist),
-    meta: {
-      intent: 'chat',
-      model: 'builtin',
-      usedOpenAI: false,
-      note: 'OPENAI_API_KEY not set'
-    }
+    answer: localAnswer(q),
+    meta: { intent: 'chat', model: 'builtin', usedOpenAI: false }
   };
 }
 
 /* =======================================================================
-   ACRES helpers
+   RTK tower field lookup helpers
 ======================================================================= */
 
-function isAcresQuestion(low) {
-  // intentionally broad + beginner language
-  return (
-    /\bhow many acres\b/.test(low) ||
-    /\btotal acres\b/.test(low) ||
-    /\bacres do we have\b/.test(low) ||
-    (/\bacres\b/.test(low) && /\bthis year\b/.test(low))
-  );
+function isRtkTowerQuestion(low) {
+  if (!low) return false;
+  // examples:
+  // "what rtk tower is 0801-lloyd n340 assigned to"
+  // "rtk tower for 0801-lloyd n340"
+  // "which tower is this field on"
+  const hasTower = /\b(tower|rtk)\b/.test(low);
+  const hasAsk = /\b(what|which|show|find|assigned|on)\b/.test(low);
+  const hasFieldish = /\b(field)\b/.test(low) || /-\w/.test(low) || /\d{3,4}/.test(low);
+  return hasTower && (hasAsk || hasFieldish);
 }
 
-function parseActiveAllChoice(low) {
-  // Accept: active / all / inactive wording
-  if (!low) return null;
+function extractLikelyFieldName(original) {
+  const s = (original || '').trim();
+  if (!s) return null;
 
-  // If they explicitly say "all" or "active and inactive" etc
-  if (/\ball\b/.test(low)) return "all";
-  if (/\bactive\b/.test(low) && /\binactive\b/.test(low)) return "all";
-  if (/\bactive\b/.test(low) && /\barchived\b/.test(low)) return "all";
+  // Heuristic: your field names almost always contain a dash like "0801-Lloyd N340"
+  // Try to pull a substring that looks like that.
+  const m = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
+  if (m && m[1]) return m[1].trim();
 
-  // If they say "active only"
-  if (/\bactive\b/.test(low)) return "active";
-
-  // Interpret yes/no only if they use it as a direct reply (we handle in follow-up path)
-  if (low === "yes" || low === "y") return "active";
-  if (low === "no" || low === "n") return "all";
+  // Another common style: user might paste exact field name without prompt words
+  // If message contains a dash and is not too long, treat whole message as name
+  if (s.includes("-") && s.length <= 48) return s;
 
   return null;
 }
 
-async function computeAcres({ db, mode }) {
-  // mode: "active" or "all"
-  const includeArchived = mode === "all";
+async function lookupFieldWithFarmAndTower({ db, fieldName }) {
+  const name = (fieldName || '').toString().trim();
+  if (!name) return { intent: "field_not_found", answer: "Missing field name." };
 
-  // Farms (for names, optional)
-  const farmsSnap = await db.collection("farms").get();
-  const farmById = new Map();
-  farmsSnap.forEach(doc => {
-    const d = doc.data() || {};
-    farmById.set(doc.id, {
-      name: (d.name || "").toString(),
-      status: (d.status || "").toString()
+  // 1) Try direct equality (fast path)
+  let fieldDoc = await findFieldByExactName(db, name);
+
+  // 2) If not found, do a small scan match (case-insensitive)
+  if (!fieldDoc) {
+    fieldDoc = await findFieldByScanName(db, name);
+  }
+
+  if (!fieldDoc) {
+    return { intent: "field_not_found", answer: `No field found for "${name}".` };
+  }
+
+  const f = fieldDoc.data || {};
+  const farmId = (f.farmId || '').toString().trim() || null;
+  const rtkTowerId = (f.rtkTowerId || '').toString().trim() || null;
+
+  // Join farm (optional)
+  let farmName = "";
+  let farmStatus = "";
+  if (farmId) {
+    const farmSnap = await db.collection("farms").doc(farmId).get();
+    if (farmSnap.exists) {
+      const d = farmSnap.data() || {};
+      farmName = (d.name || '').toString();
+      farmStatus = (d.status || '').toString();
+    }
+  }
+
+  // Join tower (optional)
+  let towerName = "";
+  let towerFreq = "";
+  if (rtkTowerId) {
+    const tSnap = await db.collection("rtkTowers").doc(rtkTowerId).get();
+    if (tSnap.exists) {
+      const d = tSnap.data() || {};
+      towerName = (d.name || '').toString();
+      towerFreq = (d.frequencyMHz || '').toString();
+    }
+  }
+
+  const fieldDisplay = (f.name || fieldName || '').toString();
+  const fieldStatus = (f.status || '').toString() || "active";
+
+  if (!rtkTowerId) {
+    return {
+      intent: "field_rtk_result",
+      answer: `Field **${fieldDisplay}** (${fieldStatus}) is not assigned to an RTK tower.`,
+      meta: { fieldId: fieldDoc.id, farmId, rtkTowerId: null }
+    };
+  }
+
+  // Clean beginner answer
+  const parts = [];
+  parts.push(`Field: **${fieldDisplay}** (${fieldStatus})`);
+  if (farmName) parts.push(`Farm: **${farmName}**${farmStatus ? ` (${farmStatus})` : ""}`);
+  parts.push(`RTK Tower: **${towerName || rtkTowerId}**${towerFreq ? ` (Freq: ${towerFreq} MHz)` : ""}`);
+
+  return {
+    intent: "field_rtk_result",
+    answer: parts.join("\n"),
+    meta: { fieldId: fieldDoc.id, farmId, rtkTowerId }
+  };
+}
+
+async function findFieldByExactName(db, name) {
+  try {
+    const snap = await db.collection("fields")
+      .where("name", "==", name)
+      .limit(1)
+      .get();
+
+    let hit = null;
+    snap.forEach(d => {
+      if (!hit) hit = { id: d.id, data: d.data() || {} };
     });
-  });
+    return hit;
+  } catch {
+    return null;
+  }
+}
 
-  // Fields
-  let q = db.collection("fields");
-  if (!includeArchived) q = q.where("status", "==", "active");
+async function findFieldByScanName(db, name) {
+  const needle = norm(name);
+  if (!needle) return null;
 
-  const fieldsSnap = await q.get();
+  // Bounded scan (beginner-safe). This is fine for now; later we can add indexes/search fields.
+  const snap = await db.collection("fields").limit(5000).get();
 
-  let total = 0;
-  let cnt = 0;
+  let best = null;
+  let bestScore = 0;
 
-  // If includeArchived, also split active/archived totals
-  let totalActive = 0, cntActive = 0;
-  let totalArchived = 0, cntArchived = 0;
-
-  // Optional: group by farm (top few)
-  const farmTotals = new Map(); // farmId -> acres
-
-  fieldsSnap.forEach(doc => {
-    const d = doc.data() || {};
-    const tillable = (typeof d.tillable === "number" && Number.isFinite(d.tillable)) ? d.tillable : 0;
-    const st = (d.status || "active").toString();
-
-    cnt += 1;
-    total += tillable;
-
-    if (includeArchived) {
-      if (st === "archived") {
-        cntArchived += 1;
-        totalArchived += tillable;
-      } else {
-        cntActive += 1;
-        totalActive += tillable;
-      }
-    }
-
-    const farmId = (d.farmId || "").toString().trim();
-    if (farmId) {
-      farmTotals.set(farmId, (farmTotals.get(farmId) || 0) + tillable);
+  snap.forEach(d => {
+    const data = d.data() || {};
+    const n = norm(data.name || "");
+    const sc = scoreName(n, needle);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = { id: d.id, data };
     }
   });
 
-  const fmt1 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+  // require a decent match
+  if (bestScore >= 50) return best;
+  return null;
+}
 
-  // Build a short answer
-  if (!includeArchived) {
-    return `Total acres (active fields): **${fmt1.format(total)}** acres across **${cnt}** fields.`;
-  }
+function norm(s) {
+  return (s || "").toString().trim().toLowerCase();
+}
 
-  // includeArchived view
-  // show combined + split
-  const lines = [];
-  lines.push(`Total acres (all fields): **${fmt1.format(total)}** acres across **${cnt}** fields.`);
-  lines.push(`Active: **${fmt1.format(totalActive)}** acres (${cntActive} fields) · Archived: **${fmt1.format(totalArchived)}** acres (${cntArchived} fields)`);
-
-  // Top 5 farms by acres (kept short)
-  const top = Array.from(farmTotals.entries())
-    .map(([farmId, acres]) => {
-      const f = farmById.get(farmId) || {};
-      return { farmId, name: f.name || farmId, acres };
-    })
-    .sort((a, b) => b.acres - a.acres)
-    .slice(0, 5);
-
-  if (top.length) {
-    lines.push(`Top farms:`);
-    for (const t of top) {
-      lines.push(`- ${t.name}: ${fmt1.format(t.acres)} acres`);
-    }
-  }
-
-  return lines.join("\n");
+function scoreName(nameLower, needleLower) {
+  if (!nameLower || !needleLower) return 0;
+  if (nameLower === needleLower) return 100;
+  if (nameLower.startsWith(needleLower)) return 80;
+  if (nameLower.includes(needleLower)) return 55;
+  return 0;
 }
 
 /* =======================================================================
-   Follow-up logic (generic)
+   Generic follow-up logic
 ======================================================================= */
 
 function buildFollowUpIfNeeded(question, history) {
   const q = (question || '').trim();
   const low = q.toLowerCase();
 
-  if (q.length < 6) {
-    return `What are you trying to do, and where?`;
-  }
+  if (q.length < 6) return `What are you trying to do, and where?`;
 
-  const pronouny = /\b(it|this|that|those|they|he|she|there|here)\b/i.test(q);
-  const hasConcreteNouns = /\b(error|file|page|endpoint|report|pdf|farm|field|equipment|login|firebase|firestore|copilot)\b/i.test(low);
-  const hasPriorContext = hasRecentHistory(history);
+  const pronouny = /\b(it|this|that|those|they|he|she)\b/i.test(q);
+  const hasConcrete = /\b(error|file|page|report|pdf|farm|field|equipment|firebase|firestore|copilot|rtk|tower)\b/i.test(low);
+  const hasPrior = Array.isArray(history) && history.slice(-4).some(h => ((h?.text || '').toString().trim().length > 0));
 
-  if (pronouny && !hasConcreteNouns && !hasPriorContext) {
-    return `What does “that/it” refer to (page/file/screenshot), and what do you want it to do?`;
-  }
-
-  const changeWords = /\b(fix|change|update|remove|add|build|rewrite|refactor|make it|make this)\b/i.test(low);
-  const mentionsFile = /\b(index\.js|server\.js|handlechat\.js|\.html|\.css|\.js)\b/i.test(low);
-  if (changeWords && !mentionsFile && !hasPriorContext) {
-    return `Which file or page should I change? Paste the full file.`;
+  if (pronouny && !hasConcrete && !hasPrior) {
+    return `What does “that/it” refer to (page/file), and what do you want it to do?`;
   }
 
   return null;
 }
 
-function hasRecentHistory(history) {
-  if (!Array.isArray(history) || !history.length) return false;
-  const recent = history.slice(-4);
-  return recent.some(h => ((h?.text || '').toString().trim().length > 0));
-}
-
 /* =======================================================================
-   OpenAI call (optional)
+   OpenAI (optional)
 ======================================================================= */
 
 async function callOpenAIChat({ apiKey, model, question, history }) {
-  const messages = buildMessages(question, history);
+  const msgs = buildMessages(question, history);
 
-  const body = {
-    model,
-    input: messages,
-    max_output_tokens: 700
-  };
-
-  const resp = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
     headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
+      "Authorization": `Bearer ${apiKey}`,
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ model, input: msgs, max_output_tokens: 600 })
   });
 
-  if (!resp.ok) {
-    const t = await safeReadText(resp);
-    throw new Error(`OpenAI error (${resp.status}): ${t || resp.statusText}`);
-  }
-
+  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}`);
   const json = await resp.json();
-  return extractResponseText(json) || '';
+  return extractResponseText(json);
 }
 
 function buildMessages(question, history) {
   const system = [
-    'You are FarmVista Copilot.',
-    'Be helpful, concise, and beginner-friendly.',
-    'If the user request is ambiguous, ask up to 3 clarifying questions instead of guessing.',
-    'Do not mention internal snapshots, revisions, code logs, or debugging unless asked.',
-    'When you need a file to proceed, ask for that file.'
-  ].join(' ');
+    "You are FarmVista Copilot.",
+    "Be concise and beginner-friendly.",
+    "Ask clarifying questions instead of guessing when needed.",
+    "Do not mention internal snapshots/revisions/logs unless asked."
+  ].join(" ");
 
-  const msgs = [{ role: 'system', content: system }];
-
+  const msgs = [{ role: "system", content: system }];
   const recent = Array.isArray(history) ? history.slice(-8) : [];
+
   for (const h of recent) {
-    const role = (h?.role || '').toString().toLowerCase() === 'assistant' ? 'assistant' : 'user';
-    const content = (h?.text || '').toString().trim();
+    const role = (h?.role || "").toString().toLowerCase() === "assistant" ? "assistant" : "user";
+    const content = (h?.text || "").toString().trim();
     if (!content) continue;
-    if (content.toLowerCase().startsWith('[[fv_pdf]]:')) continue;
     msgs.push({ role, content });
   }
 
-  msgs.push({ role: 'user', content: question });
+  msgs.push({ role: "user", content: question });
   return msgs;
 }
 
 function extractResponseText(json) {
   try {
+    if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
     const out = json?.output;
     if (Array.isArray(out)) {
-      let acc = '';
+      let acc = "";
       for (const item of out) {
         const content = item?.content;
         if (!Array.isArray(content)) continue;
         for (const c of content) {
-          if (c?.type === 'output_text' && typeof c?.text === 'string') acc += c.text;
-          if (c?.type === 'text' && typeof c?.text === 'string') acc += c.text;
+          if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
         }
       }
-      if (acc.trim()) return acc.trim();
+      return acc.trim();
     }
   } catch {}
-  try {
-    if (typeof json?.output_text === 'string' && json.output_text.trim()) return json.output_text.trim();
-  } catch {}
-  return '';
-}
-
-async function safeReadText(resp) {
-  try { return await resp.text(); } catch { return ''; }
+  return "";
 }
 
 /* =======================================================================
-   Local fallback responder
+   Local fallback
 ======================================================================= */
 
-function localAnswer(question, history) {
-  const q = (question || '').trim();
-  const low = q.toLowerCase();
-
-  if (/\b(copilot|farmvista|firestore|firebase|cloud run|endpoint|express|node)\b/.test(low)) {
-    return `Tell me what you want Copilot to do, and paste the file you want to work on.`;
-  }
-
+function localAnswer(q) {
   return `Tell me what you’re trying to do.`;
 }
