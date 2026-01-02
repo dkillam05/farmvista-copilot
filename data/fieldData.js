@@ -162,14 +162,53 @@ export function lookupTowerByName({ snapshot, towerName }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
 
-  const needle = norm(towerName);
-  if (!needle) return { ok: false, reason: "missing_name", tower: null };
+  const raw = (towerName || "").toString().trim();
+  if (!raw) return { ok: false, reason: "missing_name", tower: null };
+
+  // normalize user input
+  const needle = norm(raw)
+    .replace(/\b(rtk|tower)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let best = null;
+  let bestScore = 0;
 
   for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
-    if (norm(t?.name) === needle) return { ok: true, tower: { id, ...t } };
+    const name = (t?.name || "").toString();
+    const n = norm(name);
+
+    // exact match
+    if (n === needle) {
+      return { ok: true, tower: { id, ...t } };
+    }
+
+    // starts-with match
+    if (n.startsWith(needle)) {
+      const score = 90;
+      if (score > bestScore) {
+        best = { id, ...t };
+        bestScore = score;
+      }
+    }
+
+    // contains match
+    if (n.includes(needle)) {
+      const score = 75;
+      if (score > bestScore) {
+        best = { id, ...t };
+        bestScore = score;
+      }
+    }
   }
+
+  if (best) {
+    return { ok: true, tower: best };
+  }
+
   return { ok: false, reason: "not_found", tower: null };
 }
+
 
 // NEW: summarize towers and farms per tower
 export function summarizeTowers({ snapshot, includeArchived = false }) {
