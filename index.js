@@ -1,9 +1,10 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-02-min-core0
+// Rev: 2026-01-02-min-core1
 //
 // Minimal, deterministic Copilot core (NO LLM):
 // ✅ /health
 // ✅ /context/status + /context/reload
+// ✅ /context/summary   (shows what snapshot is loaded)
 // ✅ /chat  (snapshot-backed field + RTK tower answers only)
 
 import express from "express";
@@ -42,6 +43,55 @@ app.get("/context/status", async (req, res) => {
 app.post("/context/reload", async (req, res) => {
   const r = await reloadSnapshot();
   res.json({ ...r, revision: getRevision() });
+});
+
+// --------------------
+// Snapshot summary (safe-ish)
+// --------------------
+// GET /context/summary
+// Shows counts of farms/fields/rtkTowers and top-level keys.
+// Does NOT dump the whole snapshot.
+app.get("/context/summary", async (req, res) => {
+  const snap = await loadSnapshot({ force: false });
+
+  if (!snap?.ok) {
+    return res.status(200).json({
+      ok: false,
+      error: snap?.error || "snapshot_not_loaded",
+      source: snap?.source || null,
+      activeSnapshotId: snap?.activeSnapshotId || null,
+      loadedAt: snap?.loadedAt || null,
+      revision: getRevision()
+    });
+  }
+
+  const root = snap.json || {};
+
+  // Try common snapshot layouts
+  const cols =
+    root?.data?.__collections__ ||
+    root?.__collections__ ||
+    (root?.data && root.data.farms && root.data.fields ? root.data : null) ||
+    (root?.farms && root?.fields ? root : null);
+
+  const farms = cols?.farms || {};
+  const fields = cols?.fields || {};
+  const rtkTowers = cols?.rtkTowers || {};
+
+  return res.status(200).json({
+    ok: true,
+    activeSnapshotId: snap.activeSnapshotId || null,
+    source: snap.source || null,
+    loadedAt: snap.loadedAt || null,
+    counts: {
+      farms: Object.keys(farms).length,
+      fields: Object.keys(fields).length,
+      rtkTowers: Object.keys(rtkTowers).length
+    },
+    // Helpful to confirm structure without dumping everything
+    topKeys: Object.keys(root).slice(0, 50),
+    revision: getRevision()
+  });
 });
 
 // --------------------
