@@ -1,15 +1,11 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-router-min2
+// Rev: 2026-01-02-chat-router-min3
 //
-// Chat stays small:
-// - Handles follow-ups
-// - Routes a couple beginner intents
-// - Calls /data/* modules for Firestore lookups
-//
-// Currently supported:
-// - RTK tower for a field (multi-turn)
-// - Generic follow-up behavior
-// - OpenAI optional (if OPENAI_API_KEY set)
+// Improvements:
+// ✅ RTK tower field questions accept partial input ("field 801", "lloyd n340")
+// ✅ If lookup is a "scan" (best-match), ask confirmation: "Did you mean ____? yes/no"
+// ✅ Multi-turn confirm uses history (no new state storage needed)
+// ✅ Chat stays small; Firestore logic remains in /data/fieldLookup.js
 
 'use strict';
 
@@ -29,30 +25,52 @@ export async function handleChat({ question, snapshot, history, state }) {
   // =========================
   // RTK tower for field (v1)
   // =========================
+
+  // Follow-up: user types a field name / partial
   if (lastIntent === "field_rtk_followup") {
-    const fieldName = q;
-    const out = await answerFieldRtk({ db, fieldName });
-    return out;
+    return await answerFieldRtk({ db, fieldQuery: q, originalQuery: q, history: hist });
   }
 
+  // Confirm: "Did you mean ____ ?" -> user replies yes/no
+  if (lastIntent === "field_rtk_confirm") {
+    const yn = parseYesNo(low);
+    const suggested = extractSuggestedFieldFromLastAssistant(hist);
+
+    if (!suggested) {
+      // If we can’t recover it, just ask again
+      return {
+        answer: `Which field? (example: "0801-Lloyd N340" or "field 801")`,
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+      };
+    }
+
+    if (yn === "yes") {
+      return await answerFieldRtk({ db, fieldQuery: suggested, originalQuery: suggested, history: hist, forceExact: true });
+    }
+
+    if (yn === "no") {
+      return {
+        answer: `Ok — what field do you mean? (example: "lloyd n340" or "field 801")`,
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+      };
+    }
+
+    // Not yes/no -> treat whatever they typed as the new field query
+    return await answerFieldRtk({ db, fieldQuery: q, originalQuery: q, history: hist });
+  }
+
+  // Initial RTK question
   if (isRtkTowerQuestion(low)) {
-    const fieldName = extractLikelyFieldName(q);
+    const fieldQuery = extractFieldQueryFromQuestion(q);
 
-    if (!fieldName) {
+    if (!fieldQuery) {
       return {
-        answer: `Which field? Type the field name (example: "0801-Lloyd N340").`,
+        answer: `Which field? (example: "0801-Lloyd N340" or "field 801")`,
         meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
       };
     }
 
-    const out = await answerFieldRtk({ db, fieldName });
-    if (out?.meta?.intent === "field_not_found") {
-      return {
-        answer: `I couldn’t find "${fieldName}". What field do you mean? (type the exact field name)`,
-        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
-      };
-    }
-    return out;
+    return await answerFieldRtk({ db, fieldQuery, originalQuery: q, history: hist });
   }
 
   // =========================
@@ -74,46 +92,69 @@ export async function handleChat({ question, snapshot, history, state }) {
       const answer = await callOpenAIChat({ apiKey, model, question: q, history: hist });
       return { answer: (answer || "").trim() || "Can you rephrase that?", meta: { intent: "chat", usedOpenAI: true, model } };
     } catch {
-      // fall through to local
+      // fall through
     }
   }
 
-  return { answer: localAnswer(q), meta: { intent: "chat", usedOpenAI: false, model: "builtin" } };
+  return { answer: localAnswer(), meta: { intent: "chat", usedOpenAI: false, model: "builtin" } };
 }
 
 /* =======================================================================
-   Intent: RTK tower for field
+   RTK tower intent helpers
 ======================================================================= */
 
 function isRtkTowerQuestion(low) {
   if (!low) return false;
   const hasTower = /\b(rtk|tower)\b/.test(low);
-  const hasField = /\bfield\b/.test(low) || /\d{3,4}-/.test(low);
   const hasAsk = /\b(what|which|show|find|assigned|on)\b/.test(low);
-  return hasTower && (hasAsk || hasField);
+  const hasFieldish = /\bfield\b/.test(low) || /\d{2,4}\b/.test(low) || /-\w/.test(low);
+  return hasTower && (hasAsk || hasFieldish);
 }
 
-function extractLikelyFieldName(original) {
+// Extract a usable "field query" from the question.
+// Works for:
+// - "What RTK tower is 0801-Lloyd N340 assigned to?"
+// - "What tower is field 801 on?"
+// - "RTK tower for lloyd n340"
+function extractFieldQueryFromQuestion(original) {
   const s = (original || "").trim();
   if (!s) return null;
 
-  // pull "0801-Lloyd N340" style strings
-  const m = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
-  if (m && m[1]) return m[1].trim();
+  // If it contains your typical "0801-Name ..." style, grab that chunk
+  const dash = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
+  if (dash && dash[1]) return dash[1].trim();
 
-  // if message looks like it IS the field name
-  if (s.includes("-") && s.length <= 48 && !/\b(rtk|tower|assigned|what|which)\b/i.test(s)) {
-    return s;
-  }
+  // If it says "field 801 ..." capture after "field"
+  const fm = s.match(/\bfield\b\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9\s-]{1,40})/i);
+  if (fm && fm[1]) return fm[1].trim();
+
+  // Otherwise, remove common question words and return the remainder if it’s not empty
+  const cleaned = s
+    .replace(/\bwhat\b|\bwhich\b|\brtk\b|\btower\b|\bassigned\b|\bto\b|\bis\b|\bon\b|\bfor\b|\bthe\b|\bof\b|\bplease\b|\bshow\b|\bfind\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // If they just typed "801" or "lloyd n340", this will keep it
+  if (cleaned && cleaned.length >= 2) return cleaned;
+
   return null;
 }
 
-async function answerFieldRtk({ db, fieldName }) {
-  const bundle = await lookupFieldBundleByName(db, fieldName);
+async function answerFieldRtk({ db, fieldQuery, originalQuery, history, forceExact = false }) {
+  const query = (fieldQuery || "").toString().trim();
+  if (!query) {
+    return {
+      answer: `Which field? (example: "0801-Lloyd N340" or "field 801")`,
+      meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+    };
+  }
+
+  // Uses /data/fieldLookup.js (exact first, then best-match scan)
+  const bundle = await lookupFieldBundleByName(db, query);
 
   if (!bundle.ok) {
     return {
-      answer: `I couldn’t find that field. Type the full field name.`,
+      answer: `I couldn’t find a field for "${query}". Try: "field 801" or "lloyd n340".`,
       meta: { intent: "field_not_found", usedOpenAI: false, model: "builtin" }
     };
   }
@@ -122,27 +163,68 @@ async function answerFieldRtk({ db, fieldName }) {
   const farm = bundle.farm || null;
   const tower = bundle.tower || null;
 
+  // If this was a scan match and the user didn't already supply an exact-style name,
+  // ask confirmation first (prevents wrong-field answers).
+  if (!forceExact && bundle.matchType === "scan" && !looksExactFieldName(originalQuery)) {
+    return {
+      answer: `Did you mean **${field.name || query}**?\nReply: "yes" or "no".`,
+      meta: { intent: "field_rtk_confirm", usedOpenAI: false, model: "builtin" }
+    };
+  }
+
   if (!field.rtkTowerId) {
     return {
-      answer: `Field **${field.name || fieldName}** (${field.status || "active"}) is not assigned to an RTK tower.`,
+      answer: `Field **${field.name || query}** (${field.status || "active"}) is not assigned to an RTK tower.`,
       meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null }
     };
   }
 
   const lines = [];
-  lines.push(`Field: **${field.name || fieldName}** (${field.status || "active"})`);
+  lines.push(`Field: **${field.name || query}** (${field.status || "active"})`);
   if (farm?.name) lines.push(`Farm: **${farm.name}**${farm.status ? ` (${farm.status})` : ""}`);
   lines.push(`RTK Tower: **${tower?.name || field.rtkTowerId}**${tower?.frequencyMHz ? ` (${tower.frequencyMHz} MHz)` : ""}`);
 
-  // If it was a scan match, note it (short)
-  if (bundle.matchType === "scan") {
-    lines.push(`(Best match found)`);
-  }
-
   return {
     answer: lines.join("\n"),
-    meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null, farmId: field.farmId || null, rtkTowerId: field.rtkTowerId || null }
+    meta: {
+      intent: "field_rtk_result",
+      usedOpenAI: false,
+      model: "builtin",
+      fieldId: field.id || null,
+      farmId: field.farmId || null,
+      rtkTowerId: field.rtkTowerId || null
+    }
   };
+}
+
+function looksExactFieldName(s) {
+  const t = (s || "").toString();
+  // treat "0801-Name ..." as exact enough
+  return /\b[0-9]{3,4}-[A-Za-z]/.test(t);
+}
+
+function parseYesNo(low) {
+  const t = (low || "").trim();
+  if (t === "yes" || t === "y" || t === "yep" || t === "yeah") return "yes";
+  if (t === "no" || t === "n" || t === "nope") return "no";
+  return null;
+}
+
+// Pull the suggested field name out of our last assistant message:
+// "Did you mean **0801-Lloyd N340**?"
+function extractSuggestedFieldFromLastAssistant(history) {
+  if (!Array.isArray(history) || !history.length) return null;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if ((h?.role || "") !== "assistant") continue;
+    const text = (h?.text || "").toString();
+
+    const m = text.match(/\*\*([^*]+)\*\*/); // first bold segment
+    if (m && m[1]) return m[1].trim();
+    break;
+  }
+  return null;
 }
 
 /* =======================================================================
