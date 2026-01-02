@@ -1,5 +1,5 @@
 {
-  "name": "farmvista-copilot-min",
+  "name": "farmvista-copilot",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -11,6 +11,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@google-cloud/storage": "^7.14.0",
     "express": "^4.19.2"
   }
 }
