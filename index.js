@@ -1,9 +1,10 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-02-min-core2
+// Rev: 2026-01-02-min-core3
 //
 // Adds:
 // ✅ /context/summary  (counts + top keys + preview lists)
 // ✅ /context/raw      (FULL snapshot dump - debug only)
+// ✅ /openai/health    (verifies OpenAI is reachable)
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
@@ -46,10 +47,6 @@ app.post("/context/reload", async (req, res) => {
 // --------------------
 // Snapshot summary (safe-ish)
 // --------------------
-// GET /context/summary
-// - counts farms/fields/rtkTowers
-// - shows top-level keys
-// - shows first few names for sanity (no full dump)
 app.get("/context/summary", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
 
@@ -67,7 +64,6 @@ app.get("/context/summary", async (req, res) => {
 
   const root = snap.json || {};
 
-  // Common snapshot layouts
   const cols =
     root?.data?.__collections__ ||
     root?.__collections__ ||
@@ -106,9 +102,6 @@ app.get("/context/summary", async (req, res) => {
 // --------------------
 // Snapshot raw (DEBUG ONLY)
 // --------------------
-// GET /context/raw
-// Returns the entire snapshot JSON as loaded in memory.
-// WARNING: exposes all data. Remove/lock down later.
 app.get("/context/raw", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
   if (!snap?.ok) {
@@ -123,6 +116,48 @@ app.get("/context/raw", async (req, res) => {
     });
   }
   res.json(snap.json);
+});
+
+// --------------------
+// OpenAI health (proves OpenAI is reachable)
+// --------------------
+app.get("/openai/health", async (req, res) => {
+  const apiKey = (process.env.OPENAI_API_KEY || "").trim();
+  const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
+
+  if (!apiKey) return res.status(200).json({ ok: false, error: "OPENAI_API_KEY not set", revision: getRevision() });
+
+  try {
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        input: [{ role: "user", content: "ping" }],
+        max_output_tokens: 20
+      })
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      return res.status(200).json({
+        ok: false,
+        error: `OpenAI HTTP ${r.status}`,
+        detail: (t || r.statusText).slice(0, 300),
+        revision: getRevision()
+      });
+    }
+
+    const j = await r.json();
+    return res.status(200).json({
+      ok: true,
+      model,
+      sample: (j.output_text || "").slice(0, 80),
+      revision: getRevision()
+    });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: e?.message || String(e), revision: getRevision() });
+  }
 });
 
 // --------------------
