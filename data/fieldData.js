@@ -1,12 +1,12 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fields-only1cjs
+// Rev: 2026-01-02-fields-only1-esm
 //
 // FIELDS ONLY.
 // Snapshot-only access for fields (+ farm name lookup for display).
 // ❌ Removed ALL RTK tower logic and outputs.
 // ✅ Deterministic + forgiving field matching (no exact-only traps).
 //
-// CommonJS build (for Node/Express default require()).
+// ESM build (for Node ESM import).
 //
 // Exports kept for chat:
 // - getSnapshotCollections(snapshot)
@@ -53,8 +53,8 @@ function getCollectionMap(colsRoot, name) {
   return null;
 }
 
-function getSnapshotCollections(snapshot) {
-  const snapJson = snapshot && snapshot.json ? snapshot.json : null;
+export function getSnapshotCollections(snapshot) {
+  const snapJson = snapshot?.json || null;
   const root = getCollectionsRoot(snapJson);
 
   if (!root) {
@@ -90,14 +90,14 @@ function scoreName(hay, needle) {
   return hits ? Math.min(74, 50 + hits * 8) : 0;
 }
 
-function buildFieldBundle({ snapshot, fieldId }) {
+export function buildFieldBundle({ snapshot, fieldId }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason };
 
-  const field = (cols.fields && cols.fields[fieldId]) ? cols.fields[fieldId] : null;
+  const field = cols.fields?.[fieldId] || null;
   if (!field) return { ok: false, reason: "field_not_found" };
 
-  const farm = field.farmId ? ((cols.farms && cols.farms[field.farmId]) || null) : null;
+  const farm = field.farmId ? (cols.farms?.[field.farmId] || null) : null;
 
   return {
     ok: true,
@@ -107,7 +107,7 @@ function buildFieldBundle({ snapshot, fieldId }) {
   };
 }
 
-function tryResolveField({ snapshot, query, includeArchived = false }) {
+export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason };
 
@@ -115,28 +115,23 @@ function tryResolveField({ snapshot, query, includeArchived = false }) {
   if (!q) return { ok: false, reason: "missing_query" };
 
   // direct id
-  if (cols.fields && cols.fields[q]) {
-    return { ok: true, resolved: true, fieldId: q, confidence: 100 };
-  }
+  if (cols.fields?.[q]) return { ok: true, resolved: true, fieldId: q, confidence: 100 };
 
   // exact name
   const qn = norm(q);
   for (const [id, f] of Object.entries(cols.fields || {})) {
-    if (!includeArchived && !isActiveStatus(f && f.status)) continue;
-    if (norm(f && f.name) === qn) {
-      return { ok: true, resolved: true, fieldId: id, confidence: 100 };
-    }
+    if (!includeArchived && !isActiveStatus(f?.status)) continue;
+    if (norm(f?.name) === qn) return { ok: true, resolved: true, fieldId: id, confidence: 100 };
   }
 
   // scored suggestions
   const matches = [];
   for (const [id, f] of Object.entries(cols.fields || {})) {
-    if (!includeArchived && !isActiveStatus(f && f.status)) continue;
-    const sc = scoreName((f && f.name) || "", q);
+    if (!includeArchived && !isActiveStatus(f?.status)) continue;
+    const sc = scoreName(f?.name || "", q);
     if (sc <= 0) continue;
-    matches.push({ fieldId: id, score: sc, name: ((f && f.name) || "").toString() });
+    matches.push({ fieldId: id, score: sc, name: (f?.name || "").toString() });
   }
-
   matches.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
 
   if (!matches.length) return { ok: true, resolved: false, candidates: [] };
@@ -146,28 +141,23 @@ function tryResolveField({ snapshot, query, includeArchived = false }) {
   const strong = top.score >= 90;
   const separated = !second || (top.score - second.score >= 12);
 
-  if (strong && separated) {
-    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
-  }
-
+  if (strong && separated) return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
   return { ok: true, resolved: false, candidates: matches.slice(0, 3) };
 }
 
-function formatFieldOptionLine({ snapshot, fieldId }) {
+export function formatFieldOptionLine({ snapshot, fieldId }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return "";
-
-  const f = (cols.fields && cols.fields[fieldId]) ? cols.fields[fieldId] : null;
+  const f = cols.fields?.[fieldId] || null;
   if (!f) return "";
-
-  const farm = f.farmId ? ((cols.farms && cols.farms[f.farmId]) || null) : null;
-  const farmName = (farm && farm.name ? farm.name : "").toString().trim();
-  const label = (f && f.name ? f.name : "").toString().trim();
-
+  const farm = f?.farmId ? (cols.farms?.[f.farmId] || null) : null;
+  const farmName = (farm?.name || "").toString().trim();
+  const label = (f?.name || "").toString().trim();
   return farmName ? `${label} (${farmName})` : label;
 }
 
-module.exports = {
+// Optional convenience default export
+export default {
   getSnapshotCollections,
   buildFieldBundle,
   tryResolveField,
