@@ -1,8 +1,12 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fieldData-snapshot2
+// Rev: 2026-01-02-fieldData-snapshot3
 //
-// Snapshot-only access for farms / fields / rtkTowers.
-// Adds: lookupTowerByName() for follow-up questions like "network id" / "frequency".
+// Snapshot-only data access for farms / fields / rtkTowers.
+// Adds:
+// - summarizeTowers({ includeArchived }) -> { towersUsedCount, towers: [...] }
+// - towerToFarms map based on active fields by default
+//
+// No Firestore queries here.
 
 'use strict';
 
@@ -154,7 +158,6 @@ export function formatFieldOptionLine({ snapshot, fieldId }) {
   return farmName ? `${label} (${farmName})` : label;
 }
 
-// NEW: tower lookup by name (for follow-ups)
 export function lookupTowerByName({ snapshot, towerName }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
@@ -163,10 +166,68 @@ export function lookupTowerByName({ snapshot, towerName }) {
   if (!needle) return { ok: false, reason: "missing_name", tower: null };
 
   for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
-    if (norm(t?.name) === needle) {
-      return { ok: true, tower: { id, ...t } };
+    if (norm(t?.name) === needle) return { ok: true, tower: { id, ...t } };
+  }
+  return { ok: false, reason: "not_found", tower: null };
+}
+
+// NEW: summarize towers and farms per tower
+export function summarizeTowers({ snapshot, includeArchived = false }) {
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason };
+
+  // towerId -> { tower, farmIds:Set, fieldCount }
+  const towerMap = new Map();
+
+  for (const [fieldId, f] of Object.entries(cols.fields || {})) {
+    if (!includeArchived && !isActiveStatus(f?.status)) continue;
+
+    const towerId = (f?.rtkTowerId || "").toString().trim();
+    if (!towerId) continue;
+
+    const farmId = (f?.farmId || "").toString().trim();
+
+    if (!towerMap.has(towerId)) {
+      const t = cols.rtkTowers?.[towerId] || null;
+      towerMap.set(towerId, {
+        towerId,
+        tower: t ? { id: towerId, ...t } : { id: towerId, name: towerId },
+        farmIds: new Set(),
+        fieldCount: 0
+      });
     }
+
+    const rec = towerMap.get(towerId);
+    rec.fieldCount += 1;
+    if (farmId) rec.farmIds.add(farmId);
   }
 
-  return { ok: false, reason: "not_found", tower: null };
+  const towers = [];
+  for (const rec of towerMap.values()) {
+    const farmNames = [];
+    for (const farmId of rec.farmIds) {
+      const farm = cols.farms?.[farmId] || null;
+      if (!farm) continue;
+      if (!includeArchived && !isActiveStatus(farm?.status)) continue;
+      farmNames.push((farm.name || farmId).toString());
+    }
+    farmNames.sort((a, b) => a.localeCompare(b));
+
+    towers.push({
+      towerId: rec.towerId,
+      name: (rec.tower?.name || rec.towerId).toString(),
+      frequencyMHz: (rec.tower?.frequencyMHz || "").toString(),
+      networkId: rec.tower?.networkId ?? null,
+      fieldCount: rec.fieldCount,
+      farms: farmNames
+    });
+  }
+
+  towers.sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    ok: true,
+    towersUsedCount: towers.length,
+    towers
+  };
 }
