@@ -1,15 +1,8 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fieldData-snapshot1
+// Rev: 2026-01-02-fieldData-snapshot2
 //
-// Snapshot-only data access for:
-// - farms
-// - fields
-// - rtkTowers
-//
-// IMPORTANT:
-// - Reads from snapshot.json (loaded from Firebase Storage by context/snapshot.js)
-// - No Firestore queries here.
-// - Designed for fast lookups + suggestions at scale.
+// Snapshot-only access for farms / fields / rtkTowers.
+// Adds: lookupTowerByName() for follow-up questions like "network id" / "frequency".
 
 'use strict';
 
@@ -35,25 +28,19 @@ export function getSnapshotCollections(snapshot) {
   const snapJson = snapshot?.json || null;
   const root = getCollectionsRoot(snapJson);
   if (!root) {
-    return {
-      ok: false,
-      farms: {},
-      fields: {},
-      rtkTowers: {},
-      reason: "snapshot_missing_collections"
-    };
+    return { ok: false, farms: {}, fields: {}, rtkTowers: {}, reason: "snapshot_missing_collections" };
   }
-
-  const farms = getCollectionMap(root, "farms") || {};
-  const fields = getCollectionMap(root, "fields") || {};
-  const rtkTowers = getCollectionMap(root, "rtkTowers") || {};
-
-  return { ok: true, farms, fields, rtkTowers };
+  return {
+    ok: true,
+    farms: getCollectionMap(root, "farms") || {},
+    fields: getCollectionMap(root, "fields") || {},
+    rtkTowers: getCollectionMap(root, "rtkTowers") || {}
+  };
 }
 
 function isActiveStatus(s) {
   const v = norm(s);
-  if (!v) return true; // treat missing as active
+  if (!v) return true;
   return v !== "archived" && v !== "inactive";
 }
 
@@ -85,13 +72,10 @@ function scoreFieldName(fieldName, q) {
   if (n.startsWith(needle)) return 90;
   if (n.includes(needle)) return 80;
 
-  // numeric hint support: "801" should match "0801-..."
   const digits = needle.replace(/\D/g, "");
   if (digits && n.includes(digits)) return 75;
 
-  // token overlap
   const toks = needle.split(/\s+/).filter(Boolean);
-  if (!toks.length) return 0;
   let hit = 0;
   for (const t of toks) if (t.length >= 2 && n.includes(t)) hit++;
   if (hit) return Math.min(74, 50 + hit * 8);
@@ -107,7 +91,6 @@ export function suggestFields({ snapshot, query, includeArchived = false, limit 
   if (!q) return { ok: false, reason: "missing_query", matches: [] };
 
   const out = [];
-
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
     const sc = scoreFieldName(f?.name || "", q);
@@ -138,53 +121,52 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query" };
 
-  // 1) direct ID hit
-  if (cols.fields?.[q]) {
-    return { ok: true, resolved: true, fieldId: q, confidence: 100 };
-  }
+  if (cols.fields?.[q]) return { ok: true, resolved: true, fieldId: q, confidence: 100 };
 
-  // 2) exact name match
   const qn = norm(q);
-  let exactId = null;
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
-    if (norm(f?.name) === qn) {
-      exactId = id;
-      break;
-    }
+    if (norm(f?.name) === qn) return { ok: true, resolved: true, fieldId: id, confidence: 100 };
   }
-  if (exactId) return { ok: true, resolved: true, fieldId: exactId, confidence: 100 };
 
-  // 3) best-match suggestions
   const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
   if (!sug.ok) return { ok: false, reason: sug.reason };
 
   if (!sug.matches.length) return { ok: true, resolved: false, candidates: [] };
 
-  // if top match is clearly ahead, auto-resolve
   const top = sug.matches[0];
   const second = sug.matches[1] || null;
-
   const strong = top.score >= 90;
   const separated = !second || (top.score - second.score >= 12);
 
-  if (strong && separated) {
-    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
-  }
-
+  if (strong && separated) return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
   return { ok: true, resolved: false, candidates: sug.matches.slice(0, 3) };
 }
 
 export function formatFieldOptionLine({ snapshot, fieldId }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return "";
-
   const f = cols.fields?.[fieldId] || null;
   if (!f) return "";
-
   const farm = f?.farmId ? (cols.farms?.[f.farmId] || null) : null;
   const farmName = (farm?.name || "").toString().trim();
-
   const label = (f?.name || "").toString().trim();
   return farmName ? `${label} (${farmName})` : label;
+}
+
+// NEW: tower lookup by name (for follow-ups)
+export function lookupTowerByName({ snapshot, towerName }) {
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
+
+  const needle = norm(towerName);
+  if (!needle) return { ok: false, reason: "missing_name", tower: null };
+
+  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
+    if (norm(t?.name) === needle) {
+      return { ok: true, tower: { id, ...t } };
+    }
+  }
+
+  return { ok: false, reason: "not_found", tower: null };
 }
