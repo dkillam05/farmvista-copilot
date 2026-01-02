@@ -1,5 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-fields-only3
+// Rev: 2026-01-02-chat-fields-only4
+//
+// Fixes (per Dane):
+// ✅ Stop “dumb clarify loops”:
+//    - If only 1 plausible match => answer (no 1/2/3)
+//    - If tower-name is present => resolve tower directly (don’t mis-route into field clarify)
+//    - If user asks “tell me more about Raymond tower” => return tower detail fast-path
+// ✅ Better tower follow-ups:
+//    - Try to extract tower name from the CURRENT question first, then history
+// ✅ No internal IDs in normal answers (facts omit ids)
 //
 // Supports snapshot-backed:
 // - Field questions (RTK tower / farm / acres / county, etc via facts)
@@ -30,7 +39,7 @@ export async function handleChat({ question, snapshot, history }) {
     const sum = summarizeTowers({ snapshot, includeArchived: false });
     if (!sum.ok) {
       const answer = await openaiAnswer({ apiKey, model, userText: "Snapshot data unavailable. Ask user to retry." });
-      return { answer, meta: { intent: "chat", usedOpenAI: true, model, snapshotOk: false } };
+      return { answer, meta: { intent: "tower_summary", usedOpenAI: true, model, snapshotOk: false } };
     }
 
     const facts = {
@@ -44,38 +53,60 @@ export async function handleChat({ question, snapshot, history }) {
       }))
     };
 
-    const answer = await openaiAnswerWithFacts({
-      apiKey,
-      model,
-      userText: q,
-      facts
-    });
-
+    const answer = await openaiAnswerWithFacts({ apiKey, model, userText: q, facts });
     return { answer, meta: { intent: "tower_summary", usedOpenAI: true, model } };
   }
 
-  // 1) Tower-detail follow-up (network id / frequency)
-  if (asksTowerDetails(q)) {
-    const lastTowerName = extractLastTowerName(history);
-    if (lastTowerName) {
-      const hit = lookupTowerByName({ snapshot, towerName: lastTowerName });
+  // 1) Tower detail / tower info (fast path)
+  // IMPORTANT: prefer extracting tower name from CURRENT question, then fall back to last tower in history.
+  if (looksLikeTowerInfoQuestion(q) || asksTowerDetails(q)) {
+    const towerNameFromQuestion = extractTowerNameFromQuestion(q);
+    const towerName = towerNameFromQuestion || extractLastTowerName(history);
+
+    if (towerName) {
+      // Try direct tower lookup first
+      const hit = lookupTowerByName({ snapshot, towerName });
       if (hit.ok && hit.tower) {
         const t = hit.tower;
         const freq = (t.frequencyMHz || "").toString().trim();
         const net = (t.networkId ?? "").toString().trim();
 
-        const parts = [`RTK Tower: ${t.name}`];
-        if (net) parts.push(`Network ID: ${net}`);
-        if (freq) parts.push(`Frequency: ${freq} MHz`);
-        return { answer: parts.join("\n"), meta: { intent: "tower_details", usedOpenAI: false } };
+        // Enrich with farms/field counts if available via summarizeTowers
+        let farms = [];
+        let fieldCount = null;
+        try {
+          const sum = summarizeTowers({ snapshot, includeArchived: false });
+          if (sum?.ok && Array.isArray(sum.towers)) {
+            const found = sum.towers.find(x => norm(x?.name) === norm(t.name));
+            if (found) {
+              farms = Array.isArray(found.farms) ? found.farms : [];
+              fieldCount = typeof found.fieldCount === "number" ? found.fieldCount : null;
+            }
+          }
+        } catch {}
+
+        const lines = [`RTK Tower: ${t.name}`];
+        if (net) lines.push(`Network ID: ${net}`);
+        if (freq) lines.push(`Frequency: ${freq} MHz`);
+        if (fieldCount !== null) lines.push(`Fields assigned: ${fieldCount}`);
+        if (farms.length) lines.push(`Farms: ${farms.join(", ")}`);
+
+        return { answer: lines.join("\n"), meta: { intent: "tower_info", usedOpenAI: false } };
       }
     }
 
-    const answer = await openaiAnswer({ apiKey, model, userText: `Ask: Which RTK tower name?` });
-    return { answer, meta: { intent: "chat", usedOpenAI: true, model } };
+    // If tower name wasn't found or lookup failed, ask ONE direct clarification (A/B style)
+    // (Avoid returning a random unrelated option list.)
+    const answer = await openaiAnswer({
+      apiKey,
+      model,
+      userText:
+        "Which RTK tower name are you asking about? (Example: “Raymond”)."
+    });
+    return { answer, meta: { intent: "tower_info_clarify", usedOpenAI: true, model } };
   }
 
-  // 2) OpenAI classify
+  // 2) OpenAI classify (only for field-ish vs general)
   const plan = await openaiPlan({ apiKey, model, userText: q });
 
   if (plan.action !== "field") {
@@ -92,7 +123,11 @@ export async function handleChat({ question, snapshot, history }) {
   });
 
   if (!resolved.ok) {
-    const answer = await openaiAnswer({ apiKey, model, userText: `Snapshot data isn't available right now. Retry in a moment.` });
+    const answer = await openaiAnswer({
+      apiKey,
+      model,
+      userText: `Snapshot data isn't available right now. Retry in a moment.`
+    });
     return { answer, meta: { intent: "chat", usedOpenAI: true, model, snapshotOk: false } };
   }
 
@@ -100,9 +135,15 @@ export async function handleChat({ question, snapshot, history }) {
     return await answerWithFieldId({ apiKey, model, snapshot, fieldId: resolved.fieldId, originalUserQuestion: q });
   }
 
-  const candidates = (resolved.candidates || []).slice(0, 3);
+  // If resolver returns exactly one candidate, DO NOT clarify — answer it.
+  const allCandidates = Array.isArray(resolved.candidates) ? resolved.candidates : [];
+  if (allCandidates.length === 1 && allCandidates[0]?.fieldId) {
+    return await answerWithFieldId({ apiKey, model, snapshot, fieldId: allCandidates[0].fieldId, originalUserQuestion: q });
+  }
+
+  const candidates = allCandidates.slice(0, 3);
   if (!candidates.length) {
-    const answer = await openaiAnswer({ apiKey, model, userText: `Ask: Which field?` });
+    const answer = await openaiAnswer({ apiKey, model, userText: `Which field are you asking about?` });
     return { answer, meta: { intent: "chat", usedOpenAI: true, model } };
   }
 
@@ -119,6 +160,22 @@ function looksLikeTowerSummaryQuestion(text) {
   const hasHowMany = t.includes("how many") || t.includes("count");
   const hasFarmsPer = t.includes("what farms") || t.includes("farms go") || t.includes("each tower") || t.includes("per tower");
   return hasTower && (hasHowMany || hasFarmsPer);
+}
+
+function looksLikeTowerInfoQuestion(text) {
+  const t = (text || "").toLowerCase();
+  const hasTower = t.includes("rtk") || t.includes("tower");
+  const asksInfo =
+    t.includes("tell me more") ||
+    t.includes("more info") ||
+    t.includes("information") ||
+    t.includes("details") ||
+    t.includes("about");
+  // Examples:
+  // "Raymond rtk tower"
+  // "what is the rtk tower information for the raymond rtk tower"
+  // "tell me more info on the raymond tower"
+  return hasTower && asksInfo;
 }
 
 /* ===================== clarify helpers ===================== */
@@ -146,10 +203,57 @@ function extractLastTowerName(history) {
     let m = txt.match(/\bthe\s+([A-Za-z0-9/ ]+)\s+tower\b/i);
     if (m && m[1]) return m[1].trim();
 
-    m = txt.match(/RTK Tower:\s*([^(\\n]+)/i);
+    m = txt.match(/RTK Tower:\s*([^\n(]+)/i);
     if (m && m[1]) return m[1].trim();
   }
   return null;
+}
+
+// Pull tower name directly from question when user types it (prevents unrelated field-clarify loops)
+function extractTowerNameFromQuestion(text) {
+  const s = (text || "").toString().trim();
+  if (!s) return null;
+
+  // Common patterns:
+  // "Raymond rtk tower"
+  // "rtk tower raymond"
+  // "info on raymond tower"
+  // "what is the rtk tower information for the raymond rtk tower"
+  let m = s.match(/\b(?:rtk\s+tower|tower)\s+([A-Za-z0-9/ -]{2,})\b/i);
+  if (m && m[1]) {
+    const name = cleanupTowerName(m[1]);
+    if (name) return name;
+  }
+
+  m = s.match(/\b([A-Za-z0-9/ -]{2,})\s+(?:rtk\s+tower|tower)\b/i);
+  if (m && m[1]) {
+    const name = cleanupTowerName(m[1]);
+    if (name) return name;
+  }
+
+  // If user just types a short phrase like "Raymond rtk tower" or even "Raymond"
+  // and it isn't clearly a field number, treat it as possible tower name.
+  const plain = s.replace(/[?!.]+$/g, "").trim();
+  if (plain.length >= 3 && plain.length <= 40) {
+    // Avoid pure numeric field IDs like "0500"
+    if (!/^\d{3,6}$/.test(plain)) return cleanupTowerName(plain);
+  }
+
+  return null;
+}
+
+function cleanupTowerName(name) {
+  const n = (name || "").toString().trim();
+  if (!n) return null;
+  // strip trailing filler words
+  return n
+    .replace(/\b(rt k|rtk|tower|information|info|details|about)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim() || null;
+}
+
+function norm(s) {
+  return (s || "").toString().trim().toLowerCase();
 }
 
 /* ===================== field answer ===================== */
@@ -157,7 +261,7 @@ function extractLastTowerName(history) {
 async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUserQuestion }) {
   const bundle = buildFieldBundle({ snapshot, fieldId });
   if (!bundle.ok) {
-    const answer = await openaiAnswer({ apiKey, model, userText: `Ask: Which field?` });
+    const answer = await openaiAnswer({ apiKey, model, userText: `Which field are you asking about?` });
     return { answer, meta: { intent: "chat", usedOpenAI: true, model } };
   }
 
@@ -165,20 +269,18 @@ async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUse
   const farm = bundle.farm || null;
   const tower = bundle.tower || null;
 
+  // IMPORTANT: no internal IDs in facts (prevents OpenAI from printing them)
   const facts = {
     field: {
-      id: f.id,
       name: f.name,
       status: f.status || "active",
       county: f.county || "",
       state: f.state || "",
       tillable: typeof f.tillable === "number" ? f.tillable : null,
-      farmId: f.farmId || null,
-      rtkTowerId: f.rtkTowerId || null
+      farmName: farm?.name || ""
     },
-    farm: farm ? { id: farm.id, name: farm.name || "", status: farm.status || "" } : null,
     rtkTower: tower
-      ? { id: tower.id, name: tower.name || "", frequencyMHz: tower.frequencyMHz || "", networkId: tower.networkId ?? null }
+      ? { name: tower.name || "", frequencyMHz: tower.frequencyMHz || "", networkId: tower.networkId ?? null }
       : null
   };
 
@@ -191,9 +293,9 @@ async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUse
 async function openaiPlan({ apiKey, model, userText }) {
   const system =
     "Return ONLY JSON: {\"action\":\"field\"|\"general\",\"fieldQuery\":\"...\"}. " +
-    "Use action='field' if user asks about a specific field/farm/rtk tower assignment. " +
+    "Use action='field' if user asks about a specific field (rtk tower assignment, acres, farm, county, status). " +
     "fieldQuery should be a short hint like '0801-Lloyd N340' or '801' or 'lloyd n340'. " +
-    "Otherwise action='general'.";
+    "If user is asking about RTK tower details (network id/frequency/info about a named tower), use action='general'.";
 
   const text = await callOpenAIText({
     apiKey,
@@ -217,7 +319,9 @@ async function openaiPlan({ apiKey, model, userText }) {
 
 async function openaiAnswer({ apiKey, model, userText }) {
   const system =
-    "You are FarmVista Copilot. Be direct. If you need clarification, ask ONE short question with up to 3 numbered options; user replies 1/2/3.";
+    "You are FarmVista Copilot. Be direct and helpful. " +
+    "Do not show internal IDs, dev tags, or debug text. " +
+    "If clarification is required, ask ONE short question with up to 3 numbered options.";
   return await callOpenAIText({
     apiKey,
     model,
@@ -231,7 +335,9 @@ async function openaiAnswer({ apiKey, model, userText }) {
 
 async function openaiAnswerWithFacts({ apiKey, model, userText, facts }) {
   const system =
-    "Use ONLY the provided FACTS. If requested detail isn't in facts, say you don't have it and ask ONE short question (1–3 options).";
+    "Use ONLY the provided FACTS. Do not invent. " +
+    "Do not show internal IDs or debug text. " +
+    "If requested detail isn't in facts, say you don't have it and ask ONE short question (1–3 options).";
   return await callOpenAIText({
     apiKey,
     model,
