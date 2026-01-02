@@ -1,18 +1,12 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fields-only1-esm
+// Rev: 2026-01-02-fieldData-snapshot3
 //
-// FIELDS ONLY.
-// Snapshot-only access for fields (+ farm name lookup for display).
-// ❌ Removed ALL RTK tower logic and outputs.
-// ✅ Deterministic + forgiving field matching (no exact-only traps).
+// Snapshot-only data access for farms / fields / rtkTowers.
+// Adds:
+// - summarizeTowers({ includeArchived }) -> { towersUsedCount, towers: [...] }
+// - towerToFarms map based on active fields by default
 //
-// ESM build (for Node ESM import).
-//
-// Exports kept for chat:
-// - getSnapshotCollections(snapshot)
-// - buildFieldBundle({ snapshot, fieldId })   // returns field + (optional) farm
-// - tryResolveField({ snapshot, query, includeArchived })
-// - formatFieldOptionLine({ snapshot, fieldId })
+// No Firestore queries here.
 
 'use strict';
 
@@ -20,29 +14,10 @@ const norm = (s) => (s || "").toString().trim().toLowerCase();
 
 function getCollectionsRoot(snapshotJson) {
   const d = snapshotJson || {};
-
-  // Common snapshot wrapper shapes we’ve seen:
-  // 1) { data: { __collections__: { farms:{}, fields:{} } } }
-  // 2) { __collections__: { farms:{}, fields:{} } }
-  // 3) { data: { farms:{}, fields:{} } }   (already flattened)
-  // 4) { farms:{}, fields:{} }             (already flattened)
-
-  if (d.data && d.data.__collections__ && typeof d.data.__collections__ === "object") {
-    return d.data.__collections__;
-  }
-
-  if (d.__collections__ && typeof d.__collections__ === "object") {
-    return d.__collections__;
-  }
-
-  if (d.data && typeof d.data === "object" && d.data.farms && d.data.fields) {
-    return d.data;
-  }
-
-  if (typeof d === "object" && d.farms && d.fields) {
-    return d;
-  }
-
+  if (d.data && d.data.__collections__ && typeof d.data.__collections__ === "object") return d.data.__collections__;
+  if (d.__collections__ && typeof d.__collections__ === "object") return d.__collections__;
+  if (d.data && typeof d.data === "object" && d.data.farms && d.data.fields) return d.data;
+  if (typeof d === "object" && d.farms && d.fields) return d;
   return null;
 }
 
@@ -56,15 +31,14 @@ function getCollectionMap(colsRoot, name) {
 export function getSnapshotCollections(snapshot) {
   const snapJson = snapshot?.json || null;
   const root = getCollectionsRoot(snapJson);
-
   if (!root) {
-    return { ok: false, farms: {}, fields: {}, reason: "snapshot_missing_collections" };
+    return { ok: false, farms: {}, fields: {}, rtkTowers: {}, reason: "snapshot_missing_collections" };
   }
-
   return {
     ok: true,
     farms: getCollectionMap(root, "farms") || {},
-    fields: getCollectionMap(root, "fields") || {}
+    fields: getCollectionMap(root, "fields") || {},
+    rtkTowers: getCollectionMap(root, "rtkTowers") || {}
   };
 }
 
@@ -72,22 +46,6 @@ function isActiveStatus(s) {
   const v = norm(s);
   if (!v) return true;
   return v !== "archived" && v !== "inactive";
-}
-
-function scoreName(hay, needle) {
-  const h = norm(hay);
-  const n = norm(needle);
-  if (!h || !n) return 0;
-
-  if (h === n) return 100;
-  if (h.startsWith(n)) return 90;
-  if (h.includes(n)) return 75;
-
-  // token overlap
-  const nt = n.split(/\s+/).filter(Boolean);
-  let hits = 0;
-  for (const t of nt) if (t.length >= 2 && h.includes(t)) hits++;
-  return hits ? Math.min(74, 50 + hits * 8) : 0;
 }
 
 export function buildFieldBundle({ snapshot, fieldId }) {
@@ -98,13 +56,66 @@ export function buildFieldBundle({ snapshot, fieldId }) {
   if (!field) return { ok: false, reason: "field_not_found" };
 
   const farm = field.farmId ? (cols.farms?.[field.farmId] || null) : null;
+  const tower = field.rtkTowerId ? (cols.rtkTowers?.[field.rtkTowerId] || null) : null;
 
   return {
     ok: true,
     fieldId,
     field: { id: fieldId, ...field },
-    farm: farm ? { id: field.farmId, ...farm } : null
+    farm: farm ? { id: field.farmId, ...farm } : null,
+    tower: tower ? { id: field.rtkTowerId, ...tower } : null
   };
+}
+
+function scoreFieldName(fieldName, q) {
+  const n = norm(fieldName);
+  const needle = norm(q);
+  if (!n || !needle) return 0;
+
+  if (n === needle) return 100;
+  if (n.startsWith(needle)) return 90;
+  if (n.includes(needle)) return 80;
+
+  const digits = needle.replace(/\D/g, "");
+  if (digits && n.includes(digits)) return 75;
+
+  const toks = needle.split(/\s+/).filter(Boolean);
+  let hit = 0;
+  for (const t of toks) if (t.length >= 2 && n.includes(t)) hit++;
+  if (hit) return Math.min(74, 50 + hit * 8);
+
+  return 0;
+}
+
+export function suggestFields({ snapshot, query, includeArchived = false, limit = 3 }) {
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason, matches: [] };
+
+  const q = (query || "").toString().trim();
+  if (!q) return { ok: false, reason: "missing_query", matches: [] };
+
+  const out = [];
+  for (const [id, f] of Object.entries(cols.fields || {})) {
+    if (!includeArchived && !isActiveStatus(f?.status)) continue;
+    const sc = scoreFieldName(f?.name || "", q);
+    if (sc <= 0) continue;
+
+    const farm = f?.farmId ? (cols.farms?.[f.farmId] || null) : null;
+
+    out.push({
+      fieldId: id,
+      score: sc,
+      name: (f?.name || "").toString(),
+      status: (f?.status || "").toString() || "active",
+      tillable: (typeof f?.tillable === "number" ? f.tillable : null),
+      farmId: (f?.farmId || null),
+      farmName: (farm?.name || "").toString(),
+      rtkTowerId: (f?.rtkTowerId || null)
+    });
+  }
+
+  out.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+  return { ok: true, matches: out.slice(0, Math.max(1, Math.min(10, limit))) };
 }
 
 export function tryResolveField({ snapshot, query, includeArchived = false }) {
@@ -114,35 +125,26 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query" };
 
-  // direct id
   if (cols.fields?.[q]) return { ok: true, resolved: true, fieldId: q, confidence: 100 };
 
-  // exact name
   const qn = norm(q);
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
     if (norm(f?.name) === qn) return { ok: true, resolved: true, fieldId: id, confidence: 100 };
   }
 
-  // scored suggestions
-  const matches = [];
-  for (const [id, f] of Object.entries(cols.fields || {})) {
-    if (!includeArchived && !isActiveStatus(f?.status)) continue;
-    const sc = scoreName(f?.name || "", q);
-    if (sc <= 0) continue;
-    matches.push({ fieldId: id, score: sc, name: (f?.name || "").toString() });
-  }
-  matches.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
+  const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
+  if (!sug.ok) return { ok: false, reason: sug.reason };
 
-  if (!matches.length) return { ok: true, resolved: false, candidates: [] };
+  if (!sug.matches.length) return { ok: true, resolved: false, candidates: [] };
 
-  const top = matches[0];
-  const second = matches[1] || null;
+  const top = sug.matches[0];
+  const second = sug.matches[1] || null;
   const strong = top.score >= 90;
   const separated = !second || (top.score - second.score >= 12);
 
   if (strong && separated) return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
-  return { ok: true, resolved: false, candidates: matches.slice(0, 3) };
+  return { ok: true, resolved: false, candidates: sug.matches.slice(0, 3) };
 }
 
 export function formatFieldOptionLine({ snapshot, fieldId }) {
@@ -156,10 +158,115 @@ export function formatFieldOptionLine({ snapshot, fieldId }) {
   return farmName ? `${label} (${farmName})` : label;
 }
 
-// Optional convenience default export
-export default {
-  getSnapshotCollections,
-  buildFieldBundle,
-  tryResolveField,
-  formatFieldOptionLine
-};
+export function lookupTowerByName({ snapshot, towerName }) {
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
+
+  const raw = (towerName || "").toString().trim();
+  if (!raw) return { ok: false, reason: "missing_name", tower: null };
+
+  // normalize user input
+  const needle = norm(raw)
+    .replace(/\b(rtk|tower)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
+    const name = (t?.name || "").toString();
+    const n = norm(name);
+
+    // exact match
+    if (n === needle) {
+      return { ok: true, tower: { id, ...t } };
+    }
+
+    // starts-with match
+    if (n.startsWith(needle)) {
+      const score = 90;
+      if (score > bestScore) {
+        best = { id, ...t };
+        bestScore = score;
+      }
+    }
+
+    // contains match
+    if (n.includes(needle)) {
+      const score = 75;
+      if (score > bestScore) {
+        best = { id, ...t };
+        bestScore = score;
+      }
+    }
+  }
+
+  if (best) {
+    return { ok: true, tower: best };
+  }
+
+  return { ok: false, reason: "not_found", tower: null };
+}
+
+
+// NEW: summarize towers and farms per tower
+export function summarizeTowers({ snapshot, includeArchived = false }) {
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason };
+
+  // towerId -> { tower, farmIds:Set, fieldCount }
+  const towerMap = new Map();
+
+  for (const [fieldId, f] of Object.entries(cols.fields || {})) {
+    if (!includeArchived && !isActiveStatus(f?.status)) continue;
+
+    const towerId = (f?.rtkTowerId || "").toString().trim();
+    if (!towerId) continue;
+
+    const farmId = (f?.farmId || "").toString().trim();
+
+    if (!towerMap.has(towerId)) {
+      const t = cols.rtkTowers?.[towerId] || null;
+      towerMap.set(towerId, {
+        towerId,
+        tower: t ? { id: towerId, ...t } : { id: towerId, name: towerId },
+        farmIds: new Set(),
+        fieldCount: 0
+      });
+    }
+
+    const rec = towerMap.get(towerId);
+    rec.fieldCount += 1;
+    if (farmId) rec.farmIds.add(farmId);
+  }
+
+  const towers = [];
+  for (const rec of towerMap.values()) {
+    const farmNames = [];
+    for (const farmId of rec.farmIds) {
+      const farm = cols.farms?.[farmId] || null;
+      if (!farm) continue;
+      if (!includeArchived && !isActiveStatus(farm?.status)) continue;
+      farmNames.push((farm.name || farmId).toString());
+    }
+    farmNames.sort((a, b) => a.localeCompare(b));
+
+    towers.push({
+      towerId: rec.towerId,
+      name: (rec.tower?.name || rec.towerId).toString(),
+      frequencyMHz: (rec.tower?.frequencyMHz || "").toString(),
+      networkId: rec.tower?.networkId ?? null,
+      fieldCount: rec.fieldCount,
+      farms: farmNames
+    });
+  }
+
+  towers.sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    ok: true,
+    towersUsedCount: towers.length,
+    towers
+  };
+}
