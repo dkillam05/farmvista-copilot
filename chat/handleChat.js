@@ -1,8 +1,11 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-fields-only2
+// Rev: 2026-01-02-chat-fields-only3
 //
-// Snapshot-backed farms/fields/rtkTowers only.
-// Fix: follow-up questions about tower details (network id / frequency) use snapshot, not guessing.
+// Supports snapshot-backed:
+// - Field questions (RTK tower / farm / acres / county, etc via facts)
+// - Tower summary: "how many rtk towers do we use" + "what farms go to each tower"
+//
+// Uses OpenAI to write the final phrasing, but facts come from snapshot.
 
 'use strict';
 
@@ -10,7 +13,8 @@ import {
   tryResolveField,
   buildFieldBundle,
   formatFieldOptionLine,
-  lookupTowerByName
+  lookupTowerByName,
+  summarizeTowers
 } from "../data/fieldData.js";
 
 export async function handleChat({ question, snapshot, history }) {
@@ -20,6 +24,35 @@ export async function handleChat({ question, snapshot, history }) {
 
   if (!q) return { answer: "Missing question.", meta: { intent: "chat", error: true } };
   if (!apiKey) return { answer: "OPENAI_API_KEY is not set on Cloud Run.", meta: { intent: "chat", error: true } };
+
+  // 0) Tower summary question (fast path, no guessing)
+  if (looksLikeTowerSummaryQuestion(q)) {
+    const sum = summarizeTowers({ snapshot, includeArchived: false });
+    if (!sum.ok) {
+      const answer = await openaiAnswer({ apiKey, model, userText: "Snapshot data unavailable. Ask user to retry." });
+      return { answer, meta: { intent: "chat", usedOpenAI: true, model, snapshotOk: false } };
+    }
+
+    const facts = {
+      towersUsedCount: sum.towersUsedCount,
+      towers: sum.towers.map(t => ({
+        name: t.name,
+        networkId: t.networkId ?? null,
+        frequencyMHz: t.frequencyMHz || "",
+        fieldCount: t.fieldCount,
+        farms: t.farms
+      }))
+    };
+
+    const answer = await openaiAnswerWithFacts({
+      apiKey,
+      model,
+      userText: q,
+      facts
+    });
+
+    return { answer, meta: { intent: "tower_summary", usedOpenAI: true, model } };
+  }
 
   // 1) Tower-detail follow-up (network id / frequency)
   if (asksTowerDetails(q)) {
@@ -31,7 +64,6 @@ export async function handleChat({ question, snapshot, history }) {
         const freq = (t.frequencyMHz || "").toString().trim();
         const net = (t.networkId ?? "").toString().trim();
 
-        // Direct factual answer (no guessing)
         const parts = [`RTK Tower: ${t.name}`];
         if (net) parts.push(`Network ID: ${net}`);
         if (freq) parts.push(`Frequency: ${freq} MHz`);
@@ -39,12 +71,11 @@ export async function handleChat({ question, snapshot, history }) {
       }
     }
 
-    // If we can’t find tower context, let OpenAI ask a clean clarifier
-    const answer = await openaiAnswer({ apiKey, model, userText: `User asked: ${q}\nAsk: Which RTK tower name?` });
+    const answer = await openaiAnswer({ apiKey, model, userText: `Ask: Which RTK tower name?` });
     return { answer, meta: { intent: "chat", usedOpenAI: true, model } };
   }
 
-  // 2) Let OpenAI classify if this is a field/rtk question
+  // 2) OpenAI classify
   const plan = await openaiPlan({ apiKey, model, userText: q });
 
   if (plan.action !== "field") {
@@ -61,11 +92,7 @@ export async function handleChat({ question, snapshot, history }) {
   });
 
   if (!resolved.ok) {
-    const answer = await openaiAnswer({
-      apiKey,
-      model,
-      userText: `Snapshot data isn't available right now. Ask the user to retry in a moment.`
-    });
+    const answer = await openaiAnswer({ apiKey, model, userText: `Snapshot data isn't available right now. Retry in a moment.` });
     return { answer, meta: { intent: "chat", usedOpenAI: true, model, snapshotOk: false } };
   }
 
@@ -81,11 +108,20 @@ export async function handleChat({ question, snapshot, history }) {
 
   const lines = candidates.map((c, i) => `${i + 1}) ${formatFieldOptionLine({ snapshot, fieldId: c.fieldId })}`);
   const clarify = buildClarify(lines);
-
   return { answer: clarify, meta: { intent: "clarify_field", usedOpenAI: false } };
 }
 
-/* ===================== helpers ===================== */
+/* ===================== tower summary helpers ===================== */
+
+function looksLikeTowerSummaryQuestion(text) {
+  const t = (text || "").toLowerCase();
+  const hasTower = t.includes("rtk") || t.includes("tower") || t.includes("towers");
+  const hasHowMany = t.includes("how many") || t.includes("count");
+  const hasFarmsPer = t.includes("what farms") || t.includes("farms go") || t.includes("each tower") || t.includes("per tower");
+  return hasTower && (hasHowMany || hasFarmsPer);
+}
+
+/* ===================== clarify helpers ===================== */
 
 function buildClarify(lines) {
   return (
@@ -100,9 +136,6 @@ function asksTowerDetails(text) {
   return t.includes("network") || t.includes("network id") || t.includes("frequency") || t.includes("freq");
 }
 
-// pull "Girard" from prior assistant answers like:
-// "The RTK tower assigned to ... is the Girard tower."
-// or "RTK Tower: Girard ..."
 function extractLastTowerName(history) {
   const hist = Array.isArray(history) ? history : [];
   for (let i = hist.length - 1; i >= 0; i--) {
@@ -118,6 +151,8 @@ function extractLastTowerName(history) {
   }
   return null;
 }
+
+/* ===================== field answer ===================== */
 
 async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUserQuestion }) {
   const bundle = buildFieldBundle({ snapshot, fieldId });
@@ -156,7 +191,7 @@ async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUse
 async function openaiPlan({ apiKey, model, userText }) {
   const system =
     "Return ONLY JSON: {\"action\":\"field\"|\"general\",\"fieldQuery\":\"...\"}. " +
-    "Use action='field' if question is about a specific field/farm/rtk tower assignment. " +
+    "Use action='field' if user asks about a specific field/farm/rtk tower assignment. " +
     "fieldQuery should be a short hint like '0801-Lloyd N340' or '801' or 'lloyd n340'. " +
     "Otherwise action='general'.";
 
@@ -171,8 +206,7 @@ async function openaiPlan({ apiKey, model, userText }) {
   });
 
   try {
-    const t = extractJson(text);
-    const obj = JSON.parse(t);
+    const obj = JSON.parse(extractJson(text));
     const action = (obj.action || "").toString().toLowerCase();
     const fieldQuery = (obj.fieldQuery || "").toString();
     if (action === "field") return { action: "field", fieldQuery };
@@ -205,7 +239,7 @@ async function openaiAnswerWithFacts({ apiKey, model, userText, facts }) {
       { role: "system", content: system },
       { role: "user", content: `QUESTION:\n${userText}\n\nFACTS:\n${JSON.stringify(facts)}` }
     ],
-    max_output_tokens: 500
+    max_output_tokens: 650
   });
 }
 
@@ -224,7 +258,6 @@ async function callOpenAIText({ apiKey, model, input, max_output_tokens }) {
   const json = await resp.json();
   if (typeof json?.output_text === "string" && json.output_text.trim()) return json.output_text.trim();
 
-  // fallback
   try {
     const out = json?.output;
     if (Array.isArray(out)) {
