@@ -1,10 +1,17 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fieldData-snapshot3
+// Rev: 2026-01-02-fieldData-snapshot3-compat
 //
 // Snapshot-only data access for farms / fields / rtkTowers.
-// Adds:
-// - summarizeTowers({ includeArchived }) -> { towersUsedCount, towers: [...] }
-// - towerToFarms map based on active fields by default
+// Keeps the original export surface so existing imports DON'T break.
+//
+// Exports:
+// - getSnapshotCollections(snapshot)
+// - buildFieldBundle({ snapshot, fieldId })
+// - suggestFields({ snapshot, query, includeArchived, limit })
+// - tryResolveField({ snapshot, query, includeArchived })
+// - formatFieldOptionLine({ snapshot, fieldId })
+// - lookupTowerByName({ snapshot, towerName })
+// - summarizeTowers({ snapshot, includeArchived })
 //
 // No Firestore queries here.
 
@@ -97,6 +104,7 @@ export function suggestFields({ snapshot, query, includeArchived = false, limit 
   const out = [];
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
+
     const sc = scoreFieldName(f?.name || "", q);
     if (sc <= 0) continue;
 
@@ -125,14 +133,17 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query" };
 
+  // direct id
   if (cols.fields?.[q]) return { ok: true, resolved: true, fieldId: q, confidence: 100 };
 
+  // exact name
   const qn = norm(q);
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
     if (norm(f?.name) === qn) return { ok: true, resolved: true, fieldId: id, confidence: 100 };
   }
 
+  // scored suggestions
   const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
   if (!sug.ok) return { ok: false, reason: sug.reason };
 
@@ -165,7 +176,6 @@ export function lookupTowerByName({ snapshot, towerName }) {
   const raw = (towerName || "").toString().trim();
   if (!raw) return { ok: false, reason: "missing_name", tower: null };
 
-  // normalize user input
   const needle = norm(raw)
     .replace(/\b(rtk|tower)\b/g, "")
     .replace(/\s+/g, " ")
@@ -178,39 +188,23 @@ export function lookupTowerByName({ snapshot, towerName }) {
     const name = (t?.name || "").toString();
     const n = norm(name);
 
-    // exact match
-    if (n === needle) {
-      return { ok: true, tower: { id, ...t } };
-    }
+    if (n === needle) return { ok: true, tower: { id, ...t } };
 
-    // starts-with match
     if (n.startsWith(needle)) {
       const score = 90;
-      if (score > bestScore) {
-        best = { id, ...t };
-        bestScore = score;
-      }
+      if (score > bestScore) { best = { id, ...t }; bestScore = score; }
     }
 
-    // contains match
     if (n.includes(needle)) {
       const score = 75;
-      if (score > bestScore) {
-        best = { id, ...t };
-        bestScore = score;
-      }
+      if (score > bestScore) { best = { id, ...t }; bestScore = score; }
     }
   }
 
-  if (best) {
-    return { ok: true, tower: best };
-  }
-
+  if (best) return { ok: true, tower: best };
   return { ok: false, reason: "not_found", tower: null };
 }
 
-
-// NEW: summarize towers and farms per tower
 export function summarizeTowers({ snapshot, includeArchived = false }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason };
@@ -218,7 +212,7 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
   // towerId -> { tower, farmIds:Set, fieldCount }
   const towerMap = new Map();
 
-  for (const [fieldId, f] of Object.entries(cols.fields || {})) {
+  for (const [, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
 
     const towerId = (f?.rtkTowerId || "").toString().trim();
@@ -270,3 +264,14 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
     towers
   };
 }
+
+// Optional: default export (won’t break named imports, but helps if any file uses default import)
+export default {
+  getSnapshotCollections,
+  buildFieldBundle,
+  suggestFields,
+  tryResolveField,
+  formatFieldOptionLine,
+  lookupTowerByName,
+  summarizeTowers
+};
