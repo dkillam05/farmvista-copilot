@@ -1,8 +1,16 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-min-core0
+// Rev: 2026-01-02-fields-only1
 //
-// Snapshot-only access for farms / fields / rtkTowers.
-// Deterministic + forgiving matching (no exact-only traps).
+// FIELDS ONLY.
+// Snapshot-only access for fields (+ farm name lookup for display).
+// ❌ Removed ALL RTK tower logic and outputs.
+// ✅ Deterministic + forgiving field matching (no exact-only traps).
+//
+// Exports kept for chat:
+// - getSnapshotCollections(snapshot)
+// - buildFieldBundle({ snapshot, fieldId })   // returns field + (optional) farm
+// - tryResolveField({ snapshot, query, includeArchived })
+// - formatFieldOptionLine({ snapshot, fieldId })
 
 'use strict';
 
@@ -28,13 +36,12 @@ export function getSnapshotCollections(snapshot) {
   const snapJson = snapshot?.json || null;
   const root = getCollectionsRoot(snapJson);
   if (!root) {
-    return { ok: false, farms: {}, fields: {}, rtkTowers: {}, reason: "snapshot_missing_collections" };
+    return { ok: false, farms: {}, fields: {}, reason: "snapshot_missing_collections" };
   }
   return {
     ok: true,
     farms: getCollectionMap(root, "farms") || {},
-    fields: getCollectionMap(root, "fields") || {},
-    rtkTowers: getCollectionMap(root, "rtkTowers") || {}
+    fields: getCollectionMap(root, "fields") || {}
   };
 }
 
@@ -44,17 +51,11 @@ function isActiveStatus(s) {
   return v !== "archived" && v !== "inactive";
 }
 
-function scrubTowerNameInput(s) {
-  return norm(s)
-    .replace(/\b(rtk|tower)\b/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function scoreName(hay, needle) {
   const h = norm(hay);
   const n = norm(needle);
   if (!h || !n) return 0;
+
   if (h === n) return 100;
   if (h.startsWith(n)) return 90;
   if (h.includes(n)) return 75;
@@ -74,14 +75,12 @@ export function buildFieldBundle({ snapshot, fieldId }) {
   if (!field) return { ok: false, reason: "field_not_found" };
 
   const farm = field.farmId ? (cols.farms?.[field.farmId] || null) : null;
-  const tower = field.rtkTowerId ? (cols.rtkTowers?.[field.rtkTowerId] || null) : null;
 
   return {
     ok: true,
     fieldId,
     field: { id: fieldId, ...field },
-    farm: farm ? { id: field.farmId, ...farm } : null,
-    tower: tower ? { id: field.rtkTowerId, ...tower } : null
+    farm: farm ? { id: field.farmId, ...farm } : null
   };
 }
 
@@ -132,93 +131,4 @@ export function formatFieldOptionLine({ snapshot, fieldId }) {
   const farmName = (farm?.name || "").toString().trim();
   const label = (f?.name || "").toString().trim();
   return farmName ? `${label} (${farmName})` : label;
-}
-
-export function lookupTowerByName({ snapshot, towerName }) {
-  const cols = getSnapshotCollections(snapshot);
-  if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
-
-  const raw = (towerName || "").toString().trim();
-  if (!raw) return { ok: false, reason: "missing_name", tower: null };
-
-  const needle = scrubTowerNameInput(raw);
-  if (!needle) return { ok: false, reason: "missing_name", tower: null };
-
-  let best = null;
-  let bestScore = 0;
-
-  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
-    const name = (t?.name || "").toString();
-    const n = norm(name);
-
-    if (n === needle) return { ok: true, tower: { id, ...t } };
-
-    const sc = scoreName(n, needle);
-    if (sc > bestScore) {
-      bestScore = sc;
-      best = { id, ...t };
-    }
-  }
-
-  if (best && bestScore >= 75) return { ok: true, tower: best };
-  return { ok: false, reason: "not_found", tower: null };
-}
-
-export function summarizeTowers({ snapshot, includeArchived = false }) {
-  const cols = getSnapshotCollections(snapshot);
-  if (!cols.ok) return { ok: false, reason: cols.reason };
-
-  const towerMap = new Map();
-
-  for (const [fieldId, f] of Object.entries(cols.fields || {})) {
-    if (!includeArchived && !isActiveStatus(f?.status)) continue;
-
-    const towerId = (f?.rtkTowerId || "").toString().trim();
-    if (!towerId) continue;
-
-    const farmId = (f?.farmId || "").toString().trim();
-
-    if (!towerMap.has(towerId)) {
-      const t = cols.rtkTowers?.[towerId] || null;
-      towerMap.set(towerId, {
-        towerId,
-        tower: t ? { id: towerId, ...t } : { id: towerId, name: towerId },
-        farmIds: new Set(),
-        fieldCount: 0
-      });
-    }
-
-    const rec = towerMap.get(towerId);
-    rec.fieldCount += 1;
-    if (farmId) rec.farmIds.add(farmId);
-  }
-
-  const towers = [];
-  for (const rec of towerMap.values()) {
-    const farmNames = [];
-    for (const farmId of rec.farmIds) {
-      const farm = cols.farms?.[farmId] || null;
-      if (!farm) continue;
-      if (!includeArchived && !isActiveStatus(farm?.status)) continue;
-      farmNames.push((farm.name || farmId).toString());
-    }
-    farmNames.sort((a, b) => a.localeCompare(b));
-
-    towers.push({
-      towerId: rec.towerId,
-      name: (rec.tower?.name || rec.towerId).toString(),
-      frequencyMHz: (rec.tower?.frequencyMHz || "").toString(),
-      networkId: rec.tower?.networkId ?? null,
-      fieldCount: rec.fieldCount,
-      farms: farmNames
-    });
-  }
-
-  towers.sort((a, b) => a.name.localeCompare(b.name));
-
-  return {
-    ok: true,
-    towersUsedCount: towers.length,
-    towers
-  };
 }
