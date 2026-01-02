@@ -1,12 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-fields-only5
+// Rev: 2026-01-02-chat-fields-only6
 //
 // Fixes (per Dane):
+// ✅ If user replies "1/2/3" after a "Quick question..." menu, we DO NOT call OpenAI.
+//    We parse the last menu from history and resolve locally.
+// ✅ If a menu has ONLY ONE option (e.g., "1) Girard"), auto-pick and answer (no menu).
 // ✅ Tower info requests NEVER use OpenAI to invent options.
-//    - If tower lookup fails, we suggest top 3 REAL tower names from snapshot.
 // ✅ Better tower-name extraction from question.
 // ✅ If only 1 field candidate => answer (no 1/2/3 clarify).
-// ✅ Tower summary fast path unchanged.
 // ✅ No internal IDs in normal answers (facts omit ids).
 
 'use strict';
@@ -19,13 +20,64 @@ import {
   summarizeTowers
 } from "../data/fieldData.js";
 
-export async function handleChat({ question, snapshot, history }) {
+export async function handleChat({ question, snapshot, history, state }) {
   const apiKey = (process.env.OPENAI_API_KEY || "").trim();
   const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
   const q = (question || "").toString().trim();
 
   if (!q) return { answer: "Missing question.", meta: { intent: "chat", error: true } };
   if (!apiKey) return { answer: "OPENAI_API_KEY is not set on Cloud Run.", meta: { intent: "chat", error: true } };
+
+  // A) If user replied "1/2/3" after our clarify menu, resolve locally (NO OpenAI)
+  const pick = parseNumericPick(q);
+  if (pick) {
+    const menu = parseLastClarifyMenu(history);
+
+    if (menu && menu.options.length) {
+      const chosen = menu.options[pick - 1] || null;
+
+      // If they picked out of range, ask again with same menu (no OpenAI)
+      if (!chosen) {
+        return { answer: menu.rawText, meta: { intent: "clarify_repeat", usedOpenAI: false } };
+      }
+
+      // Decide if choice looks like a field or a tower name
+      // Field options often look like "0801-Lloyd N340 (FarmName)" or include digits/hyphen.
+      const chosenClean = cleanupChoiceText(chosen);
+
+      // Try tower first if the menu looked like tower menu (single-word names etc.)
+      // Otherwise try field resolution.
+      const towerHit = lookupTowerByName({ snapshot, towerName: chosenClean });
+      if (towerHit.ok && towerHit.tower) {
+        const answer = buildTowerInfoAnswer({ snapshot, tower: towerHit.tower });
+        return { answer, meta: { intent: "tower_info", usedOpenAI: false, via: "numeric_pick" } };
+      }
+
+      const resolvedField = tryResolveField({
+        snapshot,
+        query: chosenClean,
+        includeArchived: true
+      });
+
+      if (resolvedField.ok && resolvedField.resolved) {
+        return await answerWithFieldId({
+          apiKey,
+          model,
+          snapshot,
+          fieldId: resolvedField.fieldId,
+          originalUserQuestion: q
+        });
+      }
+
+      // If neither worked, fall back to a plain ask (still no OpenAI menu invention)
+      return {
+        answer: "I couldn’t apply that choice. Ask again with the field name or the RTK tower name.",
+        meta: { intent: "clarify_failed", usedOpenAI: false }
+      };
+    }
+
+    // No menu found in history; treat as normal question (continue below)
+  }
 
   // 0) Tower summary question (fast path, no guessing)
   if (looksLikeTowerSummaryQuestion(q)) {
@@ -56,35 +108,37 @@ export async function handleChat({ question, snapshot, history }) {
     const towerName = towerNameFromQuestion || extractLastTowerName(history);
 
     if (towerName) {
-      // Try direct tower lookup first
       const hit = lookupTowerByName({ snapshot, towerName });
       if (hit.ok && hit.tower) {
         const answer = buildTowerInfoAnswer({ snapshot, tower: hit.tower });
         return { answer, meta: { intent: "tower_info", usedOpenAI: false } };
       }
 
-      // If lookup failed, suggest REAL tower names from snapshot (NO OpenAI hallucinated list)
+      // Lookup failed: suggest REAL tower names from snapshot
       const sug = suggestTowerChoicesFromSnapshot({ snapshot, query: towerName });
-      if (sug.ok && sug.choices.length) {
-        const lines = sug.choices.slice(0, 3).map((name, i) => `${i + 1}) ${name}`);
-        const clarify =
-          "Quick question so I pull the right data:\n" +
-          lines.join("\n") +
-          "\n\nReply with 1, 2, or 3.";
-        return {
-          answer: clarify,
-          meta: { intent: "clarify_tower", usedOpenAI: false, note: "tower_lookup_failed" }
-        };
+
+      // If only ONE choice, auto-pick it (no dumb 1/2/3 menu)
+      if (sug.ok && sug.choices.length === 1) {
+        const only = sug.choices[0];
+        const hit2 = lookupTowerByName({ snapshot, towerName: only });
+        if (hit2.ok && hit2.tower) {
+          const answer = buildTowerInfoAnswer({ snapshot, tower: hit2.tower });
+          return { answer, meta: { intent: "tower_info", usedOpenAI: false, via: "auto_pick_single" } };
+        }
       }
 
-      // Still nothing available
+      if (sug.ok && sug.choices.length) {
+        const lines = sug.choices.slice(0, 3).map((name, i) => `${i + 1}) ${name}`);
+        const clarify = buildClarify(lines);
+        return { answer: clarify, meta: { intent: "clarify_tower", usedOpenAI: false, note: "tower_lookup_failed" } };
+      }
+
       return {
         answer: `I can’t find RTK tower "${towerName}" in the snapshot right now.`,
         meta: { intent: "tower_info", usedOpenAI: false, snapshotOk: false }
       };
     }
 
-    // No tower name available at all (ask user plainly — still no 1/2/3 list from OpenAI)
     return {
       answer: "Which RTK tower name are you asking about? (Example: “Girard”).",
       meta: { intent: "tower_info_clarify", usedOpenAI: false }
@@ -133,6 +187,42 @@ export async function handleChat({ question, snapshot, history }) {
   return { answer: clarify, meta: { intent: "clarify_field", usedOpenAI: false } };
 }
 
+/* ===================== helpers ===================== */
+
+function parseNumericPick(text) {
+  const t = (text || "").toString().trim();
+  if (/^[1-3]$/.test(t)) return Number(t);
+  return null;
+}
+
+// Parse the last "Quick question..." menu from assistant history
+function parseLastClarifyMenu(history) {
+  const hist = Array.isArray(history) ? history : [];
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const h = hist[i];
+    if ((h?.role || "") !== "assistant") continue;
+    const txt = (h?.text || "").toString();
+    if (!txt.includes("Quick question so I pull the right data:")) continue;
+
+    const lines = txt.split("\n").map(x => x.trim()).filter(Boolean);
+    const opts = [];
+
+    for (const ln of lines) {
+      const m = ln.match(/^([1-3])\)\s+(.*)$/);
+      if (m && m[2]) opts.push(m[2].trim());
+    }
+
+    if (opts.length) return { options: opts, rawText: txt };
+  }
+  return null;
+}
+
+function cleanupChoiceText(s) {
+  const t = (s || "").toString().trim();
+  // If a field option line includes "(FarmName)", strip the farm parenthetical for lookup
+  return t.replace(/\s+\([^)]*\)\s*$/g, "").trim();
+}
+
 /* ===================== tower summary helpers ===================== */
 
 function looksLikeTowerSummaryQuestion(text) {
@@ -163,6 +253,15 @@ function asksTowerDetails(text) {
 /* ===================== clarify helpers ===================== */
 
 function buildClarify(lines) {
+  // If only one option, don't ask "Reply with 1,2,3"
+  if (Array.isArray(lines) && lines.length === 1) {
+    return (
+      "Quick question so I pull the right data:\n" +
+      lines[0] +
+      "\n\nReply with 1."
+    );
+  }
+
   return (
     "Quick question so I pull the right data:\n" +
     lines.join("\n") +
@@ -198,12 +297,10 @@ function extractTowerNameFromQuestion(text) {
   m = s.match(/\b([A-Za-z0-9/ -]{2,})\s+(?:rtk\s+tower|tower)\b/i);
   if (m && m[1]) return cleanupTowerName(m[1]);
 
-  // single-word / short phrase tower name
   const plain = s.replace(/[?!.]+$/g, "").trim();
   if (plain.length >= 3 && plain.length <= 40) {
     if (!/^\d{3,6}$/.test(plain)) return cleanupTowerName(plain);
   }
-
   return null;
 }
 
@@ -235,14 +332,8 @@ function suggestTowerChoicesFromSnapshot({ snapshot, query }) {
       .filter(x => x.score > 0)
       .sort((a, b) => b.score - a.score);
 
-    // If query is "girard", this will strongly prefer "Girard" if it exists.
     const choices = scored.slice(0, 3).map(x => x.name);
-
-    // If nothing scored, still provide a few real options (top towers) rather than hallucinating.
-    if (!choices.length) {
-      return { ok: true, choices: names.slice(0, 3) };
-    }
-
+    if (!choices.length) return { ok: true, choices: names.slice(0, 3) };
     return { ok: true, choices };
   } catch {
     return { ok: false, choices: [] };
@@ -254,7 +345,6 @@ function scoreName(q, c) {
   if (q === c) return 100;
   if (c.startsWith(q)) return 90;
   if (c.includes(q)) return 75;
-  // simple token overlap
   const qt = q.split(/\s+/g).filter(Boolean);
   const ct = c.split(/\s+/g).filter(Boolean);
   let hits = 0;
@@ -267,7 +357,6 @@ function buildTowerInfoAnswer({ snapshot, tower }) {
   const freq = (t.frequencyMHz || "").toString().trim();
   const net = (t.networkId ?? "").toString().trim();
 
-  // Enrich with farms/field counts if available via summarizeTowers
   let farms = [];
   let fieldCount = null;
   try {
@@ -286,7 +375,6 @@ function buildTowerInfoAnswer({ snapshot, tower }) {
   if (freq) lines.push(`Frequency: ${freq} MHz`);
   if (fieldCount !== null) lines.push(`Fields assigned: ${fieldCount}`);
   if (farms.length) lines.push(`Farms: ${farms.join(", ")}`);
-
   return lines.join("\n");
 }
 
@@ -303,7 +391,6 @@ async function answerWithFieldId({ apiKey, model, snapshot, fieldId, originalUse
   const farm = bundle.farm || null;
   const tower = bundle.tower || null;
 
-  // No internal IDs in facts (prevents OpenAI from printing them)
   const facts = {
     field: {
       name: f.name,
