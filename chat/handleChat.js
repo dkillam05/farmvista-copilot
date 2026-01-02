@@ -1,11 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-02-chat-router-min4
+// Rev: 2026-01-02-chat-clean1
 //
-// FIX:
-// ✅ Never treat the entire user sentence as a field name.
-// ✅ If we can’t extract a field query, ask “Which field?” (no fake Q&A).
-// ✅ If lookup fails, do NOT echo the whole sentence back.
-// ✅ Still uses /data/fieldLookup.js for actual data.
+// GOAL:
+// - Remove dumb canned responses.
+// - For data questions: answer if possible; otherwise ask ONE short follow-up.
+// - No echoing the user's whole sentence.
+// - No "Try: ..." suggestions.
+// - Keep chat handler small (calls /data/*).
 
 'use strict';
 
@@ -15,167 +16,132 @@ import { lookupFieldBundleByName } from "../data/fieldLookup.js";
 export async function handleChat({ question, snapshot, history, state }) {
   const q = (question || "").toString().trim();
   const low = q.toLowerCase();
-  const hist = Array.isArray(history) ? history : [];
-  const lastIntent = (state && state.lastIntent) ? String(state.lastIntent) : null;
 
   if (!admin.apps.length) admin.initializeApp();
   const db = admin.firestore();
 
-  // -------------------------
+  // =========================
   // RTK tower for field
-  // -------------------------
-  if (lastIntent === "field_rtk_followup") {
-    // In follow-up mode, user reply can be short like "801" or "lloyd n340"
-    return await answerFieldRtk({ db, fieldQuery: q });
-  }
-
+  // =========================
   if (isRtkTowerQuestion(low)) {
-    const fieldQuery = extractFieldQueryFromQuestion(q);
+    const fieldQuery = extractFieldQuery(q);
 
+    // If we can't extract anything usable, ask once.
     if (!fieldQuery) {
       return {
-        answer: `Which field? (example: "field 801" or "lloyd n340")`,
+        answer: "Which field?",
         meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
       };
     }
 
-    return await answerFieldRtk({ db, fieldQuery });
-  }
+    // Look up field + farm + tower
+    const bundle = await lookupFieldBundleByName(db, fieldQuery);
 
-  // -------------------------
-  // Generic follow-up
-  // -------------------------
-  const followUp = buildFollowUpIfNeeded(q, hist);
-  if (followUp) {
-    return { answer: followUp, meta: { intent: "followup", usedOpenAI: false, model: "builtin" } };
-  }
-
-  // -------------------------
-  // OpenAI (optional)
-  // -------------------------
-  const apiKey = (process.env.OPENAI_API_KEY || "").trim();
-  const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
-
-  if (apiKey) {
-    try {
-      const answer = await callOpenAIChat({ apiKey, model, question: q, history: hist });
-      return { answer: (answer || "").trim() || "Can you rephrase that?", meta: { intent: "chat", usedOpenAI: true, model } };
-    } catch {
-      // fall through
+    // If not found, ask once (no dumb text).
+    if (!bundle?.ok || !bundle?.field) {
+      return {
+        answer: "Which field?",
+        meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+      };
     }
-  }
 
-  return { answer: `Tell me what you want to look up (field, farm, equipment).`, meta: { intent: "chat", usedOpenAI: false, model: "builtin" } };
-}
+    const field = bundle.field || {};
+    const farm = bundle.farm || null;
+    const tower = bundle.tower || null;
 
-/* =======================================================================
-   RTK helpers
-======================================================================= */
+    // If no tower assigned, say it cleanly.
+    if (!field.rtkTowerId) {
+      return {
+        answer: `Field ${field.name || fieldQuery}: No RTK tower assigned.`,
+        meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null }
+      };
+    }
 
-function isRtkTowerQuestion(low) {
-  if (!low) return false;
-  const hasTower = /\b(rtk|tower)\b/.test(low);
-  const hasAsk = /\b(what|which|show|find|assigned|on|for)\b/.test(low);
-  const hasFieldish = /\bfield\b/.test(low) || /\d{2,4}\b/.test(low) || /-\w/.test(low);
-  return hasTower && (hasAsk || hasFieldish);
-}
+    // Clean, direct answer.
+    // (No extra fluff. No "best match" notes. No confidence talk.)
+    const towerLabel = tower?.name || field.rtkTowerId;
+    const freq = (tower?.frequencyMHz || "").toString().trim();
 
-// Extracts a "fieldQuery" like:
-// - "0801-Lloyd N340"
-// - "801"
-// - "lloyd n340"
-function extractFieldQueryFromQuestion(original) {
-  const s = (original || "").trim();
-  if (!s) return null;
+    let answer = `Field ${field.name || fieldQuery}\nRTK Tower: ${towerLabel}`;
+    if (farm?.name) answer = `Field ${field.name || fieldQuery} (${farm.name})\nRTK Tower: ${towerLabel}`;
+    if (freq) answer += ` (${freq} MHz)`;
 
-  // 1) Your exact style: "0801-Lloyd N340"
-  const dash = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
-  if (dash && dash[1]) return dash[1].trim();
-
-  // 2) "field 801" or "field: 801"
-  const fm = s.match(/\bfield\b\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9\s-]{0,40})/i);
-  if (fm && fm[1]) {
-    const candidate = fm[1].trim();
-    if (candidate) return candidate;
-  }
-
-  // 3) If they typed a short thing that’s NOT a full sentence, allow it
-  // (avoid swallowing the entire question again)
-  // If it contains a question mark or starts with "what/which", do NOT use it.
-  if (/[?]/.test(s)) return null;
-  if (/^\s*(what|which|show|find)\b/i.test(s)) return null;
-
-  // 4) As a last resort, if it’s short, accept it (e.g. "801", "lloyd n340")
-  if (s.length <= 32) return s;
-
-  return null;
-}
-
-async function answerFieldRtk({ db, fieldQuery }) {
-  const query = (fieldQuery || "").toString().trim();
-  if (!query) {
     return {
-      answer: `Which field? (example: "field 801" or "lloyd n340")`,
-      meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
+      answer,
+      meta: {
+        intent: "field_rtk_result",
+        usedOpenAI: false,
+        model: "builtin",
+        fieldId: field.id || null,
+        farmId: field.farmId || null,
+        rtkTowerId: field.rtkTowerId || null
+      }
     };
   }
 
-  const bundle = await lookupFieldBundleByName(db, query);
-
-  if (!bundle.ok) {
-    // IMPORTANT: no fake “searched your whole sentence”
-    return {
-      answer: `I couldn’t find that field. Try: "field 801" or "lloyd n340".`,
-      meta: { intent: "field_rtk_followup", usedOpenAI: false, model: "builtin" }
-    };
-  }
-
-  const field = bundle.field || {};
-  const farm = bundle.farm || null;
-  const tower = bundle.tower || null;
-
-  if (!field.rtkTowerId) {
-    return {
-      answer: `Field **${field.name || query}** (${field.status || "active"}) is not assigned to an RTK tower.`,
-      meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null }
-    };
-  }
-
-  const lines = [];
-  lines.push(`Field: **${field.name || query}** (${field.status || "active"})`);
-  if (farm?.name) lines.push(`Farm: **${farm.name}**${farm.status ? ` (${farm.status})` : ""}`);
-  lines.push(`RTK Tower: **${tower?.name || field.rtkTowerId}**${tower?.frequencyMHz ? ` (${tower.frequencyMHz} MHz)` : ""}`);
-
+  // =========================
+  // Default: keep it short
+  // =========================
+  // You can expand later, but for now: no dumb filler.
   return {
-    answer: lines.join("\n"),
-    meta: { intent: "field_rtk_result", usedOpenAI: false, model: "builtin", fieldId: field.id || null }
+    answer: "What do you want to look up?",
+    meta: { intent: "followup", usedOpenAI: false, model: "builtin" }
   };
 }
 
 /* =======================================================================
-   Generic follow-up logic
+   Parsing helpers (NO dumb behavior)
 ======================================================================= */
 
-function buildFollowUpIfNeeded(question, history) {
-  const q = (question || "").trim();
-  if (q.length < 6) return `What are you trying to do?`;
+function isRtkTowerQuestion(low) {
+  if (!low) return false;
+  // Simple and safe: only enter RTK path if they mention rtk/tower.
+  return /\b(rtk|tower)\b/.test(low);
+}
+
+// Extract something usable from:
+// - "What RTK tower is 0801-Lloyd N340 assigned to?"
+// - "What RTK tower is field 801 on?"
+// - "rtk tower lloyd n340"
+function extractFieldQuery(input) {
+  const s = (input || "").toString().trim();
+  if (!s) return null;
+
+  // 1) Exact style like "0801-Lloyd N340"
+  const dash = s.match(/([0-9]{3,4}-[A-Za-z][^?.,;]*)/);
+  if (dash && dash[1]) return cleanFieldQuery(dash[1]);
+
+  // 2) "field 801 ..." -> grab after "field" but stop junk words
+  const fm = s.match(/\bfield\b\s*[:#-]?\s*([A-Za-z0-9][A-Za-z0-9\s-]{0,40})/i);
+  if (fm && fm[1]) return cleanFieldQuery(fm[1]);
+
+  // 3) If they gave a short hint (like "801" or "lloyd n340")
+  // Avoid swallowing full sentences.
+  if (s.length <= 32 && !/[?]/.test(s) && !/^\s*(what|which)\b/i.test(s)) {
+    return cleanFieldQuery(s);
+  }
+
   return null;
 }
 
-/* =======================================================================
-   OpenAI (optional)
-======================================================================= */
+// Strip junk so "801 on" -> "801", "lloyd n340 on" -> "lloyd n340"
+function cleanFieldQuery(raw) {
+  let t = (raw || "").toString().trim();
 
-async function callOpenAIChat({ apiKey, model, question, history }) {
-  const msgs = [{ role: "system", content: "You are FarmVista Copilot. Be concise." }, { role: "user", content: question }];
+  // remove trailing punctuation
+  t = t.replace(/[?.,;:]+$/g, "").trim();
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, input: msgs, max_output_tokens: 400 })
-  });
+  // remove common trailing words from questions
+  t = t.replace(/\b(on|for|to|is|the|a|an|assigned|rtk|tower)\b/gi, " ");
+  t = t.replace(/\s+/g, " ").trim();
 
-  if (!resp.ok) throw new Error(`OpenAI error ${resp.status}`);
-  const json = await resp.json();
-  return (json?.output_text || "").toString();
+  // if it includes a 2-4 digit token and it's mostly numeric-ish, return that token
+  const num = t.match(/\b(\d{2,4})\b/);
+  if (num) {
+    const digits = t.replace(/\D/g, "");
+    const mostlyDigits = (digits.length / Math.max(1, t.length)) > 0.35;
+    if (mostlyDigits) return num[1];
+  }
+
+  return t || null;
 }
