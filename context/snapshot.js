@@ -1,10 +1,10 @@
 // /context/snapshot.js  (FULL FILE)
-// Rev: 2026-01-02-min-core1
+// Rev: 2026-01-02-min-core2
 //
 // Loads snapshot JSON from one of:
 // 1) SNAPSHOT_FILE=/path/to/snapshot.json
 // 2) SNAPSHOT_URL=https://.../snapshot.json
-// 3) SNAPSHOT_GCS_PATH=gs://bucket/path/to/snapshot.json   (auto converts to HTTPS download URL)
+// 3) SNAPSHOT_GCS_PATH=gs://bucket/path/to/snapshot.json   (AUTHENTICATED download via GCS client)
 // 4) SNAPSHOT_META_FILE=./copilot_snapshots.json           (expects { active: { activeSnapshotId, gcsPath } })
 //
 // In-memory cache + reload endpoint support.
@@ -12,6 +12,7 @@
 'use strict';
 
 import fs from "fs/promises";
+import { Storage } from "@google-cloud/storage";
 
 let _cache = {
   ok: false,
@@ -36,13 +37,9 @@ function parseGsPath(gsPath) {
   return { bucket: m[1], objectPath: m[2] };
 }
 
-// Firebase Storage “alt=media” download URL (works if object is readable)
-function gsToFirebaseDownloadUrl(gsPath) {
-  const parsed = parseGsPath(gsPath);
-  if (!parsed) return null;
-  const { bucket, objectPath } = parsed;
-  const enc = encodeURIComponent(objectPath);
-  return `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${enc}?alt=media`;
+async function readJsonFile(filepath) {
+  const buf = await fs.readFile(filepath);
+  return JSON.parse(buf.toString("utf8"));
 }
 
 async function fetchJson(url) {
@@ -54,18 +51,25 @@ async function fetchJson(url) {
   return await resp.json();
 }
 
-async function readJsonFile(filepath) {
-  const buf = await fs.readFile(filepath);
-  return JSON.parse(buf.toString("utf8"));
-}
-
-async function readMetaFileAndGetGsPath(metaFile) {
+async function readMetaFile(metaFile) {
   const meta = await readJsonFile(metaFile);
   const active = meta?.active || null;
   const gcsPath = (active?.gcsPath || "").toString().trim();
   const activeSnapshotId = (active?.activeSnapshotId || "").toString().trim() || null;
   if (!gcsPath) return { ok: false, gcsPath: null, activeSnapshotId, error: "meta_missing_gcsPath" };
   return { ok: true, gcsPath, activeSnapshotId, error: null };
+}
+
+async function downloadGsJson(gsPath) {
+  const parsed = parseGsPath(gsPath);
+  if (!parsed) throw new Error("Invalid gs path (expected gs://bucket/object.json)");
+
+  const storage = new Storage(); // uses Cloud Run service account automatically
+  const file = storage.bucket(parsed.bucket).file(parsed.objectPath);
+
+  const [buf] = await file.download(); // Buffer
+  const txt = buf.toString("utf8");
+  return JSON.parse(txt);
 }
 
 export async function loadSnapshot({ force = false } = {}) {
@@ -81,37 +85,25 @@ export async function loadSnapshot({ force = false } = {}) {
     let source = null;
     let activeSnapshotId = null;
 
-    // 1) SNAPSHOT_FILE
     if (file) {
       json = await readJsonFile(file);
       source = file;
       activeSnapshotId = guessSnapshotIdFromPathLike(file);
-    }
-    // 2) SNAPSHOT_URL
-    else if (url) {
+    } else if (url) {
       json = await fetchJson(url);
       source = url;
       activeSnapshotId = guessSnapshotIdFromPathLike(url);
-    }
-    // 3) SNAPSHOT_GCS_PATH
-    else if (gs) {
-      const dl = gsToFirebaseDownloadUrl(gs);
-      if (!dl) throw new Error("Invalid SNAPSHOT_GCS_PATH (expected gs://bucket/path.json)");
-      json = await fetchJson(dl);
-      source = gs; // keep original gs:// as source
+    } else if (gs) {
+      json = await downloadGsJson(gs);
+      source = gs;
       activeSnapshotId = guessSnapshotIdFromPathLike(gs);
-    }
-    // 4) SNAPSHOT_META_FILE (your copilot_snapshots JSON)
-    else if (metaFile) {
-      const meta = await readMetaFileAndGetGsPath(metaFile);
+    } else if (metaFile) {
+      const meta = await readMetaFile(metaFile);
       if (!meta.ok) throw new Error(`SNAPSHOT_META_FILE invalid: ${meta.error}`);
-      const dl = gsToFirebaseDownloadUrl(meta.gcsPath);
-      if (!dl) throw new Error("Meta gcsPath invalid (expected gs://bucket/path.json)");
-      json = await fetchJson(dl);
+      json = await downloadGsJson(meta.gcsPath);
       source = meta.gcsPath;
       activeSnapshotId = meta.activeSnapshotId || guessSnapshotIdFromPathLike(meta.gcsPath);
-    }
-    else {
+    } else {
       throw new Error("Missing SNAPSHOT_FILE, SNAPSHOT_URL, SNAPSHOT_GCS_PATH, or SNAPSHOT_META_FILE");
     }
 
