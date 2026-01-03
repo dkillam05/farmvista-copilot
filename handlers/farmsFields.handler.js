@@ -1,11 +1,12 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-03-handler-followups1
+// Rev: 2026-01-03-handler-followups2
 //
 // Farms + Fields handler only.
 // CHANGE:
 // ✅ When router falls back (non farms/fields question), ask a targeted follow-up
 //    instead of generic help text.
 // ✅ When we can't resolve the field/farm/county intent, ask 1–2 clarifiers.
+// ✅ IMPORTANT: disambiguation now returns candidates as [{ id, label }] so router resolver-state works.
 //
 // Keeps all existing behavior for totals, by-farm, by-county, list fields, field lookup.
 
@@ -512,14 +513,23 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   }
 
   if (res.ok && res.resolved === false && Array.isArray(res.candidates) && res.candidates.length) {
-    const lines = res.candidates
-      .map(c => `• ${formatFieldOptionLine({ snapshot, fieldId: c.fieldId })}`)
-      .join("\n");
+    const candidateObjs = res.candidates.map(c => {
+      const fieldId = (c?.fieldId || "").toString();
+      const label = formatFieldOptionLine({ snapshot, fieldId }) || fieldId;
+      return { id: fieldId, label };
+    }).filter(x => x.id);
+
+    const lines = candidateObjs.map(c => `• ${c.label}`).join("\n");
 
     return {
       ok: true,
       answer: `I found a few close matches. Which one did you mean?\n${lines}`,
-      meta: { routed: "farmsFields", intent: "field_disambiguation", candidates: res.candidates.map(c => c.fieldId) }
+      action: { type: "pick", choices: candidateObjs },
+      meta: {
+        routed: "farmsFields",
+        intent: "field_disambiguation",
+        candidates: candidateObjs
+      }
     };
   }
 
