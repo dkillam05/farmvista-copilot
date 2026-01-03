@@ -1,20 +1,29 @@
 // /context/snapshot.js  (FULL FILE)
-// Rev: 2026-01-02-firestore-pointer1
+// Rev: 2026-01-03-fixed-gcs-snapshot1
 //
-// NO SNAPSHOT_* env vars required.
-// Loads active snapshot pointer from Firestore:
-//   collection: copilot_snapshots
-//   doc: active
-// Fields expected on doc:
-//   activeSnapshotId (string)
-//   gcsPath (string gs://bucket/path.json)
-//   uploadedAt (timestamp-ish)
+// FIXED SINGLE-FILE SNAPSHOT LOADER (no Firestore pointer)
+// --------------------------------------------------------
+// Reads snapshot JSON from ONE fixed Cloud Storage object (overwritten by scheduler).
 //
-// Then downloads the JSON from Cloud Storage using Cloud Run service account.
+// Default target:
+//   gs://dowsonfarms-illinois.firebasestorage.app/copilot/snapshot.json
+//
+// You can override with env vars:
+//   SNAPSHOT_GCS_PATH="gs://bucket/path.json"   (recommended single setting)
+//   or:
+//   SNAPSHOT_BUCKET="bucket-name"
+//   SNAPSHOT_OBJECT="copilot/snapshot.json"
+//
+// This replaces the old Firestore pointer mechanism entirely.
+// /context/reload simply forces a re-download of the fixed snapshot.
+//
+// NOTE:
+// - Chat stays deterministic.
+// - Freshness is controlled by the snapshot builder schedule (every 15 mins).
+// - We still download via Cloud Run service account.
 
 'use strict';
 
-import admin from "firebase-admin";
 import { Storage } from "@google-cloud/storage";
 
 let _cache = {
@@ -27,11 +36,6 @@ let _cache = {
   error: null
 };
 
-function ensureAdmin() {
-  if (!admin.apps.length) admin.initializeApp();
-  return admin.firestore();
-}
-
 function parseGsPath(gsPath) {
   const s = (gsPath || "").toString().trim();
   const m = s.match(/^gs:\/\/([^/]+)\/(.+)$/i);
@@ -39,24 +43,18 @@ function parseGsPath(gsPath) {
   return { bucket: m[1], objectPath: m[2] };
 }
 
-async function readActivePointerFromFirestore() {
-  const db = ensureAdmin();
+function resolveFixedGsPath() {
+  // 1) Single env override
+  const direct = (process.env.SNAPSHOT_GCS_PATH || "").toString().trim();
+  if (direct) return direct;
 
-  // Default: copilot_snapshots/active (matches what you showed)
-  const col = (process.env.SNAPSHOT_POINTER_COLLECTION || "copilot_snapshots").trim();
-  const docId = (process.env.SNAPSHOT_POINTER_DOC || "active").trim();
+  // 2) Bucket + object env override
+  const b = (process.env.SNAPSHOT_BUCKET || "").toString().trim();
+  const o = (process.env.SNAPSHOT_OBJECT || "").toString().trim();
+  if (b && o) return `gs://${b}/${o}`;
 
-  const ref = db.collection(col).doc(docId);
-  const snap = await ref.get();
-  if (!snap.exists) throw new Error(`Missing Firestore doc: ${col}/${docId}`);
-
-  const d = snap.data() || {};
-  const activeSnapshotId = (d.activeSnapshotId || d.activeSnapshotID || "").toString().trim() || null;
-  const gcsPath = (d.gcsPath || "").toString().trim();
-
-  if (!gcsPath) throw new Error(`Firestore doc ${col}/${docId} missing gcsPath`);
-
-  return { activeSnapshotId, gcsPath };
+  // 3) Default (matches your Firebase Storage bucket & desired fixed filename)
+  return "gs://dowsonfarms-illinois.firebasestorage.app/copilot/snapshot.json";
 }
 
 async function downloadGsJson(gsPath) {
@@ -68,23 +66,31 @@ async function downloadGsJson(gsPath) {
 
   const [buf] = await file.download();
   const txt = buf.toString("utf8");
+
+  // Helpful guard against accidentally writing an empty file
+  if (!txt || !txt.trim()) throw new Error("Snapshot file is empty");
+
   return JSON.parse(txt);
 }
 
 export async function loadSnapshot({ force = false } = {}) {
   if (!force && _cache.ok && _cache.json) return _cache;
 
+  const gcsPath = resolveFixedGsPath();
+
   try {
-    const ptr = await readActivePointerFromFirestore();
-    const json = await downloadGsJson(ptr.gcsPath);
+    const json = await downloadGsJson(gcsPath);
+
+    // If builder writes meta.builtAt, expose it as activeSnapshotId for visibility.
+    const builtAt = (json?.meta?.builtAt || "").toString().trim();
 
     _cache = {
       ok: true,
       json,
       loadedAt: new Date().toISOString(),
-      source: "firestore:pointer->gcs",
-      activeSnapshotId: ptr.activeSnapshotId || null,
-      gcsPath: ptr.gcsPath,
+      source: "gcs:fixed",
+      activeSnapshotId: builtAt ? `live@${builtAt}` : "live",
+      gcsPath,
       error: null
     };
     return _cache;
@@ -93,9 +99,9 @@ export async function loadSnapshot({ force = false } = {}) {
       ok: false,
       json: null,
       loadedAt: new Date().toISOString(),
-      source: "firestore:pointer->gcs",
+      source: "gcs:fixed",
       activeSnapshotId: null,
-      gcsPath: null,
+      gcsPath,
       error: e?.message || String(e)
     };
     return _cache;
