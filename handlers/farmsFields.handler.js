@@ -1,7 +1,8 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-02-handler-fields-only1
+// Rev: 2026-01-02-handler-fields-only2-county
 //
 // Farms + Fields handler only.
+// ✅ Adds County/State output for field lookups (since counties are tied to fields).
 // Uses snapshot-only /data/fieldData.js helpers.
 //
 // Requires these exports from /data/fieldData.js:
@@ -155,16 +156,27 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     const status = (b.field?.status || "active").toString() || "active";
     const tillable = (typeof b.field?.tillable === "number") ? b.field.tillable : null;
 
+    const county = (b.field?.county || "").toString().trim();
+    const state  = (b.field?.state  || "").toString().trim();
+
     const parts = [];
     parts.push(`Field: ${fieldName}`);
     if (farmName) parts.push(`Farm: ${farmName}`);
+    if (county) parts.push(`County: ${county}${state ? ", " + state : ""}`);
     parts.push(`Status: ${status}`);
     if (tillable != null) parts.push(`Tillable: ${tillable.toLocaleString()} acres`);
 
     return {
       ok: true,
       answer: parts.join("\n"),
-      meta: { routed: "farmsFields", intent: "field_lookup", fieldId: b.fieldId, confidence: res.confidence || null }
+      meta: {
+        routed: "farmsFields",
+        intent: "field_lookup",
+        fieldId: b.fieldId,
+        confidence: res.confidence || null,
+        county: county || null,
+        state: state || null
+      }
     };
   }
 
@@ -186,7 +198,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       `I can help with farms and fields. Try:\n` +
       `• "How many active fields do we have?"\n` +
       `• "Show me Brown 80"\n` +
-      `• "List fields on Lov Shack"`,
+      `• "List fields on Lov Shack"\n` +
+      `• "What county is Brown 80 in?"`,
     meta: { routed: "farmsFields", intent: "help" }
   };
 }
