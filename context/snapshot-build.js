@@ -1,5 +1,5 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-03-snapshot-build2-cloudrun
+// Rev: 2026-01-03-snapshot-build3-more-collections
 //
 // Snapshot Builder (EXPORTER)
 // --------------------------
@@ -12,18 +12,51 @@
 //   SNAPSHOT_BUCKET="dowsonfarms-illinois.firebasestorage.app"   (your actual bucket)
 //   SNAPSHOT_OBJECT="copilot/snapshot.json"
 //   SNAPSHOT_TMP_OBJECT="copilot/snapshot.tmp.json"
-//   SNAPSHOT_COLLECTIONS="farms,fields,rtkTowers"
-//   SNAPSHOT_LIMIT_PER_COLLECTION="0"
+//   SNAPSHOT_COLLECTIONS="..."   (optional override; if not set, uses DEFAULT_COLLECTIONS below)
+//   SNAPSHOT_LIMIT_PER_COLLECTION="0"   (0 = no limit; otherwise max docs read per collection)
+//
+// NOTE:
+// - Adding collections here just makes the data available in snapshot.json.
+// - Nothing will use it until you build data modules + handlers.
 
 'use strict';
 
 import admin from "firebase-admin";
 import "firebase-admin/storage";   // ✅ ensure Storage is registered (Cloud Run-safe)
 
+// ✅ Default collections baked into code (used when SNAPSHOT_COLLECTIONS is not set)
+const DEFAULT_COLLECTIONS = [
+  "farms",
+  "fields",
+  "rtkTowers",
+
+  // Requested additions:
+  "aerial_applications",
+  "binMovements",
+  "binSites",
+  "boundary_requests",
+  "combine_grain_loss",
+  "combine_yield",
+  "combine_yield_calibration",
+  "employees",
+  "equipment",
+  "fieldMaintenance",
+  "fieldTrials",
+  "field_crop_plans_v2",
+  "grain_bag_events",
+  "inventoryGrainBagMovements",
+  "productsChemical",
+  "productsFertilizer",
+  "productsGrainBags",
+  "productsSeed",
+  "starfireMoves",
+  "vehicleRegistrations"
+];
+
 // Lazy-init Admin SDK (works in Cloud Run / Functions with ADC)
 function ensureAdmin() {
   if (admin.apps && admin.apps.length) return;
-  // If you set FIREBASE_STORAGE_BUCKET or SNAPSHOT_BUCKET, we can set storageBucket here too.
+
   const storageBucket =
     (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim() ||
     (process.env.SNAPSHOT_BUCKET || "").toString().trim() ||
@@ -91,9 +124,9 @@ function toJsonSafe(value) {
    Build snapshot object
 ---------------------------- */
 
-function getEnvCsv(name, fallbackCsv) {
+function getEnvCsv(name) {
   const raw = (process.env[name] || "").toString().trim();
-  if (!raw) return fallbackCsv.split(",").map(s => s.trim()).filter(Boolean);
+  if (!raw) return null;
   return raw.split(",").map(s => s.trim()).filter(Boolean);
 }
 
@@ -103,12 +136,27 @@ function getEnvInt(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function uniqKeepOrder(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const v of (arr || [])) {
+    const s = (v || "").toString().trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 export async function buildSnapshotObject() {
   ensureAdmin();
 
   const db = admin.firestore();
 
-  const collections = getEnvCsv("SNAPSHOT_COLLECTIONS", "farms,fields,rtkTowers");
+  const override = getEnvCsv("SNAPSHOT_COLLECTIONS");
+  const collections = uniqKeepOrder(override && override.length ? override : DEFAULT_COLLECTIONS);
+
   const limitPer = getEnvInt("SNAPSHOT_LIMIT_PER_COLLECTION", 0); // 0 = unlimited
 
   const root = {
@@ -124,19 +172,32 @@ export async function buildSnapshotObject() {
   };
 
   const counts = {};
+  const errors = {}; // per-collection errors (won’t fail whole snapshot)
 
   for (const colName of collections) {
-    const colRef = db.collection(colName);
-    const q = limitPer > 0 ? colRef.limit(limitPer) : colRef;
-    const snap = await q.get();
+    try {
+      const colRef = db.collection(colName);
+      const q = limitPer > 0 ? colRef.limit(limitPer) : colRef;
+      const snap = await q.get();
 
-    const map = {};
-    snap.forEach(docSnap => {
-      map[docSnap.id] = toJsonSafe(docSnap.data() || {});
-    });
+      const map = {};
+      snap.forEach(docSnap => {
+        map[docSnap.id] = toJsonSafe(docSnap.data() || {});
+      });
 
-    root.data.__collections__[colName] = map;
-    counts[colName] = Object.keys(map).length;
+      root.data.__collections__[colName] = map;
+      counts[colName] = Object.keys(map).length;
+    } catch (e) {
+      // Don’t fail the entire build if one collection is missing or blocked.
+      // Record error and keep going.
+      root.data.__collections__[colName] = {};
+      counts[colName] = 0;
+      errors[colName] = (e?.message || String(e)).slice(0, 400);
+    }
+  }
+
+  if (Object.keys(errors).length) {
+    root.meta.collectionErrors = errors;
   }
 
   return { snapshot: root, counts };
@@ -152,18 +213,15 @@ function guessDefaultBucket() {
 }
 
 function getBucketName() {
-  // Prefer explicit values
   const snapBucket = (process.env.SNAPSHOT_BUCKET || "").toString().trim();
   const fbBucket = (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim();
 
   if (snapBucket) return snapBucket;
   if (fbBucket) return fbBucket;
 
-  // Fallback to admin app option if present
   const opt = admin.app().options || {};
   if (opt.storageBucket) return String(opt.storageBucket);
 
-  // Final fallback guess
   return guessDefaultBucket();
 }
 
@@ -246,7 +304,9 @@ export async function buildSnapshotHttp(req, res) {
       builtAt: w.builtAt,
       bucket: w.bucket,
       objectPath: w.objectPath,
-      counts: w.counts
+      counts: w.counts,
+      collections: snapshot?.meta?.collections || [],
+      collectionErrors: snapshot?.meta?.collectionErrors || null
     });
   } catch (e) {
     return res.status(500).json({
