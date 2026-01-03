@@ -1,11 +1,11 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-03-fieldData-autoresolve1
+// Rev: 2026-01-03-fieldData-autopick-debug1
 //
 // Snapshot-only data access for farms / fields / rtkTowers.
-// AUTO-RESOLVE CHANGE:
-// ✅ If query contains digits and the top match contains those digits,
-//    resolve immediately instead of asking for clarification.
-// ✅ Still asks when ambiguity is truly real.
+// CHANGE:
+// ✅ Never return 3-choice candidates to the user path.
+// ✅ Resolver ALWAYS returns the best match (top score) if any match exists.
+// ✅ Adds resolver debug hints in the return object (non-user-facing unless bubbled up).
 //
 // Exports unchanged.
 
@@ -122,14 +122,14 @@ export function suggestFields({ snapshot, query, includeArchived = false, limit 
 
 export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const cols = getSnapshotCollections(snapshot);
-  if (!cols.ok) return { ok: false, reason: cols.reason };
+  if (!cols.ok) return { ok: false, reason: cols.reason, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "getSnapshotCollections" } };
 
   const q = (query || "").toString().trim();
-  if (!q) return { ok: false, reason: "missing_query" };
+  if (!q) return { ok: false, reason: "missing_query", debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "missing_query" } };
 
   // direct id
   if (cols.fields?.[q]) {
-    return { ok: true, resolved: true, fieldId: q, confidence: 100 };
+    return { ok: true, resolved: true, fieldId: q, confidence: 100, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "direct_id" } };
   }
 
   // exact name
@@ -137,36 +137,46 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
     if (norm(f?.name) === qn) {
-      return { ok: true, resolved: true, fieldId: id, confidence: 100 };
+      return { ok: true, resolved: true, fieldId: id, confidence: 100, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "exact_name" } };
     }
   }
 
   // scored suggestions
   const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
-  if (!sug.ok) return { ok: false, reason: sug.reason };
+  if (!sug.ok) return { ok: false, reason: sug.reason, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "suggestFields_failed", detail: sug.reason } };
 
   if (!sug.matches.length) {
-    return { ok: true, resolved: false, candidates: [] };
+    return { ok: true, resolved: false, candidates: [], debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "no_matches" } };
   }
 
+  // ✅ NEW: ALWAYS pick the best match (top) and return it.
+  // We still compute ambiguity so upstream can warn/log, but we do NOT force a user choice list.
   const top = sug.matches[0];
   const second = sug.matches[1] || null;
 
-  // 🔑 NEW: numeric intent auto-resolve (fixes "field 0110")
+  const ambiguous = !!(second && (top.score - second.score < 12));
   const digits = q.replace(/\D/g, "");
-  if (digits && norm(top.name).includes(digits)) {
-    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: "auto-numeric" };
-  }
+  const digitHit = !!(digits && norm(top.name).includes(digits));
 
-  // existing strong/separated logic
-  const strong = top.score >= 90;
-  const separated = !second || (top.score - second.score >= 12);
-
-  if (strong && separated) {
-    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
-  }
-
-  return { ok: true, resolved: false, candidates: sug.matches.slice(0, 3) };
+  return {
+    ok: true,
+    resolved: true,
+    fieldId: top.fieldId,
+    confidence: top.score,
+    ambiguous: ambiguous,
+    digitHit: digitHit,
+    // keep alternates for debugging (not for user UI)
+    alternates: sug.matches.slice(0, 3).map(m => ({ fieldId: m.fieldId, score: m.score, name: m.name })),
+    debug: {
+      file: "/data/fieldData.js",
+      fn: "tryResolveField",
+      step: "auto_pick_top",
+      topScore: top.score,
+      secondScore: second ? second.score : null,
+      ambiguous,
+      digitHit
+    }
+  };
 }
 
 export function formatFieldOptionLine({ snapshot, fieldId }) {
