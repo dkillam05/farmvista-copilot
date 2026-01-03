@@ -1,11 +1,12 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-03-handler-autopick-debug3
+// Rev: 2026-01-03-handler-followups-global1
 //
-// Goals (per Dane):
-// ✅ NO category menus / "Quick check" prompts (removed completely)
-// ✅ NO 3-choice disambiguation list (resolver auto-picks in /data/fieldData.js)
-// ✅ Keep totals, by-farm, by-county, list-fields-on-farm, and field lookup
-// ✅ If we truly can't answer, return: "Please check <file> ..."
+// Keeps your working totals + field lookup behavior.
+// CHANGE:
+// ✅ When returning truncated lists (top 10), attach meta.continuation for global follow-ups.
+// ✅ NO "Quick check" menu.
+// ✅ NO 3-choice disambiguation lists (resolver auto-picks).
+// ✅ If can't answer, returns "Please check <file> ..."
 
 'use strict';
 
@@ -38,29 +39,14 @@ function fmtAcre(n) {
   return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
-// ---------------------
 // Intent helpers
-// ---------------------
-function wantsCount(q) {
-  return q.includes("how many") || q.includes("count") || q.includes("total") || q.includes("number of");
-}
-function wantsAcres(q) {
-  return q.includes("acres") || q.includes("tillable") || q.includes("acre");
-}
+function wantsCount(q) { return q.includes("how many") || q.includes("count") || q.includes("total") || q.includes("number of"); }
+function wantsAcres(q) { return q.includes("acres") || q.includes("tillable") || q.includes("acre"); }
 function wantsHel(q) { return q.includes("hel"); }
 function wantsCrp(q) { return q.includes("crp"); }
-
-function wantsByFarm(q) {
-  return q.includes("by farm") || (q.includes("farm") && (q.includes("breakdown") || q.includes("totals") || q.includes("total")));
-}
-
-function wantsByCounty(q) {
-  return q.includes("by county") || q.includes("county totals") || (q.includes("county") && (q.includes("breakdown") || q.includes("totals") || q.includes("total")));
-}
-
-function wantsList(q) {
-  return q.includes("list") || q.includes("show");
-}
+function wantsByFarm(q) { return q.includes("by farm") || (q.includes("farm") && (q.includes("breakdown") || q.includes("totals") || q.includes("total"))); }
+function wantsByCounty(q) { return q.includes("by county") || q.includes("county totals") || (q.includes("county") && (q.includes("breakdown") || q.includes("totals") || q.includes("total"))); }
+function wantsList(q) { return q.includes("list") || q.includes("show"); }
 
 function extractFarmNameGuess(raw) {
   const m = String(raw || "").match(/\b(?:on|in)\s+([a-z0-9][a-z0-9\s\-\._]{1,60})$/i);
@@ -101,9 +87,6 @@ function findFarmByName(cols, farmName) {
   return null;
 }
 
-// ---------------------
-// Totals builders
-// ---------------------
 function buildTotals({ cols, includeArchived }) {
   const totals = {
     fieldsTotal: 0,
@@ -194,9 +177,6 @@ function totalsByCounty({ cols, includeArchived }) {
   return arr;
 }
 
-// =====================================================================
-// Handler
-// =====================================================================
 export async function handleFarmsFields({ question, snapshot, user, includeArchived = false, meta = {} }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) {
@@ -226,38 +206,73 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   const farmGuessHit = farmGuessForTotals ? findFarmByName(cols, farmGuessForTotals) : null;
 
   if (askedTotals) {
-    // by farm
     if (wantsByFarm(q)) {
       const arr = totalsByFarm({ cols, includeArchived });
-      const top = arr.slice(0, 10);
 
-      const lines = [];
-      lines.push(`Farm totals (${includeArchived ? "incl archived" : "active only"}):`);
-      for (const r of top) {
-        lines.push(`• ${r.name}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`);
-      }
-      if (arr.length > top.length) lines.push(`…plus ${arr.length - top.length} more farms.`);
+      const allLines = arr.map(r =>
+        `• ${r.name}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
+      );
 
-      return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_by_farm" } };
+      const pageSize = 10;
+      const first = allLines.slice(0, pageSize);
+      const remaining = allLines.length - first.length;
+
+      const out = [];
+      out.push(`Farm totals (${includeArchived ? "incl archived" : "active only"}):`);
+      out.push(...first);
+      if (remaining > 0) out.push(`…plus ${remaining} more farms.`);
+
+      return {
+        ok: true,
+        answer: out.join("\n"),
+        meta: {
+          routed: "farmsFields",
+          intent: "totals_by_farm",
+          continuation: (remaining > 0) ? {
+            kind: "page",
+            title: `Farm totals (${includeArchived ? "incl archived" : "active only"}):`,
+            lines: allLines,
+            offset: pageSize,
+            pageSize
+          } : null
+        }
+      };
     }
 
-    // by county
     if (wantsByCounty(q)) {
       const arr = totalsByCounty({ cols, includeArchived });
-      const top = arr.slice(0, 10);
 
-      const lines = [];
-      lines.push(`County totals (${includeArchived ? "incl archived" : "active only"}):`);
-      for (const r of top) {
-        lines.push(`• ${r.key}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`);
-      }
-      if (arr.length > top.length) lines.push(`…plus ${arr.length - top.length} more counties.`);
+      const allLines = arr.map(r =>
+        `• ${r.key}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
+      );
 
-      return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_by_county" } };
+      const pageSize = 10;
+      const first = allLines.slice(0, pageSize);
+      const remaining = allLines.length - first.length;
+
+      const out = [];
+      out.push(`County totals (${includeArchived ? "incl archived" : "active only"}):`);
+      out.push(...first);
+      if (remaining > 0) out.push(`…plus ${remaining} more counties.`);
+
+      return {
+        ok: true,
+        answer: out.join("\n"),
+        meta: {
+          routed: "farmsFields",
+          intent: "totals_by_county",
+          continuation: (remaining > 0) ? {
+            kind: "page",
+            title: `County totals (${includeArchived ? "incl archived" : "active only"}):`,
+            lines: allLines,
+            offset: pageSize,
+            pageSize
+          } : null
+        }
+      };
     }
 
-    // totals for a specific farm (if name guessed)
-    if (farmGuessHit && (q.includes("farm") || q.includes("on ") || q.includes("in "))) {
+    if (farmGuessHit && (q.includes("farm") || q.includes(" on ") || q.includes(" in "))) {
       const farmId = farmGuessHit.id;
       let fields = 0, tillable = 0, hel = 0, crp = 0;
 
@@ -284,7 +299,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    // totals for a specific county
     if (countyGuess && q.includes("county")) {
       const needle = norm(countyGuess);
       let fields = 0, tillable = 0, hel = 0, crp = 0;
@@ -327,10 +341,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    // overall totals
     const t = buildTotals({ cols, includeArchived });
 
-    // special phrasing: "How many active fields..."
     if (wantsCount(q) && q.includes("field") && !wantsAcres(q) && !wantsHel(q) && !wantsCrp(q)) {
       if (includeArchived) {
         const archived = t.fieldsTotal - t.fieldsActive;
@@ -392,13 +404,32 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    const lines = ids.slice(0, 40).map(id => `• ${formatFieldOptionLine({ snapshot, fieldId: id })}`);
-    const more = ids.length > 40 ? `\n…plus ${ids.length - 40} more.` : "";
+    const allLines = ids.map(id => `• ${formatFieldOptionLine({ snapshot, fieldId: id })}`);
+    const pageSize = 40;
+    const first = allLines.slice(0, pageSize);
+    const remaining = allLines.length - first.length;
+
+    const out = [];
+    out.push(`Fields on ${farm.name || farm.id} (${ids.length}):`);
+    out.push(...first);
+    if (remaining > 0) out.push(`…plus ${remaining} more.`);
 
     return {
       ok: true,
-      answer: `Fields on ${farm.name || farm.id} (${ids.length}):\n${lines.join("\n")}${more}`,
-      meta: { routed: "farmsFields", intent: "list_fields_on_farm", farmId: farm.id, count: ids.length }
+      answer: out.join("\n"),
+      meta: {
+        routed: "farmsFields",
+        intent: "list_fields_on_farm",
+        farmId: farm.id,
+        count: ids.length,
+        continuation: (remaining > 0) ? {
+          kind: "page",
+          title: `Fields on ${farm.name || farm.id} (${ids.length}):`,
+          lines: allLines,
+          offset: pageSize,
+          pageSize
+        } : null
+      }
     };
   }
 
