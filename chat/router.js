@@ -1,9 +1,11 @@
 // /chat/router.js  (FULL FILE)
-// Rev: 2026-01-02-router-fields-only2-county
+// Rev: 2026-01-03-router-followups2
 //
-// Deterministic router: only one category right now (farms + fields).
-// ✅ Added county/state keywords so county questions route to farmsFields handler.
-// Everything else => "not wired yet" message.
+// Deterministic router: farms + fields is the only handler today.
+// IMPORTANT CHANGE:
+// - Do NOT dead-end with "not reachable".
+// - If no match, still route to farmsFields but flag routerFallback so the handler
+//   can ask a clarifying follow-up instead of returning a dumb refusal.
 
 'use strict';
 
@@ -23,7 +25,7 @@ const FF_TERMS = [
   "field", "fields", "tillable", "acres", "fieldid", "farmid",
   // farms
   "farm", "farms",
-  // geography (fields are tied to counties/states)
+  // geography
   "county", "counties", "state", "where is", "location",
   // status
   "archived", "inactive", "active",
@@ -31,6 +33,14 @@ const FF_TERMS = [
   "how many", "count", "total", "number of", "list", "show", "find", "lookup", "search",
   // phrasing
   "which farm", "what farm", "on farm", "in farm"
+];
+
+// "soft" terms to help the handler ask better follow-ups
+const SOFT_TERMS = [
+  "rtk", "tower", "towers", "base station", "frequency", "network id",
+  "grain", "bag", "bags", "putdown", "pickup", "ticket", "elevator",
+  "contract", "contracts", "basis", "delivery",
+  "equipment", "tractor", "combine", "sprayer", "implement"
 ];
 
 function detectIncludeArchived(q) {
@@ -46,20 +56,36 @@ export async function routeQuestion({ question, snapshot, user }) {
   if (!q) {
     return {
       ok: true,
-      answer: 'Ask me something about a field or farm. Example: "How many fields do we farm?"',
+      answer: 'Ask me something about a field or farm. Example: "How many active fields do we have?"',
       meta: { routed: "none", reason: "empty" }
     };
   }
 
+  const includeArchived = detectIncludeArchived(q);
+
+  // Normal farms/fields route
   if (hasAny(q, FF_TERMS)) {
-    const includeArchived = detectIncludeArchived(q);
-    return await handleFarmsFields({ question: raw, snapshot, user, includeArchived });
+    return await handleFarmsFields({
+      question: raw,
+      snapshot,
+      user,
+      includeArchived,
+      meta: { routerFallback: false, routerReason: "ff_match" }
+    });
   }
 
-  return {
-    ok: true,
-    answer:
-      'Still in Beta testing, this information isnt reachable at this time',
-    meta: { routed: "none", reason: "no_match" }
-  };
+  // Not a farms/fields keyword match — still route, but flag fallback.
+  const softHit = hasAny(q, SOFT_TERMS);
+
+  return await handleFarmsFields({
+    question: raw,
+    snapshot,
+    user,
+    includeArchived,
+    meta: {
+      routerFallback: true,
+      routerReason: softHit ? "soft_match_other_domain" : "no_match",
+      softHit: softHit || false
+    }
+  });
 }
