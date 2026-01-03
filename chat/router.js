@@ -59,8 +59,7 @@ export async function routeQuestion({ question, snapshot, user }) {
   return {
     ok: true,
     answer:
-      'That category isn’t wired yet. For now I can answer questions about farms and fields. ' +
-      'Try: "How many active fields do we have?" or "List fields on Lov Shack."',
+      'Still in Beta testing, this information isnt reachable at this time',
     meta: { routed: "none", reason: "no_match" }
   };
 }
