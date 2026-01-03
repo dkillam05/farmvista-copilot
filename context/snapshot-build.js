@@ -1,40 +1,35 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-02-snapshot-build1
+// Rev: 2026-01-03-snapshot-build2-cloudrun
 //
 // Snapshot Builder (EXPORTER)
 // --------------------------
-// Purpose:
-//   Build a single, current snapshot JSON directly from Firestore and write it to
-//   ONE fixed Cloud Storage object path (overwrite-in-place).
+// Builds a single, current snapshot from Firestore and overwrites ONE fixed GCS object.
 //
-// This is the “Option 3” hourly refresh piece.
-// It is NOT used by chat directly — chat continues to read snapshot.json via /context/snapshot.js.
+// Writes:
+//   gs://<bucket>/<objectPath>   (default: copilot/snapshot.json)
 //
-// What it does:
-//   1) Reads selected Firestore collections (default: farms, fields, rtkTowers)
-//   2) Produces JSON shaped like: { meta, data: { __collections__: { <col>: {id: doc} } } }
-//   3) Writes to GCS at a fixed path (default: copilot/snapshot.json)
-//   4) Uses a temp object + copy to reduce risk of partial writes
-//
-// How you’ll use it later:
-//   - Add a route in index.js: app.post("/snapshot/build", buildSnapshotHttp)
-//   - Trigger it hourly with Cloud Scheduler: POST /snapshot/build
-//
-// Env vars (optional):
-//   SNAPSHOT_COLLECTIONS="farms,fields,rtkTowers"
-//   SNAPSHOT_BUCKET="dowsonfarms-illinois.appspot.com"   (or your bucket name)
+// Env vars (recommended):
+//   SNAPSHOT_BUCKET="dowsonfarms-illinois.firebasestorage.app"   (your actual bucket)
 //   SNAPSHOT_OBJECT="copilot/snapshot.json"
 //   SNAPSHOT_TMP_OBJECT="copilot/snapshot.tmp.json"
-//   SNAPSHOT_LIMIT_PER_COLLECTION="0"   (0 = no limit; otherwise max docs read per collection)
+//   SNAPSHOT_COLLECTIONS="farms,fields,rtkTowers"
+//   SNAPSHOT_LIMIT_PER_COLLECTION="0"
 
 'use strict';
 
 import admin from "firebase-admin";
+import "firebase-admin/storage";   // ✅ ensure Storage is registered (Cloud Run-safe)
 
 // Lazy-init Admin SDK (works in Cloud Run / Functions with ADC)
 function ensureAdmin() {
   if (admin.apps && admin.apps.length) return;
-  admin.initializeApp();
+  // If you set FIREBASE_STORAGE_BUCKET or SNAPSHOT_BUCKET, we can set storageBucket here too.
+  const storageBucket =
+    (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim() ||
+    (process.env.SNAPSHOT_BUCKET || "").toString().trim() ||
+    undefined;
+
+  admin.initializeApp(storageBucket ? { storageBucket } : undefined);
 }
 
 /* ---------------------------
@@ -42,37 +37,30 @@ function ensureAdmin() {
 ---------------------------- */
 
 function isTimestampLike(v) {
-  // Firestore Timestamp has toDate(), seconds, nanoseconds
   return v && typeof v === "object" && typeof v.toDate === "function" &&
     (typeof v.seconds === "number" || typeof v._seconds === "number");
 }
 
 function isGeoPointLike(v) {
-  // Firestore GeoPoint has latitude/longitude numbers
   return v && typeof v === "object" &&
     typeof v.latitude === "number" && typeof v.longitude === "number";
 }
 
 function isDocumentRefLike(v) {
-  // Firestore DocumentReference has path string
   return v && typeof v === "object" && typeof v.path === "string" && typeof v.id === "string";
 }
 
 function toJsonSafe(value) {
   if (value == null) return value;
 
-  // primitives
   const t = typeof value;
   if (t === "string" || t === "number" || t === "boolean") return value;
 
-  // arrays
   if (Array.isArray(value)) return value.map(toJsonSafe);
 
-  // Firestore special types
   if (isTimestampLike(value)) {
     let sec = value.seconds;
     let nsec = value.nanoseconds;
-    // some builds expose _seconds/_nanoseconds
     if (typeof sec !== "number") sec = value._seconds;
     if (typeof nsec !== "number") nsec = value._nanoseconds;
 
@@ -90,16 +78,12 @@ function toJsonSafe(value) {
     return { __type: "docref", path: value.path, id: value.id };
   }
 
-  // plain objects
   if (t === "object") {
     const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = toJsonSafe(v);
-    }
+    for (const [k, v] of Object.entries(value)) out[k] = toJsonSafe(v);
     return out;
   }
 
-  // fallback
   try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
 }
 
@@ -148,8 +132,7 @@ export async function buildSnapshotObject() {
 
     const map = {};
     snap.forEach(docSnap => {
-      const data = docSnap.data() || {};
-      map[docSnap.id] = toJsonSafe(data);
+      map[docSnap.id] = toJsonSafe(docSnap.data() || {});
     });
 
     root.data.__collections__[colName] = map;
@@ -164,27 +147,36 @@ export async function buildSnapshotObject() {
 ---------------------------- */
 
 function guessDefaultBucket() {
-  // Common default patterns:
-  // - <project-id>.appspot.com  (classic)
-  // - Firebase Storage uses storage bucket, but Admin SDK default bucket is usually appspot unless configured.
   const projectId = (process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "").toString().trim();
   return projectId ? `${projectId}.appspot.com` : "";
+}
+
+function getBucketName() {
+  // Prefer explicit values
+  const snapBucket = (process.env.SNAPSHOT_BUCKET || "").toString().trim();
+  const fbBucket = (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim();
+
+  if (snapBucket) return snapBucket;
+  if (fbBucket) return fbBucket;
+
+  // Fallback to admin app option if present
+  const opt = admin.app().options || {};
+  if (opt.storageBucket) return String(opt.storageBucket);
+
+  // Final fallback guess
+  return guessDefaultBucket();
 }
 
 export async function writeSnapshotToGcs({ snapshot, counts }) {
   ensureAdmin();
 
-  // Admin SDK storage
-  const bucketName =
-    (process.env.SNAPSHOT_BUCKET || "").toString().trim() ||
-    (admin.app().options && admin.app().options.storageBucket ? String(admin.app().options.storageBucket) : "") ||
-    guessDefaultBucket();
+  const bucketName = getBucketName();
 
   if (!bucketName) {
     return {
       ok: false,
       error: "missing_bucket",
-      detail: "Set SNAPSHOT_BUCKET or configure storageBucket in firebase-admin initializeApp()."
+      detail: "Set SNAPSHOT_BUCKET (recommended) or FIREBASE_STORAGE_BUCKET."
     };
   }
 
@@ -192,37 +184,45 @@ export async function writeSnapshotToGcs({ snapshot, counts }) {
   const tmpPath = (process.env.SNAPSHOT_TMP_OBJECT || "copilot/snapshot.tmp.json").toString().trim();
 
   const bucket = admin.storage().bucket(bucketName);
-
   const body = JSON.stringify(snapshot);
 
-  // 1) write tmp
-  const tmpFile = bucket.file(tmpPath);
-  await tmpFile.save(body, {
-    resumable: false,
-    contentType: "application/json",
-    metadata: {
-      cacheControl: "no-store, max-age=0"
-    }
-  });
+  try {
+    // 1) write tmp
+    const tmpFile = bucket.file(tmpPath);
+    await tmpFile.save(body, {
+      resumable: false,
+      contentType: "application/json",
+      metadata: { cacheControl: "no-store, max-age=0" }
+    });
 
-  // 2) copy tmp -> final (overwrite)
-  const finalFile = bucket.file(objectPath);
-  await tmpFile.copy(finalFile);
+    // 2) copy tmp -> final (overwrite)
+    const finalFile = bucket.file(objectPath);
+    await tmpFile.copy(finalFile);
 
-  // 3) delete tmp (best effort)
-  try { await tmpFile.delete({ ignoreNotFound: true }); } catch {}
+    // 3) delete tmp (best effort)
+    try { await tmpFile.delete({ ignoreNotFound: true }); } catch {}
 
-  return {
-    ok: true,
-    bucket: bucketName,
-    objectPath,
-    builtAt: snapshot?.meta?.builtAt || null,
-    counts: counts || {}
-  };
+    return {
+      ok: true,
+      bucket: bucketName,
+      objectPath,
+      builtAt: snapshot?.meta?.builtAt || null,
+      counts: counts || {}
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: "gcs_write_failed",
+      detail: (e?.message || String(e)).slice(0, 500),
+      bucket: bucketName,
+      objectPath,
+      tmpPath
+    };
+  }
 }
 
 /* ---------------------------
-   HTTP handler (optional for later)
+   HTTP handler
 ---------------------------- */
 
 export async function buildSnapshotHttp(req, res) {
@@ -234,7 +234,10 @@ export async function buildSnapshotHttp(req, res) {
       return res.status(500).json({
         ok: false,
         error: w.error || "snapshot_write_failed",
-        detail: w.detail || null
+        detail: w.detail || null,
+        bucket: w.bucket || null,
+        objectPath: w.objectPath || null,
+        tmpPath: w.tmpPath || null
       });
     }
 
@@ -249,7 +252,7 @@ export async function buildSnapshotHttp(req, res) {
     return res.status(500).json({
       ok: false,
       error: "snapshot_build_failed",
-      detail: (e?.message || String(e)).slice(0, 300)
+      detail: (e?.message || String(e)).slice(0, 500)
     });
   }
 }
