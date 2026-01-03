@@ -1,5 +1,5 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-02-min-core3-router1
+// Rev: 2026-01-03-min-core3-router2-snapshotbuild
 //
 // Adds (unchanged):
 // ✅ /context/summary
@@ -8,11 +8,17 @@
 //
 // Chat:
 // ✅ passes Authorization header through to handleChat (for new UI token header)
-// ✅ handleChat now uses router/handlers
+// ✅ handleChat uses router/handlers
+//
+// NEW:
+// ✅ /snapshot/build  (builds & overwrites the single snapshot file in GCS)
+//    - implemented in /context/snapshot-build.js as buildSnapshotHttp
+//    - intended for Cloud Scheduler hourly POST trigger
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
 import { getSnapshotStatus, reloadSnapshot, loadSnapshot } from "./context/snapshot.js";
+import { buildSnapshotHttp } from "./context/snapshot-build.js";
 import { handleChat } from "./chat/handleChat.js";
 
 const app = express();
@@ -47,6 +53,13 @@ app.post("/context/reload", async (req, res) => {
   const r = await reloadSnapshot();
   res.json({ ...r, revision: getRevision() });
 });
+
+// --------------------
+// Snapshot builder (hourly scheduler target)
+// --------------------
+// Cloud Scheduler will call: POST /snapshot/build
+// This endpoint builds a fresh snapshot from Firestore and overwrites the single snapshot file in GCS.
+app.post("/snapshot/build", buildSnapshotHttp);
 
 // --------------------
 // Snapshot summary (safe-ish)
