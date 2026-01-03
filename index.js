@@ -1,19 +1,17 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-03-min-core3-router2-snapshotbuild
+// Rev: 2026-01-03-min-core3-router2-snapshotbuild-summaryall
 //
 // Adds (unchanged):
-// ✅ /context/summary
+// ✅ /context/summary   (UPDATED: now reports ALL snapshot collections + counts)
 // ✅ /context/raw
 // ✅ /openai/health
 //
 // Chat:
-// ✅ passes Authorization header through to handleChat (for new UI token header)
+// ✅ passes Authorization header through to handleChat
 // ✅ handleChat uses router/handlers
 //
-// NEW:
-// ✅ /snapshot/build  (builds & overwrites the single snapshot file in GCS)
-//    - implemented in /context/snapshot-build.js as buildSnapshotHttp
-//    - intended for Cloud Scheduler hourly POST trigger
+// Snapshot builder:
+// ✅ /snapshot/build
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
@@ -55,14 +53,12 @@ app.post("/context/reload", async (req, res) => {
 });
 
 // --------------------
-// Snapshot builder (hourly scheduler target)
+// Snapshot builder (scheduler target)
 // --------------------
-// Cloud Scheduler will call: POST /snapshot/build
-// This endpoint builds a fresh snapshot from Firestore and overwrites the single snapshot file in GCS.
 app.post("/snapshot/build", buildSnapshotHttp);
 
 // --------------------
-// Snapshot summary (safe-ish)
+// Snapshot summary (UPDATED: all collections)
 // --------------------
 app.get("/context/summary", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
@@ -85,15 +81,73 @@ app.get("/context/summary", async (req, res) => {
     root?.data?.__collections__ ||
     root?.__collections__ ||
     (root?.data && root.data.farms && root.data.fields ? root.data : null) ||
-    (root?.farms && root?.fields ? root : null);
+    (root?.farms && root?.fields ? root : null) ||
+    {};
 
-  const farms = cols?.farms || {};
-  const fields = cols?.fields || {};
-  const rtkTowers = cols?.rtkTowers || {};
+  // Build counts for ALL collections present in snapshot
+  const counts = {};
+  const preview = {};
 
-  const firstFarmNames = Object.values(farms).slice(0, 10).map(x => (x?.name || "").toString()).filter(Boolean);
-  const firstFieldNames = Object.values(fields).slice(0, 10).map(x => (x?.name || "").toString()).filter(Boolean);
-  const firstTowerNames = Object.values(rtkTowers).slice(0, 10).map(x => (x?.name || "").toString()).filter(Boolean);
+  const colNames = Object.keys(cols || {}).sort((a, b) => a.localeCompare(b));
+  const PREVIEW_LIMIT = 10;
+
+  function firstValues(obj, limit) {
+    try {
+      return Object.values(obj || {}).slice(0, limit);
+    } catch {
+      return [];
+    }
+  }
+
+  function firstKeys(obj, limit) {
+    try {
+      return Object.keys(obj || {}).slice(0, limit);
+    } catch {
+      return [];
+    }
+  }
+
+  for (const name of colNames) {
+    const map = cols?.[name] || {};
+    counts[name] = Object.keys(map).length;
+
+    // Collection-specific preview: show human-friendly names when common
+    if (name === "farms") {
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
+      continue;
+    }
+    if (name === "fields") {
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
+      continue;
+    }
+    if (name === "rtkTowers") {
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
+      continue;
+    }
+    if (name === "employees") {
+      // often { name, displayName, email }
+      preview[name] = firstValues(map, PREVIEW_LIMIT)
+        .map(x => (x?.name || x?.displayName || x?.email || "").toString())
+        .filter(Boolean);
+      continue;
+    }
+    if (name === "equipment") {
+      // common fields: name, unit, assetTag, makeModel
+      preview[name] = firstValues(map, PREVIEW_LIMIT)
+        .map(x => (x?.name || x?.unit || x?.assetTag || x?.makeModel || x?.model || "").toString())
+        .filter(Boolean);
+      continue;
+    }
+    if (name === "binSites") {
+      preview[name] = firstValues(map, PREVIEW_LIMIT)
+        .map(x => (x?.name || x?.siteName || "").toString())
+        .filter(Boolean);
+      continue;
+    }
+
+    // Default preview: doc IDs (always available)
+    preview[name] = firstKeys(map, PREVIEW_LIMIT);
+  }
 
   return res.status(200).json({
     ok: true,
@@ -101,16 +155,8 @@ app.get("/context/summary", async (req, res) => {
     source: snap.source || null,
     gcsPath: snap.gcsPath || null,
     loadedAt: snap.loadedAt || null,
-    counts: {
-      farms: Object.keys(farms).length,
-      fields: Object.keys(fields).length,
-      rtkTowers: Object.keys(rtkTowers).length
-    },
-    preview: {
-      farms: firstFarmNames,
-      fields: firstFieldNames,
-      rtkTowers: firstTowerNames
-    },
+    counts,
+    preview,
     topKeys: Object.keys(root).slice(0, 50),
     revision: getRevision()
   });
