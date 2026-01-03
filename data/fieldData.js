@@ -1,19 +1,13 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-02-fieldData-snapshot3-compat
+// Rev: 2026-01-03-fieldData-autoresolve1
 //
 // Snapshot-only data access for farms / fields / rtkTowers.
-// Keeps the original export surface so existing imports DON'T break.
+// AUTO-RESOLVE CHANGE:
+// ✅ If query contains digits and the top match contains those digits,
+//    resolve immediately instead of asking for clarification.
+// ✅ Still asks when ambiguity is truly real.
 //
-// Exports:
-// - getSnapshotCollections(snapshot)
-// - buildFieldBundle({ snapshot, fieldId })
-// - suggestFields({ snapshot, query, includeArchived, limit })
-// - tryResolveField({ snapshot, query, includeArchived })
-// - formatFieldOptionLine({ snapshot, fieldId })
-// - lookupTowerByName({ snapshot, towerName })
-// - summarizeTowers({ snapshot, includeArchived })
-//
-// No Firestore queries here.
+// Exports unchanged.
 
 'use strict';
 
@@ -84,7 +78,7 @@ function scoreFieldName(fieldName, q) {
   if (n.includes(needle)) return 80;
 
   const digits = needle.replace(/\D/g, "");
-  if (digits && n.includes(digits)) return 75;
+  if (digits && n.includes(digits)) return 85;
 
   const toks = needle.split(/\s+/).filter(Boolean);
   let hit = 0;
@@ -134,27 +128,44 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   if (!q) return { ok: false, reason: "missing_query" };
 
   // direct id
-  if (cols.fields?.[q]) return { ok: true, resolved: true, fieldId: q, confidence: 100 };
+  if (cols.fields?.[q]) {
+    return { ok: true, resolved: true, fieldId: q, confidence: 100 };
+  }
 
   // exact name
   const qn = norm(q);
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
-    if (norm(f?.name) === qn) return { ok: true, resolved: true, fieldId: id, confidence: 100 };
+    if (norm(f?.name) === qn) {
+      return { ok: true, resolved: true, fieldId: id, confidence: 100 };
+    }
   }
 
   // scored suggestions
   const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
   if (!sug.ok) return { ok: false, reason: sug.reason };
 
-  if (!sug.matches.length) return { ok: true, resolved: false, candidates: [] };
+  if (!sug.matches.length) {
+    return { ok: true, resolved: false, candidates: [] };
+  }
 
   const top = sug.matches[0];
   const second = sug.matches[1] || null;
+
+  // 🔑 NEW: numeric intent auto-resolve (fixes "field 0110")
+  const digits = q.replace(/\D/g, "");
+  if (digits && norm(top.name).includes(digits)) {
+    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: "auto-numeric" };
+  }
+
+  // existing strong/separated logic
   const strong = top.score >= 90;
   const separated = !second || (top.score - second.score >= 12);
 
-  if (strong && separated) return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
+  if (strong && separated) {
+    return { ok: true, resolved: true, fieldId: top.fieldId, confidence: top.score };
+  }
+
   return { ok: true, resolved: false, candidates: sug.matches.slice(0, 3) };
 }
 
@@ -209,7 +220,6 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) return { ok: false, reason: cols.reason };
 
-  // towerId -> { tower, farmIds:Set, fieldCount }
   const towerMap = new Map();
 
   for (const [, f] of Object.entries(cols.fields || {})) {
@@ -265,7 +275,6 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
   };
 }
 
-// Optional: default export (won’t break named imports, but helps if any file uses default import)
 export default {
   getSnapshotCollections,
   buildFieldBundle,
