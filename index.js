@@ -1,10 +1,14 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-02-min-core3
+// Rev: 2026-01-02-min-core3-router1
 //
-// Adds:
-// ✅ /context/summary  (counts + top keys + preview lists)
-// ✅ /context/raw      (FULL snapshot dump - debug only)
-// ✅ /openai/health    (verifies OpenAI is reachable)
+// Adds (unchanged):
+// ✅ /context/summary
+// ✅ /context/raw
+// ✅ /openai/health
+//
+// Chat:
+// ✅ passes Authorization header through to handleChat (for new UI token header)
+// ✅ handleChat now uses router/handlers
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
@@ -167,17 +171,20 @@ app.post("/chat", async (req, res) => {
   const question = (req.body?.question || "").toString().trim();
   if (!question) return res.status(400).json({ ok: false, error: "Missing question", revision: getRevision() });
 
+  const authHeader = (req.headers.authorization || "").toString();
+
   const snap = await loadSnapshot({ force: false });
-  const out = await handleChat({ question, snapshot: snap });
+  const out = await handleChat({ question, snapshot: snap, authHeader });
 
   res.json({
     ...out,
     meta: {
       ...(out?.meta || {}),
-      snapshotId: snap.activeSnapshotId || null,
-      source: snap.source || null,
-      gcsPath: snap.gcsPath || null,
-      loadedAt: snap.loadedAt || null,
+      snapshotId: snap?.activeSnapshotId || null,
+      source: snap?.source || null,
+      gcsPath: snap?.gcsPath || null,
+      loadedAt: snap?.loadedAt || null,
+      authPresent: !!authHeader,
       revision: getRevision()
     }
   });
