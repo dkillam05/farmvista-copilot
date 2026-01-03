@@ -1,12 +1,15 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-03-handler-followups-global1
+// Rev: 2026-01-03-handler-followups-global2
 //
 // Keeps your working totals + field lookup behavior.
-// CHANGE:
-// ✅ When returning truncated lists (top 10), attach meta.continuation for global follow-ups.
-// ✅ NO "Quick check" menu.
-// ✅ NO 3-choice disambiguation lists (resolver auto-picks).
-// ✅ If can't answer, returns "Please check <file> ..."
+// Adds contextDelta so global conversation can carry on.
+//
+// Rules (per Dane):
+// ✅ No "Quick check" menus.
+// ✅ No 3-choice disambiguation lists (resolver auto-picks).
+// ✅ When returning truncated lists, attach meta.continuation for paging ("more/the rest/show all").
+// ✅ Always attach meta.contextDelta to support global follow-ups ("same but CRP", "by county", "that field", etc.).
+// ✅ If can't answer, return "Please check <file> ..."
 
 'use strict';
 
@@ -177,13 +180,26 @@ function totalsByCounty({ cols, includeArchived }) {
   return arr;
 }
 
+function metricFromQuery(q) {
+  if (wantsHel(q)) return "hel";
+  if (wantsCrp(q)) return "crp";
+  if (wantsAcres(q)) return "tillable";
+  if (wantsCount(q) && q.includes("field")) return "fields";
+  return "all";
+}
+
 export async function handleFarmsFields({ question, snapshot, user, includeArchived = false, meta = {} }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) {
     return {
       ok: false,
       answer: "Please check /data/fieldData.js — snapshot collections not loaded.",
-      meta: { routed: "farmsFields", reason: cols.reason, debugFile: "/data/fieldData.js" }
+      meta: {
+        routed: "farmsFields",
+        reason: cols.reason,
+        debugFile: "/data/fieldData.js",
+        contextDelta: { lastIntent: "snapshot_error", lastScope: { includeArchived: !!includeArchived } }
+      }
     };
   }
 
@@ -204,11 +220,11 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   const countyGuess = extractCountyGuess(raw);
   const farmGuessForTotals = extractFarmNameGuess(raw);
   const farmGuessHit = farmGuessForTotals ? findFarmByName(cols, farmGuessForTotals) : null;
+  const metric = metricFromQuery(q);
 
   if (askedTotals) {
     if (wantsByFarm(q)) {
       const arr = totalsByFarm({ cols, includeArchived });
-
       const allLines = arr.map(r =>
         `• ${r.name}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
       );
@@ -234,14 +250,19 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
             lines: allLines,
             offset: pageSize,
             pageSize
-          } : null
+          } : null,
+          contextDelta: {
+            lastIntent: "totals_by_farm",
+            lastMetric: metric,
+            lastBy: "farm",
+            lastScope: { includeArchived: !!includeArchived }
+          }
         }
       };
     }
 
     if (wantsByCounty(q)) {
       const arr = totalsByCounty({ cols, includeArchived });
-
       const allLines = arr.map(r =>
         `• ${r.key}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
       );
@@ -267,7 +288,13 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
             lines: allLines,
             offset: pageSize,
             pageSize
-          } : null
+          } : null,
+          contextDelta: {
+            lastIntent: "totals_by_county",
+            lastMetric: metric,
+            lastBy: "county",
+            lastScope: { includeArchived: !!includeArchived }
+          }
         }
       };
     }
@@ -295,7 +322,18 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
           `Tillable acres: ${fmtAcre(tillable)}\n` +
           `HEL acres: ${fmtAcre(hel)}\n` +
           `CRP acres: ${fmtAcre(crp)}`,
-        meta: { routed: "farmsFields", intent: "farm_totals", farmId }
+        meta: {
+          routed: "farmsFields",
+          intent: "farm_totals",
+          farmId,
+          contextDelta: {
+            lastIntent: "farm_totals",
+            lastMetric: metric,
+            lastBy: "farm",
+            lastEntity: { type: "farm", id: farmId, name: farmGuessHit.name || farmId },
+            lastScope: { includeArchived: !!includeArchived, farmId, farmName: farmGuessHit.name || farmId }
+          }
+        }
       };
     }
 
@@ -325,7 +363,17 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
         return {
           ok: true,
           answer: `I couldn’t find any ${includeArchived ? "" : "active "}fields in ${countyGuess} County.`,
-          meta: { routed: "farmsFields", intent: "county_totals", county: countyGuess }
+          meta: {
+            routed: "farmsFields",
+            intent: "county_totals_none",
+            contextDelta: {
+              lastIntent: "county_totals",
+              lastMetric: metric,
+              lastBy: "county",
+              lastEntity: { type: "county", id: countyGuess, name: countyGuess },
+              lastScope: { includeArchived: !!includeArchived, county: countyGuess }
+            }
+          }
         };
       }
 
@@ -337,7 +385,18 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
           `Tillable acres: ${fmtAcre(tillable)}\n` +
           `HEL acres: ${fmtAcre(hel)}\n` +
           `CRP acres: ${fmtAcre(crp)}`,
-        meta: { routed: "farmsFields", intent: "county_totals", county: matchedKey }
+        meta: {
+          routed: "farmsFields",
+          intent: "county_totals",
+          county: matchedKey,
+          contextDelta: {
+            lastIntent: "county_totals",
+            lastMetric: metric,
+            lastBy: "county",
+            lastEntity: { type: "county", id: matchedKey, name: matchedKey },
+            lastScope: { includeArchived: !!includeArchived, county: matchedKey }
+          }
+        }
       };
     }
 
@@ -349,13 +408,33 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
         return {
           ok: true,
           answer: `Fields: ${fmtInt(t.fieldsActive)} active, ${fmtInt(archived)} archived/inactive (${fmtInt(t.fieldsTotal)} total).`,
-          meta: { routed: "farmsFields", intent: "count_fields", ...t }
+          meta: {
+            routed: "farmsFields",
+            intent: "count_fields",
+            ...t,
+            contextDelta: {
+              lastIntent: "count_fields",
+              lastMetric: "fields",
+              lastBy: "",
+              lastScope: { includeArchived: !!includeArchived }
+            }
+          }
         };
       }
       return {
         ok: true,
         answer: `Active fields: ${fmtInt(t.fieldsActive)}.`,
-        meta: { routed: "farmsFields", intent: "count_fields", ...t }
+        meta: {
+          routed: "farmsFields",
+          intent: "count_fields",
+          ...t,
+          contextDelta: {
+            lastIntent: "count_fields",
+            lastMetric: "fields",
+            lastBy: "",
+            lastScope: { includeArchived: !!includeArchived }
+          }
+        }
       };
     }
 
@@ -366,7 +445,21 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     lines.push(`HEL acres: ${fmtAcre(t.helAcres)} (${fmtInt(t.fieldsWithHEL)} fields)`);
     lines.push(`CRP acres: ${fmtAcre(t.crpAcres)} (${fmtInt(t.fieldsWithCRP)} fields)`);
 
-    return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_overall", ...t } };
+    return {
+      ok: true,
+      answer: lines.join("\n"),
+      meta: {
+        routed: "farmsFields",
+        intent: "totals_overall",
+        ...t,
+        contextDelta: {
+          lastIntent: "totals_overall",
+          lastMetric: metric,
+          lastBy: "",
+          lastScope: { includeArchived: !!includeArchived }
+        }
+      }
+    };
   }
 
   // -----------------------
@@ -380,7 +473,13 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return {
         ok: false,
         answer: "Please check /handlers/farmsFields.handler.js — could not extract farm name for list-fields query.",
-        meta: { routed: "farmsFields", intent: "list_fields_on_farm_failed", debugFile: "/handlers/farmsFields.handler.js", farmGuess }
+        meta: {
+          routed: "farmsFields",
+          intent: "list_fields_on_farm_failed",
+          debugFile: "/handlers/farmsFields.handler.js",
+          farmGuess,
+          contextDelta: { lastIntent: "list_fields_on_farm_failed", lastScope: { includeArchived: !!includeArchived } }
+        }
       };
     }
 
@@ -400,7 +499,18 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return {
         ok: true,
         answer: `No ${includeArchived ? "" : "active "}fields found on ${farm.name || farm.id}.`,
-        meta: { routed: "farmsFields", intent: "list_fields_on_farm", farmId: farm.id }
+        meta: {
+          routed: "farmsFields",
+          intent: "list_fields_on_farm",
+          farmId: farm.id,
+          contextDelta: {
+            lastIntent: "list_fields_on_farm",
+            lastMetric: "fields",
+            lastBy: "farm",
+            lastEntity: { type: "farm", id: farm.id, name: farm.name || farm.id },
+            lastScope: { includeArchived: !!includeArchived, farmId: farm.id, farmName: farm.name || farm.id }
+          }
+        }
       };
     }
 
@@ -428,7 +538,14 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
           lines: allLines,
           offset: pageSize,
           pageSize
-        } : null
+        } : null,
+        contextDelta: {
+          lastIntent: "list_fields_on_farm",
+          lastMetric: "fields",
+          lastBy: "farm",
+          lastEntity: { type: "farm", id: farm.id, name: farm.name || farm.id },
+          lastScope: { includeArchived: !!includeArchived, farmId: farm.id, farmName: farm.name || farm.id }
+        }
       }
     };
   }
@@ -444,7 +561,13 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return {
         ok: false,
         answer: "Please check /handlers/farmsFields.handler.js — buildFieldBundle failed after resolver selection.",
-        meta: { routed: "farmsFields", intent: "field_lookup_failed", debugFile: "/handlers/farmsFields.handler.js", bundleReason: b.reason }
+        meta: {
+          routed: "farmsFields",
+          intent: "field_lookup_failed",
+          debugFile: "/handlers/farmsFields.handler.js",
+          bundleReason: b.reason,
+          contextDelta: { lastIntent: "field_lookup_failed", lastScope: { includeArchived: !!includeArchived } }
+        }
       };
     }
 
@@ -467,13 +590,31 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     return {
       ok: true,
       answer: parts.join("\n"),
-      meta: { routed: "farmsFields", intent: "field_lookup", fieldId: b.fieldId, confidence: res.confidence || null }
+      meta: {
+        routed: "farmsFields",
+        intent: "field_lookup",
+        fieldId: b.fieldId,
+        confidence: res.confidence || null,
+        contextDelta: {
+          lastIntent: "field_lookup",
+          lastMetric: "field",
+          lastBy: "",
+          lastEntity: { type: "field", id: b.fieldId, name: f.name || b.fieldId },
+          lastScope: { includeArchived: !!includeArchived }
+        }
+      }
     };
   }
 
   return {
     ok: false,
     answer: "Please check /data/fieldData.js — resolver could not match this query.",
-    meta: { routed: "farmsFields", intent: "no_match", debugFile: "/data/fieldData.js", resolverDebug: res?.debug || null }
+    meta: {
+      routed: "farmsFields",
+      intent: "no_match",
+      debugFile: "/data/fieldData.js",
+      resolverDebug: res?.debug || null,
+      contextDelta: { lastIntent: "no_match", lastScope: { includeArchived: !!includeArchived } }
+    }
   };
 }
