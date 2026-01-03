@@ -1,23 +1,13 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-02-handler-fields-only3-totals
+// Rev: 2026-01-03-handler-followups1
 //
 // Farms + Fields handler only.
-// ✅ Adds County/State output for field lookups
-// ✅ Adds totals + breakdowns:
-//    - count fields (active vs incl archived)
-//    - tillable acres totals
-//    - HEL acres totals (hasHEL / helAcres)
-//    - CRP acres totals (hasCRP / crpAcres)
-//    - breakdown by farm
-//    - breakdown by county
+// CHANGE:
+// ✅ When router falls back (non farms/fields question), ask a targeted follow-up
+//    instead of generic help text.
+// ✅ When we can't resolve the field/farm/county intent, ask 1–2 clarifiers.
 //
-// Uses snapshot-only /data/fieldData.js helpers.
-//
-// Requires these exports from /data/fieldData.js:
-// - getSnapshotCollections(snapshot)
-// - tryResolveField({ snapshot, query, includeArchived })
-// - buildFieldBundle({ snapshot, fieldId })
-// - formatFieldOptionLine({ snapshot, fieldId })
+// Keeps all existing behavior for totals, by-farm, by-county, list fields, field lookup.
 
 'use strict';
 
@@ -44,13 +34,8 @@ function wantsAcres(q) {
   return q.includes("acres") || q.includes("tillable") || q.includes("acre");
 }
 
-function wantsHel(q) {
-  return q.includes("hel");
-}
-
-function wantsCrp(q) {
-  return q.includes("crp");
-}
+function wantsHel(q) { return q.includes("hel"); }
+function wantsCrp(q) { return q.includes("crp"); }
 
 function wantsByFarm(q) {
   return q.includes("by farm") || (q.includes("farm") && (q.includes("breakdown") || q.includes("totals") || q.includes("total")));
@@ -65,14 +50,12 @@ function wantsList(q) {
 }
 
 function extractFarmNameGuess(raw) {
-  // heuristic: "... on <farm>" or "... in <farm>" at end
   const m = String(raw || "").match(/\b(?:on|in)\s+([a-z0-9][a-z0-9\s\-\._]{1,60})$/i);
   if (!m) return "";
   return (m[1] || "").toString().trim();
 }
 
 function extractCountyGuess(raw) {
-  // Supports: "in Pike county", "Pike county", "county Pike"
   const s = String(raw || "").trim();
 
   let m = s.match(/\bin\s+([A-Za-z][A-Za-z\s\-]{2,})\s+county\b/i);
@@ -154,7 +137,6 @@ function buildTotals({ cols, includeArchived }) {
 }
 
 function totalsByFarm({ cols, includeArchived }) {
-  // farmId -> { name, fields, tillable, hel, crp }
   const map = new Map();
 
   for (const [, f] of Object.entries(cols.fields || {})) {
@@ -186,7 +168,6 @@ function totalsByFarm({ cols, includeArchived }) {
 }
 
 function totalsByCounty({ cols, includeArchived }) {
-  // "County, ST" -> { fields, tillable, hel, crp }
   const map = new Map();
 
   for (const [, f] of Object.entries(cols.fields || {})) {
@@ -212,7 +193,64 @@ function totalsByCounty({ cols, includeArchived }) {
   return arr;
 }
 
-export async function handleFarmsFields({ question, snapshot, user, includeArchived = false }) {
+/* -----------------------
+   Follow-up intent helpers
+----------------------- */
+function detectOtherDomain(q) {
+  const s = norm(q);
+  if (s.includes("rtk") || s.includes("tower") || s.includes("frequency") || s.includes("network id")) return "rtk";
+  if (s.includes("grain bag") || s.includes("grain") || s.includes("putdown") || s.includes("pickup") || s.includes("ticket")) return "grain";
+  if (s.includes("contract") || s.includes("basis") || s.includes("delivery")) return "contracts";
+  if (s.includes("equipment") || s.includes("tractor") || s.includes("combine") || s.includes("sprayer")) return "equipment";
+  return "";
+}
+
+function followupForDomain(domain) {
+  if (domain === "rtk") {
+    return (
+      `Are you asking about **RTK towers**?\n` +
+      `If yes, tell me which you want:\n` +
+      `• "How many RTK towers do we use?"\n` +
+      `• "What farms/fields use the Girard tower?"\n` +
+      `• "What tower is 0801-Lloyd N340 assigned to?"`
+    );
+  }
+  if (domain === "grain") {
+    return (
+      `Are you asking about **grain bags / grain events**?\n` +
+      `If yes, say:\n` +
+      `• "Grain bag events last 5"\n` +
+      `• "Show grain bags on <farm>"\n` +
+      `• "How many bags are full right now?"`
+    );
+  }
+  if (domain === "contracts") {
+    return (
+      `Are you asking about **grain contracts / basis / delivery**?\n` +
+      `If yes, tell me:\n` +
+      `• elevator (ADM Quincy, etc.)\n` +
+      `• crop (corn/soybeans)\n` +
+      `• delivery month (Dec/Jan/Feb, etc.)`
+    );
+  }
+  if (domain === "equipment") {
+    return (
+      `Are you asking about **equipment**?\n` +
+      `If yes, tell me the type (tractor/combine/sprayer) and the name/unit number.`
+    );
+  }
+  return (
+    `Quick check — what are you trying to look up?\n` +
+    `• farms / fields\n` +
+    `• counties / acres totals\n` +
+    `• RTK towers\n` +
+    `• grain bags\n` +
+    `• contracts\n` +
+    `• equipment`
+  );
+}
+
+export async function handleFarmsFields({ question, snapshot, user, includeArchived = false, meta = {} }) {
   const cols = getSnapshotCollections(snapshot);
   if (!cols.ok) {
     return {
@@ -223,6 +261,16 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   }
 
   const q = norm(question);
+
+  // If router fell back (not clearly farms/fields), ask a targeted follow-up instead of a dumb refusal/help dump.
+  if (meta?.routerFallback) {
+    const domain = detectOtherDomain(q);
+    return {
+      ok: true,
+      answer: followupForDomain(domain),
+      meta: { routed: "farmsFields", intent: "followup_router_fallback", routerReason: meta.routerReason || "fallback", domain: domain || null }
+    };
+  }
 
   // -----------------------
   // A) TOTALS / BREAKDOWNS
@@ -235,13 +283,11 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     q.includes("totals") ||
     q.includes("breakdown");
 
-  // County-specific list/count (e.g. "acres in Macoupin county", "fields in Pike county")
   const countyGuess = extractCountyGuess(question);
   const farmGuessForTotals = extractFarmNameGuess(question);
   const farmGuessHit = farmGuessForTotals ? findFarmByName(cols, farmGuessForTotals) : null;
 
   if (askedTotals && (wantsByFarm(q) || wantsByCounty(q) || q.includes("county") || q.includes("farm") || q.includes("fields") || q.includes("acres") || wantsHel(q) || wantsCrp(q))) {
-    // If they ask "by farm" explicitly
     if (wantsByFarm(q)) {
       const arr = totalsByFarm({ cols, includeArchived });
       const top = arr.slice(0, 10);
@@ -256,7 +302,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_by_farm" } };
     }
 
-    // If they ask "by county" explicitly
     if (wantsByCounty(q)) {
       const arr = totalsByCounty({ cols, includeArchived });
       const top = arr.slice(0, 10);
@@ -271,7 +316,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_by_county" } };
     }
 
-    // If they ask totals for a specific farm name (e.g. "Farm totals for Illiopolis-MtAuburn")
     if (farmGuessHit && (q.includes("farm") || q.includes("totals") || q.includes("acres") || q.includes("fields") || wantsHel(q) || wantsCrp(q))) {
       const farmId = farmGuessHit.id;
       let fields = 0, tillable = 0, hel = 0, crp = 0;
@@ -299,7 +343,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    // If they ask totals for a specific county (e.g. "acres in Macoupin county")
     if (countyGuess && q.includes("county")) {
       const needle = norm(countyGuess);
       let fields = 0, tillable = 0, hel = 0, crp = 0;
@@ -342,10 +385,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    // Otherwise: overall totals (fields/acres/hel/crp)
     const t = buildTotals({ cols, includeArchived });
 
-    // If they ONLY asked for fields count, keep it short.
     if (wantsCount(q) && q.includes("field") && !wantsAcres(q) && !wantsHel(q) && !wantsCrp(q)) {
       if (includeArchived) {
         const archived = t.fieldsTotal - t.fieldsActive;
@@ -362,7 +403,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       };
     }
 
-    // Full totals line set
     const lines = [];
     lines.push(`Totals (${includeArchived ? "incl archived" : "active only"}):`);
     lines.push(`Fields: ${fmtInt(includeArchived ? t.fieldsTotal : t.fieldsActive)}`);
@@ -383,8 +423,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     if (!farm) {
       return {
         ok: true,
-        answer: `I couldn’t find that farm name. Try: "List fields on Illiopolis-MtAuburn" or use the exact farm name.`,
-        meta: { routed: "farmsFields", intent: "list_fields_on_farm", farmGuess }
+        answer: `Which farm? (Use the exact farm name.) Example: "List fields on Illiopolis-MtAuburn"`,
+        meta: { routed: "farmsFields", intent: "followup_need_farm_name", farmGuess }
       };
     }
 
@@ -483,15 +523,16 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     };
   }
 
+  // Final fallback: ask a follow-up (NOT a static help dump)
   return {
     ok: true,
     answer:
-      `I can help with farms and fields. Try:\n` +
-      `• "How many active fields do we have?"\n` +
-      `• "Totals acres (tillable/HEL/CRP)"\n` +
-      `• "Farm totals by farm"\n` +
-      `• "County totals by county"\n` +
-      `• "What county is 0801-Lloyd N340 in?"`,
-    meta: { routed: "farmsFields", intent: "help" }
+      `I’m not sure what you meant.\n` +
+      `Do you want:\n` +
+      `• a field lookup (example: "0801-Lloyd N340")\n` +
+      `• totals (example: "Total tillable acres")\n` +
+      `• a breakdown (example: "County totals by county")\n` +
+      `• list fields on a farm (example: "List fields on Lov Shack")`,
+    meta: { routed: "farmsFields", intent: "followup_unclear" }
   };
 }
