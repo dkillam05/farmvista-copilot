@@ -1,14 +1,11 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-03-handler-followups2
+// Rev: 2026-01-03-handler-autopick-debug1
 //
-// Farms + Fields handler only.
 // CHANGE:
-// ✅ When router falls back (non farms/fields question), ask a targeted follow-up
-//    instead of generic help text.
-// ✅ When we can't resolve the field/farm/county intent, ask 1–2 clarifiers.
-// ✅ IMPORTANT: disambiguation now returns candidates as [{ id, label }] so router resolver-state works.
-//
-// Keeps all existing behavior for totals, by-farm, by-county, list fields, field lookup.
+// ✅ Never show 3-choice list to the user.
+// ✅ If resolver returns alternates/ambiguous, we still answer immediately (auto-picked),
+//    and we include a short one-line note only when ambiguity is high.
+// ✅ If we truly can't answer, we return: "Please check <file>" so you know what to inspect.
 
 'use strict';
 
@@ -27,28 +24,18 @@ function isActiveStatus(s) {
   return v !== "archived" && v !== "inactive";
 }
 
-function wantsCount(q) {
-  return q.includes("how many") || q.includes("count") || q.includes("total") || q.includes("number of");
-}
-
-function wantsAcres(q) {
-  return q.includes("acres") || q.includes("tillable") || q.includes("acre");
-}
-
+function wantsCount(q) { return q.includes("how many") || q.includes("count") || q.includes("total") || q.includes("number of"); }
+function wantsAcres(q) { return q.includes("acres") || q.includes("tillable") || q.includes("acre"); }
 function wantsHel(q) { return q.includes("hel"); }
 function wantsCrp(q) { return q.includes("crp"); }
 
 function wantsByFarm(q) {
   return q.includes("by farm") || (q.includes("farm") && (q.includes("breakdown") || q.includes("totals") || q.includes("total")));
 }
-
 function wantsByCounty(q) {
   return q.includes("by county") || q.includes("county totals") || (q.includes("county") && (q.includes("breakdown") || q.includes("totals") || q.includes("total")));
 }
-
-function wantsList(q) {
-  return q.includes("list") || q.includes("show");
-}
+function wantsList(q) { return q.includes("list") || q.includes("show"); }
 
 function extractFarmNameGuess(raw) {
   const m = String(raw || "").match(/\b(?:on|in)\s+([a-z0-9][a-z0-9\s\-\._]{1,60})$/i);
@@ -256,20 +243,19 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   if (!cols.ok) {
     return {
       ok: false,
-      answer: "Snapshot not loaded (missing farms/fields).",
-      meta: { routed: "farmsFields", reason: cols.reason }
+      answer: "Please check /data/fieldData.js — snapshot collections not loaded.",
+      meta: { routed: "farmsFields", reason: cols.reason, debug: { file: "/handlers/farmsFields.handler.js", step: "getSnapshotCollections_failed" } }
     };
   }
 
   const q = norm(question);
 
-  // If router fell back (not clearly farms/fields), ask a targeted follow-up instead of a dumb refusal/help dump.
   if (meta?.routerFallback) {
     const domain = detectOtherDomain(q);
     return {
       ok: true,
       answer: followupForDomain(domain),
-      meta: { routed: "farmsFields", intent: "followup_router_fallback", routerReason: meta.routerReason || "fallback", domain: domain || null }
+      meta: { routed: "farmsFields", intent: "followup_router_fallback", routerReason: meta.routerReason || "fallback", domain: domain || null, debug: { file: "/handlers/farmsFields.handler.js", step: "routerFallback" } }
     };
   }
 
@@ -424,8 +410,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     if (!farm) {
       return {
         ok: true,
-        answer: `Which farm? (Use the exact farm name.) Example: "List fields on Illiopolis-MtAuburn"`,
-        meta: { routed: "farmsFields", intent: "followup_need_farm_name", farmGuess }
+        answer: `Please check /handlers/farmsFields.handler.js — couldn't extract farm name from your question.`,
+        meta: { routed: "farmsFields", intent: "followup_need_farm_name", farmGuess, debug: { file: "/handlers/farmsFields.handler.js", step: "extractFarmNameGuess" } }
       };
     }
 
@@ -469,8 +455,8 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     if (!b.ok) {
       return {
         ok: true,
-        answer: "Found the field id but could not load details.",
-        meta: { routed: "farmsFields", intent: "field_lookup", reason: b.reason }
+        answer: "Please check /data/fieldData.js — resolver returned a fieldId but bundle load failed.",
+        meta: { routed: "farmsFields", intent: "field_lookup", reason: b.reason, debug: { file: "/handlers/farmsFields.handler.js", step: "buildFieldBundle_failed", bundleReason: b.reason, resolverDebug: res.debug || null } }
       };
     }
 
@@ -498,6 +484,11 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     if (hasHEL) parts.push(`HEL acres: ${fmtAcre(helAcres)}`);
     if (hasCRP) parts.push(`CRP acres: ${fmtAcre(crpAcres)}`);
 
+    // ✅ only show a minimal note when ambiguity is high
+    if (res.ambiguous) {
+      parts.push(`(Auto-selected best match — if wrong, be more specific like "0411-Stone Seed".)`);
+    }
+
     return {
       ok: true,
       answer: parts.join("\n"),
@@ -507,42 +498,20 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
         fieldId: b.fieldId,
         confidence: res.confidence || null,
         county: county || null,
-        state: state || null
+        state: state || null,
+        debug: {
+          file: "/handlers/farmsFields.handler.js",
+          step: "field_lookup_success",
+          resolverDebug: res.debug || null
+        }
       }
     };
   }
 
-  if (res.ok && res.resolved === false && Array.isArray(res.candidates) && res.candidates.length) {
-    const candidateObjs = res.candidates.map(c => {
-      const fieldId = (c?.fieldId || "").toString();
-      const label = formatFieldOptionLine({ snapshot, fieldId }) || fieldId;
-      return { id: fieldId, label };
-    }).filter(x => x.id);
-
-    const lines = candidateObjs.map(c => `• ${c.label}`).join("\n");
-
-    return {
-      ok: true,
-      answer: `I found a few close matches. Which one did you mean?\n${lines}`,
-      action: { type: "pick", choices: candidateObjs },
-      meta: {
-        routed: "farmsFields",
-        intent: "field_disambiguation",
-        candidates: candidateObjs
-      }
-    };
-  }
-
-  // Final fallback: ask a follow-up (NOT a static help dump)
+  // If resolver truly found nothing
   return {
     ok: true,
-    answer:
-      `I’m not sure what you meant.\n` +
-      `Do you want:\n` +
-      `• a field lookup (example: "0801-Lloyd N340")\n` +
-      `• totals (example: "Total tillable acres")\n` +
-      `• a breakdown (example: "County totals by county")\n` +
-      `• list fields on a farm (example: "List fields on Lov Shack")`,
-    meta: { routed: "farmsFields", intent: "followup_unclear" }
+    answer: "Please check /data/fieldData.js — no resolver matches for that query.",
+    meta: { routed: "farmsFields", intent: "followup_unclear", debug: { file: "/handlers/farmsFields.handler.js", step: "resolver_no_match", resolverDebug: res.debug || null } }
   };
 }
