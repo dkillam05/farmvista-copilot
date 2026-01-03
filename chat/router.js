@@ -1,7 +1,8 @@
 // /chat/router.js  (FULL FILE)
-// Rev: 2026-01-02-router-fields-only1
+// Rev: 2026-01-02-router-fields-only2-county
 //
 // Deterministic router: only one category right now (farms + fields).
+// ✅ Added county/state keywords so county questions route to farmsFields handler.
 // Everything else => "not wired yet" message.
 
 'use strict';
@@ -22,6 +23,8 @@ const FF_TERMS = [
   "field", "fields", "tillable", "acres", "fieldid", "farmid",
   // farms
   "farm", "farms",
+  // geography (fields are tied to counties/states)
+  "county", "counties", "state", "where is", "location",
   // status
   "archived", "inactive", "active",
   // counting / listing
