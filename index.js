@@ -1,5 +1,5 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-03-min-core3-router2-snapshotbuild-summaryall
+// Rev: 2026-01-03a-min-core3-router2-snapshotbuild-summaryall
 //
 // Adds (unchanged):
 // ✅ /context/summary   (UPDATED: now reports ALL snapshot collections + counts)
