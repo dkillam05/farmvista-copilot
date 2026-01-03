@@ -1,18 +1,31 @@
 // /chat/router.js  (FULL FILE)
-// Rev: 2026-01-03-router-followups4-fieldshape
+// Rev: 2026-01-03-router-field-first-final
 //
-// Deterministic router: farms + fields is the only handler today.
-// Adds resolver-state support so "first one" / "2" / exact option label
-// can finalize a prior disambiguation list instead of re-running fuzzy match.
-// CHANGE:
-// ✅ If input looks like a field ID or field name, always route to farms/fields
-//    even if no explicit keywords are present.
+// Deterministic router.
+// CHANGE (FINAL):
+// ✅ ALWAYS try farms/fields first.
+// ✅ Only show category follow-up if farms/fields explicitly falls back.
+// This fixes inputs like:
+//   "Stone Seed"
+//   "0801-Lloyd N340"
+//   "0110"
+//   without keyword guessing or pattern hacks.
 
 'use strict';
 
 import { handleFarmsFields } from "../handlers/farmsFields.handler.js";
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
+
+function detectIncludeArchived(q) {
+  if (q.includes("archived") || q.includes("inactive")) return true;
+  if (q.includes("active only") || q.includes("only active")) return false;
+  return false;
+}
+
+/* =====================================================================
+   Resolver state helpers (UNCHANGED)
+===================================================================== */
 
 function hasAny(q, terms) {
   for (const t of terms) {
@@ -21,22 +34,6 @@ function hasAny(q, terms) {
   return false;
 }
 
-const FF_TERMS = [
-  // fields
-  "field", "fields", "tillable", "acres", "fieldid", "farmid",
-  // farms
-  "farm", "farms",
-  // geography
-  "county", "counties", "state", "where is", "location",
-  // status
-  "archived", "inactive", "active",
-  // counting / listing
-  "how many", "count", "total", "number of", "list", "show", "find", "lookup", "search",
-  // phrasing
-  "which farm", "what farm", "on farm", "in farm"
-];
-
-// "soft" terms to help the handler ask better follow-ups
 const SOFT_TERMS = [
   "rtk", "tower", "towers", "base station", "frequency", "network id",
   "grain", "bag", "bags", "putdown", "pickup", "ticket", "elevator",
@@ -44,41 +41,8 @@ const SOFT_TERMS = [
   "equipment", "tractor", "combine", "sprayer", "implement"
 ];
 
-function detectIncludeArchived(q) {
-  if (q.includes("archived") || q.includes("inactive")) return true;
-  if (q.includes("active only") || q.includes("only active")) return false;
-  return false; // default: active-only
-}
-
-/* =====================================================================
-   NEW: field-shaped query detection
-   Catches inputs like:
-   - "0801-Lloyd N340"
-   - "0110"
-   - "Stone Seed"
-===================================================================== */
-function looksLikeFieldQuery(q) {
-  if (!q) return false;
-
-  // numeric field ids
-  if (/\b\d{3,4}\b/.test(q)) return true;
-
-  // id-name patterns (0801-Name / 0801 Name)
-  if (/\b\d{3,4}[-\s][a-z]/i.test(q)) return true;
-
-  // common field-name patterns with numbers
-  if (/[a-z]{3,}\s+\d{2,4}/i.test(q)) return true;
-
-  return false;
-}
-
-/* =====================================================================
-   Resolver state helpers
-===================================================================== */
-
 function coerceCandidatesFromResponse(r) {
   const out = [];
-
   const m = r?.meta || {};
   const a = r?.action || {};
 
@@ -149,7 +113,7 @@ function pickCandidateFromUserText(q, candidates) {
 }
 
 /* =====================================================================
-   Router
+   Router (FINAL LOGIC)
 ===================================================================== */
 
 export async function routeQuestion({ question, snapshot, user, state = null }) {
@@ -165,7 +129,7 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     };
   }
 
-  // Resolver follow-up path
+  // 1️⃣ Resolver follow-up path (UNCHANGED)
   if (state && state.mode === "pick_field" && Array.isArray(state.candidates) && state.candidates.length) {
     const picked = pickCandidateFromUserText(q, state.candidates);
 
@@ -199,52 +163,13 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
 
   const includeArchived = detectIncludeArchived(q);
 
-  // ✅ PRIMARY farms/fields route
-  if (hasAny(q, FF_TERMS) || looksLikeFieldQuery(q)) {
-    const r = await handleFarmsFields({
-      question: raw,
-      snapshot,
-      user,
-      includeArchived,
-      meta: {
-        routerFallback: false,
-        routerReason: hasAny(q, FF_TERMS) ? "ff_keyword" : "ff_field_shape"
-      }
-    });
-
-    const candidates = coerceCandidatesFromResponse(r);
-    if (candidates.length) {
-      return {
-        ok: r?.ok !== false,
-        answer: r?.answer,
-        action: r?.action || null,
-        meta: r?.meta || {},
-        state: { mode: "pick_field", candidates, includeArchived }
-      };
-    }
-
-    return {
-      ok: r?.ok !== false,
-      answer: r?.answer,
-      action: r?.action || null,
-      meta: r?.meta || {},
-      state: null
-    };
-  }
-
-  // Fallback routing
-  const softHit = hasAny(q, SOFT_TERMS);
-
+  // 2️⃣ ALWAYS try farms/fields first
   const r = await handleFarmsFields({
     question: raw,
     snapshot,
     user,
     includeArchived,
-    meta: {
-      routerFallback: true,
-      routerReason: softHit ? "soft_match_other_domain" : "no_match",
-      softHit: softHit || false
-    }
+    meta: { routerFallback: false, routerReason: "always_try_ff" }
   });
 
   const candidates = coerceCandidatesFromResponse(r);
@@ -258,11 +183,18 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     };
   }
 
-  return {
-    ok: r?.ok !== false,
-    answer: r?.answer,
-    action: r?.action || null,
-    meta: r?.meta || {},
-    state: null
-  };
+  // 3️⃣ Only now do category fallback
+  const softHit = hasAny(q, SOFT_TERMS);
+
+  return await handleFarmsFields({
+    question: raw,
+    snapshot,
+    user,
+    includeArchived,
+    meta: {
+      routerFallback: true,
+      routerReason: softHit ? "soft_match_other_domain" : "no_match",
+      softHit: softHit || false
+    }
+  });
 }
