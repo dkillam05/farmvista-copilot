@@ -1,17 +1,9 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-03-handleChat-conversation1
+// Rev: 2026-01-03-handleChat-conversation2-continuation
 //
-// Chat entry point:
-// - validates snapshot is loaded
-// - generates/returns threadId (backend-owned if not provided)
-// - checks global paging followups BEFORE routing (more/rest/all)
-// - checks global conversational followups BEFORE routing (same thing but CRP/by county/etc.)
-// - routes question
-// - stores global continuation + contextDelta
-//
-// IMPORTANT:
-// - Must export NAMED function: handleChat
-//   because index.js imports: import { handleChat } from "./chat/handleChat.js";
+// CHANGE:
+// ✅ Accepts `continuation` in request body and seeds /chat/followups.js store.
+// This makes paging work across Cloud Run instances.
 
 'use strict';
 
@@ -42,7 +34,8 @@ export async function handleChat({
   snapshot,
   authHeader = "",
   state = null,
-  threadId = ""
+  threadId = "",
+  continuation = null
 }) {
   const qRaw = safeStr(question);
   const tid = safeStr(threadId) || makeThreadId();
@@ -72,10 +65,19 @@ export async function handleChat({
   const token = extractBearer(authHeader);
   const user = token ? { hasAuth: true } : null;
 
-  // 0) Load per-thread context (may be null)
+  // If client sent a continuation, seed the followup store.
+  // This makes paging work even if this request hits a different Cloud Run instance.
+  try {
+    if (continuation && typeof continuation === "object") {
+      setContinuation(tid, continuation);
+    }
+  } catch {
+    // ignore
+  }
+
   const ctx = getThreadContext(tid) || {};
 
-  // 1) Paging follow-ups first (more/rest/all)
+  // 1) Paging follow-ups first
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
@@ -91,7 +93,7 @@ export async function handleChat({
     clearContinuation(tid);
   }
 
-  // 2) Conversational follow-ups (same thing but CRP/by county/etc.)
+  // 2) Conversational follow-ups
   let routedQuestion = qRaw;
   try {
     const interp = interpretFollowup({ question: qRaw, ctx });
@@ -99,15 +101,13 @@ export async function handleChat({
       routedQuestion = interp.rewriteQuestion;
       if (interp.contextDelta) applyContextDelta(tid, interp.contextDelta);
     }
-  } catch {
-    // do nothing; route raw question
-  }
+  } catch {}
 
   // 3) Route normally
   try {
     const r = await routeQuestion({ question: routedQuestion, snapshot, user, state });
 
-    // Store continuation (paging) if provided
+    // Store continuation if provided by handler
     const cont = r?.meta?.continuation || null;
     if (cont) setContinuation(tid, cont);
 
