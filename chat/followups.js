@@ -1,10 +1,9 @@
 // /chat/followups.js  (FULL FILE)
-// Rev: 2026-01-03-followups-global2-continuation
+// Rev: 2026-01-04-followups-global3-robust
 //
-// Global follow-up memory keyed by threadId.
-// IMPORTANT CHANGE:
-// ✅ tryHandleFollowup now returns meta.continuation (next page state) so the client can persist it.
-// This makes "show all / more" work even when Cloud Run routes to different instances.
+// CHANGE:
+// ✅ Recognize "show more" / "show me more" explicitly
+// ✅ Keep returning meta.continuation so client can persist it
 
 'use strict';
 
@@ -12,10 +11,7 @@ const TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const STORE = new Map(); // threadId -> { cont, exp }
 
 function nowMs() { return Date.now(); }
-
-function norm(s) {
-  return (s || "").toString().trim().toLowerCase();
-}
+function norm(s) { return (s || "").toString().trim().toLowerCase(); }
 
 function cleanExpired() {
   const t = nowMs();
@@ -55,15 +51,20 @@ function wantsMore(q) {
   const s = norm(q);
   if (!s) return false;
 
+  // exact
   if (s === "more" || s === "next" || s === "rest" || s === "remaining") return true;
-  if (s.includes("the rest")) return true;
+  if (s === "show more" || s === "show me more" || s === "more please") return true;
+
+  // contains / startswith
+  if (s.startsWith("more")) return true;
+  if (s.startsWith("next")) return true;
   if (s.includes("show more")) return true;
-  if (s.includes("more farms")) return true;
-  if (s.includes("more counties")) return true;
-  if (s.includes("the 11 more")) return true;
-  if (s.includes("the other")) return true;
+  if (s.includes("show me more")) return true;
+  if (s.includes("the rest")) return true;
   if (s.includes("keep going")) return true;
-  if (s.includes("11") && s.includes("more")) return true;
+
+  // "the 11 more"
+  if (s.includes("more") && /\b\d+\b/.test(s)) return true;
 
   return false;
 }
@@ -73,6 +74,8 @@ function wantsAll(q) {
   if (!s) return false;
 
   if (s === "all") return true;
+  if (s === "show all" || s === "list all" || s === "everything") return true;
+
   if (s.includes("show all")) return true;
   if (s.includes("list all")) return true;
   if (s.includes("all of them")) return true;
