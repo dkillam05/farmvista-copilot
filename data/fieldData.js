@@ -1,13 +1,13 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-03-fieldData-autopick-debug1
+// Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard
 //
 // Snapshot-only data access for farms / fields / rtkTowers.
-// CHANGE:
-// ✅ Never return 3-choice candidates to the user path.
-// ✅ Resolver ALWAYS returns the best match (top score) if any match exists.
-// ✅ Adds resolver debug hints in the return object (non-user-facing unless bubbled up).
+// CHANGE (requested):
+// ✅ Prevent auto-pick field resolution for obvious follow-up commands like:
+//    "show all", "all", "more", "next", "the rest", "remaining", etc.
+// This stops random field selections when the user is trying to page a list.
 //
-// Exports unchanged.
+// Everything else unchanged from your live file.
 
 'use strict';
 
@@ -47,6 +47,47 @@ function isActiveStatus(s) {
   const v = norm(s);
   if (!v) return true;
   return v !== "archived" && v !== "inactive";
+}
+
+/* =====================================================================
+   NEW: follow-up command guard
+   Prevents field resolver from treating paging commands as field queries.
+===================================================================== */
+function isFollowupCommandQuery(qRaw) {
+  const q = norm(qRaw);
+  if (!q) return false;
+
+  // exact common follow-up commands
+  const exact = new Set([
+    "more",
+    "next",
+    "rest",
+    "remaining",
+    "all",
+    "show all",
+    "list all",
+    "the rest",
+    "all of them",
+    "everything",
+    "keep going"
+  ]);
+  if (exact.has(q)) return true;
+
+  // common variants
+  if (q.includes("show all")) return true;
+  if (q.includes("list all")) return true;
+  if (q.includes("the rest")) return true;
+  if (q.includes("all of them")) return true;
+  if (q.includes("keep going")) return true;
+
+  // polite versions
+  if (q === "more please" || q === "next please" || q === "show all please") return true;
+
+  // starts-with versions
+  if (q.startsWith("more ")) return true;
+  if (q.startsWith("next ")) return true;
+
+  return false;
 }
 
 export function buildFieldBundle({ snapshot, fieldId }) {
@@ -127,6 +168,16 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query", debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "missing_query" } };
 
+  // ✅ NEW: Block obvious follow-up/paging commands from being interpreted as a field query
+  if (isFollowupCommandQuery(q)) {
+    return {
+      ok: true,
+      resolved: false,
+      candidates: [],
+      debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "blocked_followup_command" }
+    };
+  }
+
   // direct id
   if (cols.fields?.[q]) {
     return { ok: true, resolved: true, fieldId: q, confidence: 100, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "direct_id" } };
@@ -149,8 +200,7 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     return { ok: true, resolved: false, candidates: [], debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "no_matches" } };
   }
 
-  // ✅ NEW: ALWAYS pick the best match (top) and return it.
-  // We still compute ambiguity so upstream can warn/log, but we do NOT force a user choice list.
+  // ALWAYS pick the best match (top) and return it.
   const top = sug.matches[0];
   const second = sug.matches[1] || null;
 
@@ -165,7 +215,6 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     confidence: top.score,
     ambiguous: ambiguous,
     digitHit: digitHit,
-    // keep alternates for debugging (not for user UI)
     alternates: sug.matches.slice(0, 3).map(m => ({ fieldId: m.fieldId, score: m.score, name: m.name })),
     debug: {
       file: "/data/fieldData.js",
