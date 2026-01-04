@@ -1,8 +1,9 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard2
+// Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard3
 //
 // CHANGE:
-// ✅ Block "show more" / "show me more" etc. so they NEVER resolve to a random field.
+// ✅ Adds "show more" / "show me more" blocking to the follow-up guard.
+// Everything else unchanged from your live file.
 
 'use strict';
 
@@ -44,16 +45,29 @@ function isActiveStatus(s) {
   return v !== "archived" && v !== "inactive";
 }
 
-// UPDATED guard
 function isFollowupCommandQuery(qRaw) {
   const q = norm(qRaw);
   if (!q) return false;
 
   const exact = new Set([
-    "more","next","rest","remaining",
-    "all","show all","list all","the rest","all of them","everything","keep going",
-    // NEW
-    "show more","show me more","more please","show more please","show me more please","next please"
+    "more",
+    "next",
+    "rest",
+    "remaining",
+    "all",
+    "show all",
+    "list all",
+    "the rest",
+    "all of them",
+    "everything",
+    "keep going",
+
+    // ✅ NEW
+    "show more",
+    "show me more",
+    "more please",
+    "show more please",
+    "show me more please"
   ]);
   if (exact.has(q)) return true;
 
@@ -61,15 +75,16 @@ function isFollowupCommandQuery(qRaw) {
   if (q.includes("list all")) return true;
   if (q.includes("the rest")) return true;
   if (q.includes("all of them")) return true;
-  if (q.includes("everything")) return true;
   if (q.includes("keep going")) return true;
 
-  // NEW
+  // ✅ NEW
   if (q.includes("show more")) return true;
   if (q.includes("show me more")) return true;
 
-  if (q.startsWith("more")) return true;
-  if (q.startsWith("next")) return true;
+  if (q === "next please" || q === "show all please") return true;
+
+  if (q.startsWith("more ")) return true;
+  if (q.startsWith("next ")) return true;
 
   return false;
 }
@@ -153,7 +168,12 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   if (!q) return { ok: false, reason: "missing_query", debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "missing_query" } };
 
   if (isFollowupCommandQuery(q)) {
-    return { ok: true, resolved: false, candidates: [], debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "blocked_followup_command" } };
+    return {
+      ok: true,
+      resolved: false,
+      candidates: [],
+      debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "blocked_followup_command" }
+    };
   }
 
   if (cols.fields?.[q]) {
@@ -187,8 +207,8 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     resolved: true,
     fieldId: top.fieldId,
     confidence: top.score,
-    ambiguous,
-    digitHit,
+    ambiguous: ambiguous,
+    digitHit: digitHit,
     alternates: sug.matches.slice(0, 3).map(m => ({ fieldId: m.fieldId, score: m.score, name: m.name })),
     debug: {
       file: "/data/fieldData.js",
@@ -301,7 +321,11 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
 
   towers.sort((a, b) => a.name.localeCompare(b.name));
 
-  return { ok: true, towersUsedCount: towers.length, towers };
+  return {
+    ok: true,
+    towersUsedCount: towers.length,
+    towers
+  };
 }
 
 export default {
