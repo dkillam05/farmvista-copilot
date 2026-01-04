@@ -1,17 +1,11 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-03a-min-core3-router2-snapshotbuild-summaryall
+// Rev: 2026-01-04a-min-core3-router2-snapshotbuild-summaryall-chatthread
 //
-// Adds (unchanged):
-// ✅ /context/summary   (UPDATED: now reports ALL snapshot collections + counts)
-// ✅ /context/raw
-// ✅ /openai/health
+// CHANGE (Chat):
+// ✅ forwards threadId, continuation, and state from req.body into handleChat()
+// ✅ returns them back (already part of out), plus your existing meta enrichment
 //
-// Chat:
-// ✅ passes Authorization header through to handleChat
-// ✅ handleChat uses router/handlers
-//
-// Snapshot builder:
-// ✅ /snapshot/build
+// Everything else unchanged.
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
@@ -84,7 +78,6 @@ app.get("/context/summary", async (req, res) => {
     (root?.farms && root?.fields ? root : null) ||
     {};
 
-  // Build counts for ALL collections present in snapshot
   const counts = {};
   const preview = {};
 
@@ -111,7 +104,6 @@ app.get("/context/summary", async (req, res) => {
     const map = cols?.[name] || {};
     counts[name] = Object.keys(map).length;
 
-    // Collection-specific preview: show human-friendly names when common
     if (name === "farms") {
       preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
       continue;
@@ -125,14 +117,12 @@ app.get("/context/summary", async (req, res) => {
       continue;
     }
     if (name === "employees") {
-      // often { name, displayName, email }
       preview[name] = firstValues(map, PREVIEW_LIMIT)
         .map(x => (x?.name || x?.displayName || x?.email || "").toString())
         .filter(Boolean);
       continue;
     }
     if (name === "equipment") {
-      // common fields: name, unit, assetTag, makeModel
       preview[name] = firstValues(map, PREVIEW_LIMIT)
         .map(x => (x?.name || x?.unit || x?.assetTag || x?.makeModel || x?.model || "").toString())
         .filter(Boolean);
@@ -145,7 +135,6 @@ app.get("/context/summary", async (req, res) => {
       continue;
     }
 
-    // Default preview: doc IDs (always available)
     preview[name] = firstKeys(map, PREVIEW_LIMIT);
   }
 
@@ -232,8 +221,21 @@ app.post("/chat", async (req, res) => {
 
   const authHeader = (req.headers.authorization || "").toString();
 
+  // ✅ NEW: pass through these fields if present
+  const threadId = (req.body?.threadId || "").toString().trim();
+  const continuation = (req.body && typeof req.body.continuation === "object") ? req.body.continuation : null;
+  const state = (req.body && typeof req.body.state === "object") ? req.body.state : null;
+
   const snap = await loadSnapshot({ force: false });
-  const out = await handleChat({ question, snapshot: snap, authHeader });
+
+  const out = await handleChat({
+    question,
+    snapshot: snap,
+    authHeader,
+    threadId,
+    continuation,
+    state
+  });
 
   res.json({
     ...out,
