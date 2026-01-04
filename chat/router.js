@@ -36,7 +36,6 @@ const SOFT_TERMS = [
   "equipment", "tractor", "combine", "sprayer", "implement"
 ];
 
-// ✅ RTK detection terms (route to RTK handler first)
 const RTK_TERMS = [
   "rtk", "tower", "towers", "base station", "frequency", "network id"
 ];
@@ -113,7 +112,7 @@ function pickCandidateFromUserText(q, candidates) {
 }
 
 /* =====================================================================
-   Router
+   Router (FINAL LOGIC + RTK FIRST)
 ===================================================================== */
 
 export async function routeQuestion({ question, snapshot, user, state = null }) {
@@ -129,7 +128,7 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     };
   }
 
-  // 1) Resolver follow-up path (UNCHANGED) — stays farms/fields specific
+  // 1️⃣ Resolver follow-up path (UNCHANGED)
   if (state && state.mode === "pick_field" && Array.isArray(state.candidates) && state.candidates.length) {
     const picked = pickCandidateFromUserText(q, state.candidates);
 
@@ -163,9 +162,9 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
 
   const includeArchived = detectIncludeArchived(q);
 
-  // ✅ 2) RTK route FIRST (prevents farms/fields from eating RTK questions)
+  // ✅ RTK FIRST
   if (hasAny(q, RTK_TERMS)) {
-    const r = await handleRTK({
+    const rtk = await handleRTK({
       question: raw,
       snapshot,
       user,
@@ -174,15 +173,15 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     });
 
     return {
-      ok: r?.ok !== false,
-      answer: r?.answer,
-      action: r?.action || null,
-      meta: r?.meta || {},
+      ok: rtk?.ok !== false,
+      answer: rtk?.answer,
+      action: rtk?.action || null,
+      meta: rtk?.meta || {},
       state: null
     };
   }
 
-  // 3) ALWAYS try farms/fields next (your current behavior)
+  // 2️⃣ ALWAYS try farms/fields next
   const r = await handleFarmsFields({
     question: raw,
     snapshot,
@@ -202,7 +201,7 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     };
   }
 
-  // 4) Soft fallback (still goes to farms/fields; it will respond with debug, not menus)
+  // 3️⃣ Soft fallback (still goes to farms/fields)
   const softHit = hasAny(q, SOFT_TERMS);
 
   return await handleFarmsFields({
