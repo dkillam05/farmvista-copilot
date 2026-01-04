@@ -1,19 +1,10 @@
 // /chat/followups.js  (FULL FILE)
-// Rev: 2026-01-03-followups-global1
+// Rev: 2026-01-03-followups-global2-continuation
 //
 // Global follow-up memory keyed by threadId.
-// Stores a single "continuation" per thread:
-// - paging ("more", "next", "rest", "all", "remaining")
-// - no per-handler follow-up parsing
-//
-// Continuation shape:
-// {
-//   kind: "page",
-//   title: "Farm totals (active only):",
-//   lines: [ "• ...", ... ],
-//   offset: 0,
-//   pageSize: 10
-// }
+// IMPORTANT CHANGE:
+// ✅ tryHandleFollowup now returns meta.continuation (next page state) so the client can persist it.
+// This makes "show all / more" work even when Cloud Run routes to different instances.
 
 'use strict';
 
@@ -64,7 +55,6 @@ function wantsMore(q) {
   const s = norm(q);
   if (!s) return false;
 
-  // common followups
   if (s === "more" || s === "next" || s === "rest" || s === "remaining") return true;
   if (s.includes("the rest")) return true;
   if (s.includes("show more")) return true;
@@ -73,8 +63,6 @@ function wantsMore(q) {
   if (s.includes("the 11 more")) return true;
   if (s.includes("the other")) return true;
   if (s.includes("keep going")) return true;
-
-  // "can you tell me the 11 more farms"
   if (s.includes("11") && s.includes("more")) return true;
 
   return false;
@@ -96,7 +84,7 @@ function wantsAll(q) {
 function pageFromContinuation(cont, mode) {
   const lines = Array.isArray(cont?.lines) ? cont.lines : [];
   const title = (cont?.title || "").toString();
-  const pageSize = Math.max(5, Math.min(50, Number(cont?.pageSize) || 10));
+  const pageSize = Math.max(5, Math.min(80, Number(cont?.pageSize) || 10));
   let offset = Math.max(0, Number(cont?.offset) || 0);
 
   if (!lines.length) {
@@ -113,9 +101,7 @@ function pageFromContinuation(cont, mode) {
   }
 
   const remaining = Math.max(0, lines.length - offset);
-  const moreLine = remaining
-    ? `…plus ${remaining} more.`
-    : null;
+  const moreLine = remaining ? `…plus ${remaining} more.` : null;
 
   const out = [];
   if (title) out.push(title);
@@ -145,7 +131,11 @@ export function tryHandleFollowup({ threadId, question }) {
   const res = pageFromContinuation(cont, all ? "all" : "page");
   if (!res.ok) {
     clearContinuation(threadId);
-    return { ok: false, answer: res.answer, meta: { followup: true, source: "/chat/followups.js" } };
+    return {
+      ok: false,
+      answer: res.answer,
+      meta: { followup: true, source: "/chat/followups.js", continuation: null }
+    };
   }
 
   if (res.done) clearContinuation(threadId);
@@ -154,6 +144,11 @@ export function tryHandleFollowup({ threadId, question }) {
   return {
     ok: true,
     answer: res.answer,
-    meta: { followup: true, source: "/chat/followups.js", done: !!res.done }
+    meta: {
+      followup: true,
+      source: "/chat/followups.js",
+      done: !!res.done,
+      continuation: res.done ? null : res.next
+    }
   };
 }
