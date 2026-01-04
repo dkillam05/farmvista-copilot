@@ -1,11 +1,9 @@
 // /handlers/rtk.handler.js  (FULL FILE)
-// Rev: 2026-01-04-rtkHandler4-readable
+// Rev: 2026-01-04-rtkHandler5-fields-with
 //
 // CHANGE:
-// ✅ Much easier-to-read formatting (two-line bullets with indent)
-// ✅ Tower-specific questions still handled first
-// ✅ Summary list uses readable bullets
-// ✅ "fields for <tower>" triggers tower field list
+// ✅ Accept "fields with <tower> tower" / "fields with <tower>" phrasing
+// ✅ Uses robust lookup in /data/rtkData.js
 
 'use strict';
 
@@ -28,26 +26,39 @@ function wantsCount(q) {
   const s = norm(q);
   return s.includes("how many") || s.includes("how man") || s.includes("count") || s.includes("number of");
 }
-
 function wantsList(q) { const s = norm(q); return s.includes("list") || s.includes("show"); }
 function wantsFarms(q) { return norm(q).includes("farms"); }
 function wantsFields(q) { return norm(q).includes("fields"); }
 function wantsTillable(q) { const s = norm(q); return s.includes("tillable") || s.includes("acres"); }
 
+function towerBullet(t) {
+  const name = (t.name || t.towerId || "").toString();
+  const freq = (t.frequencyMHz || "").toString().trim();
+  const net  = (t.networkId != null ? String(t.networkId) : "").trim();
+  const fc   = fmtInt(t.fieldCount || 0);
+
+  const line1 = `• ${name} — ${fc} fields`;
+  const bits = [];
+  if (freq) bits.push(`${freq} MHz`);
+  if (net) bits.push(`Net ${net}`);
+  const line2 = bits.length ? `  ${bits.join(" • ")}` : "";
+  return line2 ? `${line1}\n${line2}` : line1;
+}
+
 function extractTowerNameGuess(raw) {
   const s = (raw || "").toString().trim();
   if (!s) return "";
 
-  // "Name: 18 fields • 464.05000 MHz • Net 4010"
+  // "Name: 18 fields ..."
   let m = s.match(/^\s*([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s*:\s*\d+\s*fields?\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "fields for Carlinville"
-  m = s.match(/\bfields\s+(?:for|on)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
+  // "fields with Carlinville"
+  m = s.match(/\bfields\s+(?:for|on|with)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
   if (m && m[1]) return m[1].trim();
 
   // "for the Carlinville tower"
-  m = s.match(/\b(?:use|uses|using|on|for|from|along\s+with)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
+  m = s.match(/\b(?:use|uses|using|on|for|from|with|along\s+with)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
   // "<name> tower"
@@ -81,25 +92,11 @@ function extractFieldGuess(raw) {
   return s;
 }
 
-function towerBullet(t) {
-  const name = (t.name || t.towerId || "").toString();
-  const freq = (t.frequencyMHz || "").toString().trim();
-  const net  = (t.networkId != null ? String(t.networkId) : "").trim();
-  const fc   = fmtInt(t.fieldCount || 0);
-
-  const line1 = `• ${name} — ${fc} fields`;
-  const bits = [];
-  if (freq) bits.push(`${freq} MHz`);
-  if (net) bits.push(`Net ${net}`);
-  const line2 = bits.length ? `  ${bits.join(" • ")}` : "";
-  return line2 ? `${line1}\n${line2}` : line1;
-}
-
 export async function handleRTK({ question, snapshot, user, includeArchived = false, meta = {} }) {
   const raw = (question || "").toString();
   const q = norm(raw);
 
-  // 1) Field -> tower assignment
+  // Field -> tower
   if ((q.includes("rtk") || q.includes("tower")) && (q.includes("assigned") || q.includes("what tower") || q.includes("which tower") || q.includes("does field"))) {
     const fieldGuess = extractFieldGuess(raw);
     const fs = getFieldTowerSummary({ snapshot, fieldQuery: fieldGuess, includeArchived });
@@ -119,14 +116,10 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     if (fs.tower?.frequencyMHz) lines.push(`Frequency: ${String(fs.tower.frequencyMHz)} MHz`);
     if (fs.tower?.networkId != null) lines.push(`Network ID: ${String(fs.tower.networkId)}`);
 
-    return {
-      ok: true,
-      answer: lines.join("\n"),
-      meta: { routed: "rtk", intent: "field_tower" }
-    };
+    return { ok: true, answer: lines.join("\n"), meta: { routed: "rtk", intent: "field_tower" } };
   }
 
-  // 2) Tower-specific (fields/farms/details)
+  // Tower-specific
   const towerGuess = extractTowerNameGuess(raw);
   if (towerGuess) {
     const lt = lookupTowerByName({ snapshot, towerName: towerGuess });
@@ -147,11 +140,11 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // Fields list (optionally include acres)
-    if (wantsFields(q) || q.includes("fields for") || q.includes("fields that use")) {
+    // fields list
+    if (wantsFields(q) || q.includes("fields for") || q.includes("fields with") || q.includes("fields that use")) {
       const includeTillable = wantsTillable(q);
-
       const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
+
       const lines = (usage.fields || []).map(f => {
         const base = `• ${f.name}${f.farmName ? ` (${f.farmName})` : ""}`;
         return includeTillable ? `${base}\n  ${fmtAcre(f.tillable || 0)} ac` : base;
@@ -170,15 +163,11 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       return {
         ok: true,
         answer: out.join("\n"),
-        meta: {
-          routed: "rtk",
-          intent: "tower_fields",
-          continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null
-        }
+        meta: { routed: "rtk", intent: "tower_fields", continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null }
       };
     }
 
-    // Farms list
+    // farms list
     if (wantsFarms(q)) {
       const title = `Farms using ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
       const lines = (usage.farms || []).map(f => `• ${f.name}`);
@@ -193,14 +182,10 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       out.push(...first);
       if (remaining > 0) out.push(`\n…plus ${remaining} more farms.`);
 
-      return {
-        ok: true,
-        answer: out.join("\n"),
-        meta: { routed: "rtk", intent: "tower_farms", continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null }
-      };
+      return { ok: true, answer: out.join("\n"), meta: { routed: "rtk", intent: "tower_farms", continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null } };
     }
 
-    // Default detail
+    // default detail
     const lines = [];
     lines.push(`RTK tower: ${usage.tower.name || usage.tower.id}`);
     if (usage.tower.frequencyMHz) lines.push(`Frequency: ${String(usage.tower.frequencyMHz)} MHz`);
@@ -211,15 +196,11 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     return { ok: true, answer: lines.join("\n"), meta: { routed: "rtk", intent: "tower_detail" } };
   }
 
-  // 3) Summary (towers used)
+  // Summary list
   if ((q.includes("rtk") || q.includes("tower")) && (wantsCount(q) || wantsList(q) || q.includes("towers do we use"))) {
     const s = summarizeTowersUsed({ snapshot, includeArchived });
     if (!s.ok) {
-      return {
-        ok: false,
-        answer: "Please check /data/rtkData.js — summarizeTowersUsed failed.",
-        meta: { routed: "rtk", intent: "rtk_summary_failed", reason: s.reason, debugFile: "/data/rtkData.js" }
-      };
+      return { ok: false, answer: "Please check /data/rtkData.js — summarizeTowersUsed failed.", meta: { routed: "rtk", intent: "rtk_summary_failed", reason: s.reason, debugFile: "/data/rtkData.js" } };
     }
 
     const title = `RTK towers used (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(s.towersUsedCount || 0)}`;
@@ -235,20 +216,8 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     out.push(...first);
     if (remaining > 0) out.push(`\n…plus ${remaining} more towers.`);
 
-    return {
-      ok: true,
-      answer: out.join("\n"),
-      meta: {
-        routed: "rtk",
-        intent: "rtk_towers_used",
-        continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null
-      }
-    };
+    return { ok: true, answer: out.join("\n"), meta: { routed: "rtk", intent: "rtk_towers_used", continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null } };
   }
 
-  return {
-    ok: false,
-    answer: "Please check /handlers/rtk.handler.js — RTK intent not recognized from this question.",
-    meta: { routed: "rtk", intent: "rtk_unrecognized", debugFile: "/handlers/rtk.handler.js" }
-  };
+  return { ok: false, answer: "Please check /handlers/rtk.handler.js — RTK intent not recognized from this question.", meta: { routed: "rtk", intent: "rtk_unrecognized", debugFile: "/handlers/rtk.handler.js" } };
 }
