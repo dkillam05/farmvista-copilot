@@ -1,13 +1,11 @@
 // /data/fieldData.js  (FULL FILE)
-// Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard
+// Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard2
 //
-// Snapshot-only data access for farms / fields / rtkTowers.
-// CHANGE (requested):
-// ✅ Prevent auto-pick field resolution for obvious follow-up commands like:
-//    "show all", "all", "more", "next", "the rest", "remaining", etc.
-// This stops random field selections when the user is trying to page a list.
+// CHANGE:
+// ✅ Block paging commands from being treated as field queries:
+//    show all / show more / show me more / more / next / rest / remaining / etc.
 //
-// Everything else unchanged from your live file.
+// Everything else is your current live file.
 
 'use strict';
 
@@ -50,14 +48,13 @@ function isActiveStatus(s) {
 }
 
 /* =====================================================================
-   NEW: follow-up command guard
+   UPDATED: follow-up command guard
    Prevents field resolver from treating paging commands as field queries.
 ===================================================================== */
 function isFollowupCommandQuery(qRaw) {
   const q = norm(qRaw);
   if (!q) return false;
 
-  // exact common follow-up commands
   const exact = new Set([
     "more",
     "next",
@@ -69,7 +66,16 @@ function isFollowupCommandQuery(qRaw) {
     "the rest",
     "all of them",
     "everything",
-    "keep going"
+    "keep going",
+
+    // ✅ NEW
+    "show more",
+    "show me more",
+    "more please",
+    "next please",
+    "show all please",
+    "show more please",
+    "show me more please"
   ]);
   if (exact.has(q)) return true;
 
@@ -78,14 +84,16 @@ function isFollowupCommandQuery(qRaw) {
   if (q.includes("list all")) return true;
   if (q.includes("the rest")) return true;
   if (q.includes("all of them")) return true;
+  if (q.includes("everything")) return true;
   if (q.includes("keep going")) return true;
 
-  // polite versions
-  if (q === "more please" || q === "next please" || q === "show all please") return true;
+  // ✅ NEW: show more variants
+  if (q.includes("show more")) return true;
+  if (q.includes("show me more")) return true;
 
   // starts-with versions
-  if (q.startsWith("more ")) return true;
-  if (q.startsWith("next ")) return true;
+  if (q.startsWith("more")) return true;
+  if (q.startsWith("next")) return true;
 
   return false;
 }
@@ -168,7 +176,7 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query", debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "missing_query" } };
 
-  // ✅ NEW: Block obvious follow-up/paging commands from being interpreted as a field query
+  // ✅ Block paging commands
   if (isFollowupCommandQuery(q)) {
     return {
       ok: true,
@@ -200,7 +208,6 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     return { ok: true, resolved: false, candidates: [], debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "no_matches" } };
   }
 
-  // ALWAYS pick the best match (top) and return it.
   const top = sug.matches[0];
   const second = sug.matches[1] || null;
 
