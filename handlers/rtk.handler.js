@@ -1,11 +1,16 @@
 // /handlers/rtk.handler.js  (FULL FILE)
-// Rev: 2026-01-04-rtkHandler2-specific-first
+// Rev: 2026-01-04-rtkHandler3-typos-acres-fieldid
 //
-// CHANGE:
-// ✅ Tower-specific requests (Carlinville tower, fields/farms on tower, tower details) are handled FIRST.
-// ✅ "RTK towers used" summary is handled LAST (so "list fields for Carlinville tower" doesn't get hijacked).
-// ✅ Accepts tower name from lines like: "Carlinville: 18 fields • 464.05000 MHz • Net 4010"
-// ✅ Supports paging via meta.continuation and contextDelta.
+// Fixes:
+// ✅ "how mans/how man" treated like "how many"
+// ✅ Better fieldId extraction: "what rtk tower does field 1915 use"
+// ✅ Tower fields list can include tillable acres (when query mentions tillable/acres)
+// ✅ Tower can report total tillable acres across its fields (when asked)
+//
+// Keeps:
+// ✅ tower-specific questions handled before summary
+// ✅ paging via meta.continuation
+// ✅ contextDelta so follow-ups can work
 
 'use strict';
 
@@ -18,24 +23,41 @@ import {
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
-function fmtInt(n) {
-  return Math.round(Number(n) || 0).toLocaleString();
+function fmtInt(n) { return Math.round(Number(n) || 0).toLocaleString(); }
+function fmtAcre(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 function wantsCount(q) {
-  return q.includes("how many") || q.includes("count") || q.includes("number of");
+  const s = norm(q);
+  // accept typos like "how man", "how mans"
+  if (s.includes("how many") || s.includes("how man")) return true;
+  if (s.includes("count") || s.includes("number of")) return true;
+  return false;
 }
 
 function wantsList(q) {
-  return q.includes("list") || q.includes("show");
+  const s = norm(q);
+  return s.includes("list") || s.includes("show");
 }
 
-function wantsFarms(q) {
-  return q.includes("farms");
+function wantsFarms(q) { return norm(q).includes("farms"); }
+function wantsFields(q) { return norm(q).includes("fields"); }
+
+function wantsTillable(q) {
+  const s = norm(q);
+  return s.includes("tillable") || s.includes("tillable acres");
 }
 
-function wantsFields(q) {
-  return q.includes("fields");
+function wantsTotalTillable(q) {
+  const s = norm(q);
+  // "tillable acres for the carlinville tower" should mean total, not per-field
+  if (!wantsTillable(s)) return false;
+  if (s.includes("total") || s.includes("sum")) return true;
+  if (s.includes("tillable acres for")) return true;
+  if (s.includes("acres for")) return true;
+  return false;
 }
 
 // Extract tower name from:
@@ -46,34 +68,53 @@ function extractTowerNameGuess(raw) {
   const s = (raw || "").toString().trim();
   if (!s) return "";
 
-  // If it's a "Name: 18 fields • 464.05000 MHz • Net 4010" style line
   let m = s.match(/^\s*([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s*:\s*\d+\s*fields?\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "for the Girard tower" / "on the Girard tower"
   m = s.match(/\b(?:use|uses|using|on|for|from|along\s+with)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "<name> tower"
   m = s.match(/\b([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "tower Girard"
   m = s.match(/\btower\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
+  if (m && m[1]) return m[1].trim();
+
+  // "fields for Carlinville"
+  m = s.match(/\bfields\s+(?:for|on)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
   if (m && m[1]) return m[1].trim();
 
   return "";
 }
 
+// Extract a field query from phrases like:
+// - "what rtk tower does field 1915 use"
+// - "rtk tower for 0801-Lloyd N340"
 function extractFieldGuess(raw) {
-  const s = (raw || "").toString().trim();
-  return s
-    .replace(/^what\s+rtk\s+tower\s+is\s+/i, "")
-    .replace(/^which\s+rtk\s+tower\s+is\s+/i, "")
-    .replace(/^what\s+tower\s+is\s+/i, "")
-    .replace(/^which\s+tower\s+is\s+/i, "")
-    .replace(/^rtk\s+tower\s+for\s+/i, "")
-    .trim();
+  const s0 = (raw || "").toString().trim();
+  if (!s0) return "";
+
+  let s = s0;
+
+  // normalize common prefixes
+  s = s.replace(/^what\s+rtk\s+tower\s+does\s+/i, "");
+  s = s.replace(/^what\s+rtk\s+tower\s+is\s+/i, "");
+  s = s.replace(/^which\s+rtk\s+tower\s+does\s+/i, "");
+  s = s.replace(/^which\s+rtk\s+tower\s+is\s+/i, "");
+  s = s.replace(/^rtk\s+tower\s+for\s+/i, "");
+  s = s.replace(/^tower\s+for\s+/i, "");
+
+  // If it contains "field <something>", capture the <something>
+  const m = s.match(/\bfield\s+([A-Za-z0-9][A-Za-z0-9\-\s\._]{0,80})/i);
+  if (m && m[1]) {
+    return m[1]
+      .replace(/\b(use|uses|using|assigned|on|for)\b.*$/i, "")
+      .trim();
+  }
+
+  // Strip trailing verbs
+  s = s.replace(/\b(use|uses|using|assigned|on|for)\b.*$/i, "").trim();
+  return s;
 }
 
 export async function handleRTK({ question, snapshot, user, includeArchived = false, meta = {} }) {
@@ -83,7 +124,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
   // -------------------------------------------------------------------
   // 1) Field -> tower assignment (specific)
   // -------------------------------------------------------------------
-  if ((q.includes("rtk") || q.includes("tower")) && (q.includes("assigned") || q.includes("what tower") || q.includes("which tower"))) {
+  if ((q.includes("rtk") || q.includes("tower")) && (q.includes("assigned") || q.includes("what tower") || q.includes("which tower") || q.includes("does field"))) {
     const fieldGuess = extractFieldGuess(raw);
     const fs = getFieldTowerSummary({ snapshot, fieldQuery: fieldGuess, includeArchived });
 
@@ -119,7 +160,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
   }
 
   // -------------------------------------------------------------------
-  // 2) Tower-specific questions (fields/farms/details) — MUST COME BEFORE summary
+  // 2) Tower-specific questions (fields/farms/details) — BEFORE summary
   // -------------------------------------------------------------------
   const towerGuess = extractTowerNameGuess(raw);
   if (towerGuess) {
@@ -141,10 +182,37 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // If user wants fields (or asked "list fields for ... tower")
-    if (wantsFields(q) || q.includes("list of fields") || q.includes("fields for")) {
+    // Total tillable acres on tower (sum)
+    if (wantsTotalTillable(q)) {
+      const totalTill = Number(usage.totals?.tillable || 0);
+      return {
+        ok: true,
+        answer:
+          `RTK tower: ${usage.tower.name || usage.tower.id}\n` +
+          `Total tillable acres (fields on tower): ${fmtAcre(totalTill)}\n` +
+          `Fields using tower: ${fmtInt(usage.counts?.fields || 0)}`,
+        meta: {
+          routed: "rtk",
+          intent: "tower_tillable_total",
+          contextDelta: {
+            lastIntent: "tower_tillable_total",
+            lastEntity: { type: "tower", id: usage.tower.id, name: usage.tower.name || usage.tower.id },
+            lastScope: { includeArchived: !!includeArchived }
+          }
+        }
+      };
+    }
+
+    // Fields list (optionally include tillable per field)
+    if (wantsFields(q) || q.includes("list of fields") || q.includes("fields for") || q.includes("fields that use")) {
+      const includeTillable = wantsTillable(q) || q.includes("include tillable") || q.includes("with acres");
+
       const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
-      const lines = (usage.fields || []).map(f => `• ${f.name}${f.farmName ? ` (${f.farmName})` : ""}`);
+      const lines = (usage.fields || []).map(f => {
+        const base = `• ${f.name}${f.farmName ? ` (${f.farmName})` : ""}`;
+        if (!includeTillable) return base;
+        return `${base} — ${fmtAcre(f.tillable || 0)} ac`;
+      });
 
       const pageSize = 40;
       const first = lines.slice(0, pageSize);
@@ -171,7 +239,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // If user wants farms
+    // Farms list
     if (wantsFarms(q) || q.includes("farms for") || q.includes("farms using")) {
       const title = `Farms using ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
       const lines = (usage.farms || []).map(f => `• ${f.name}`);
@@ -201,13 +269,16 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // Default: tower detail
+    // Default tower detail (include totals)
     const lines = [];
     lines.push(`RTK tower: ${usage.tower.name || usage.tower.id}`);
     if (usage.tower.frequencyMHz) lines.push(`Frequency: ${String(usage.tower.frequencyMHz)} MHz`);
     if (usage.tower.networkId != null) lines.push(`Network ID: ${String(usage.tower.networkId)}`);
     lines.push(`Fields using tower: ${fmtInt(usage.counts?.fields || 0)}`);
     lines.push(`Farms using tower: ${fmtInt(usage.counts?.farms || 0)}`);
+    if (usage.totals && typeof usage.totals.tillable === "number") {
+      lines.push(`Total tillable acres (fields on tower): ${fmtAcre(usage.totals.tillable)}`);
+    }
 
     return {
       ok: true,
