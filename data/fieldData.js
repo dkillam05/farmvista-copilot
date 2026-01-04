@@ -2,10 +2,7 @@
 // Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard2
 //
 // CHANGE:
-// ✅ Block paging commands from being treated as field queries:
-//    show all / show more / show me more / more / next / rest / remaining / etc.
-//
-// Everything else is your current live file.
+// ✅ Block "show more" / "show me more" etc. so they NEVER resolve to a random field.
 
 'use strict';
 
@@ -47,39 +44,19 @@ function isActiveStatus(s) {
   return v !== "archived" && v !== "inactive";
 }
 
-/* =====================================================================
-   UPDATED: follow-up command guard
-   Prevents field resolver from treating paging commands as field queries.
-===================================================================== */
+// UPDATED guard
 function isFollowupCommandQuery(qRaw) {
   const q = norm(qRaw);
   if (!q) return false;
 
   const exact = new Set([
-    "more",
-    "next",
-    "rest",
-    "remaining",
-    "all",
-    "show all",
-    "list all",
-    "the rest",
-    "all of them",
-    "everything",
-    "keep going",
-
-    // ✅ NEW
-    "show more",
-    "show me more",
-    "more please",
-    "next please",
-    "show all please",
-    "show more please",
-    "show me more please"
+    "more","next","rest","remaining",
+    "all","show all","list all","the rest","all of them","everything","keep going",
+    // NEW
+    "show more","show me more","more please","show more please","show me more please","next please"
   ]);
   if (exact.has(q)) return true;
 
-  // common variants
   if (q.includes("show all")) return true;
   if (q.includes("list all")) return true;
   if (q.includes("the rest")) return true;
@@ -87,11 +64,10 @@ function isFollowupCommandQuery(qRaw) {
   if (q.includes("everything")) return true;
   if (q.includes("keep going")) return true;
 
-  // ✅ NEW: show more variants
+  // NEW
   if (q.includes("show more")) return true;
   if (q.includes("show me more")) return true;
 
-  // starts-with versions
   if (q.startsWith("more")) return true;
   if (q.startsWith("next")) return true;
 
@@ -176,22 +152,14 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
   const q = (query || "").toString().trim();
   if (!q) return { ok: false, reason: "missing_query", debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "missing_query" } };
 
-  // ✅ Block paging commands
   if (isFollowupCommandQuery(q)) {
-    return {
-      ok: true,
-      resolved: false,
-      candidates: [],
-      debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "blocked_followup_command" }
-    };
+    return { ok: true, resolved: false, candidates: [], debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "blocked_followup_command" } };
   }
 
-  // direct id
   if (cols.fields?.[q]) {
     return { ok: true, resolved: true, fieldId: q, confidence: 100, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "direct_id" } };
   }
 
-  // exact name
   const qn = norm(q);
   for (const [id, f] of Object.entries(cols.fields || {})) {
     if (!includeArchived && !isActiveStatus(f?.status)) continue;
@@ -200,7 +168,6 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     }
   }
 
-  // scored suggestions
   const sug = suggestFields({ snapshot, query: q, includeArchived, limit: 5 });
   if (!sug.ok) return { ok: false, reason: sug.reason, debug: { file: "/data/fieldData.js", fn: "tryResolveField", step: "suggestFields_failed", detail: sug.reason } };
 
@@ -220,8 +187,8 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     resolved: true,
     fieldId: top.fieldId,
     confidence: top.score,
-    ambiguous: ambiguous,
-    digitHit: digitHit,
+    ambiguous,
+    digitHit,
     alternates: sug.matches.slice(0, 3).map(m => ({ fieldId: m.fieldId, score: m.score, name: m.name })),
     debug: {
       file: "/data/fieldData.js",
@@ -334,11 +301,7 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
 
   towers.sort((a, b) => a.name.localeCompare(b.name));
 
-  return {
-    ok: true,
-    towersUsedCount: towers.length,
-    towers
-  };
+  return { ok: true, towersUsedCount: towers.length, towers };
 }
 
 export default {
