@@ -1,9 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-03-handleChat-conversation2-continuation
+// Rev: 2026-01-04-handleChat-conversation3-normalize
 //
 // CHANGE:
-// ✅ Accepts `continuation` in request body and seeds /chat/followups.js store.
-// This makes paging work across Cloud Run instances.
+// ✅ Adds global input normalization via /chat/normalize.js
+//    - fixes common typos like "how mans"
+//    - normalizes paging commands like "show more" -> "more"
+// ✅ Normalization is applied BEFORE followups, interpreter, and routing.
+// ✅ Adds meta.normalized + meta.normalizedRules when a rewrite occurs.
+//
+// Keeps:
+// ✅ threadId / continuation passthrough
+// ✅ paging followups
+// ✅ conversation interpreter
+// ✅ contextDelta persistence
 
 'use strict';
 
@@ -12,6 +21,7 @@ import { routeQuestion } from "./router.js";
 import { tryHandleFollowup, setContinuation, clearContinuation } from "./followups.js";
 import { getThreadContext, applyContextDelta } from "./conversationStore.js";
 import { interpretFollowup } from "./followupInterpreter.js";
+import { normalizeQuestion } from "./normalize.js";
 
 function safeStr(v) {
   return (v == null ? "" : String(v)).trim();
@@ -37,10 +47,10 @@ export async function handleChat({
   threadId = "",
   continuation = null
 }) {
-  const qRaw = safeStr(question);
+  const qRaw0 = safeStr(question);
   const tid = safeStr(threadId) || makeThreadId();
 
-  if (!qRaw) {
+  if (!qRaw0) {
     return {
       ok: false,
       error: "missing_question",
@@ -62,11 +72,14 @@ export async function handleChat({
     };
   }
 
+  // ✅ Normalize input once, globally
+  const n = normalizeQuestion(qRaw0);
+  const qRaw = safeStr(n?.text || qRaw0);
+
   const token = extractBearer(authHeader);
   const user = token ? { hasAuth: true } : null;
 
   // If client sent a continuation, seed the followup store.
-  // This makes paging work even if this request hits a different Cloud Run instance.
   try {
     if (continuation && typeof continuation === "object") {
       setContinuation(tid, continuation);
@@ -77,7 +90,7 @@ export async function handleChat({
 
   const ctx = getThreadContext(tid) || {};
 
-  // 1) Paging follow-ups first
+  // 1) Paging follow-ups first (after normalization)
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
@@ -85,7 +98,11 @@ export async function handleChat({
         ok: fu?.ok !== false,
         answer: safeStr(fu?.answer) || "No response.",
         action: fu?.action || null,
-        meta: { ...(fu?.meta || {}), threadId: tid },
+        meta: {
+          ...(fu?.meta || {}),
+          threadId: tid,
+          ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
+        },
         state: state || null
       };
     }
@@ -93,7 +110,7 @@ export async function handleChat({
     clearContinuation(tid);
   }
 
-  // 2) Conversational follow-ups
+  // 2) Conversational follow-ups (same thing but CRP/by county/etc.)
   let routedQuestion = qRaw;
   try {
     const interp = interpretFollowup({ question: qRaw, ctx });
@@ -107,11 +124,9 @@ export async function handleChat({
   try {
     const r = await routeQuestion({ question: routedQuestion, snapshot, user, state });
 
-    // Store continuation if provided by handler
     const cont = r?.meta?.continuation || null;
     if (cont) setContinuation(tid, cont);
 
-    // Store contextDelta if provided
     const delta = r?.meta?.contextDelta || null;
     if (delta) applyContextDelta(tid, delta);
 
@@ -119,7 +134,12 @@ export async function handleChat({
       ok: r?.ok !== false,
       answer: safeStr(r?.answer) || "No response.",
       action: r?.action || null,
-      meta: { ...(r?.meta || {}), threadId: tid, routedQuestion: routedQuestion !== qRaw ? routedQuestion : undefined },
+      meta: {
+        ...(r?.meta || {}),
+        threadId: tid,
+        ...(routedQuestion !== qRaw ? { routedQuestion } : {}),
+        ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
+      },
       state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null)
     };
   } catch (e) {
@@ -128,7 +148,11 @@ export async function handleChat({
       error: "chat_failed",
       answer: "Sorry — the chat service hit an error.",
       action: null,
-      meta: { detail: safeStr(e?.message || e), threadId: tid },
+      meta: {
+        detail: safeStr(e?.message || e),
+        threadId: tid,
+        ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
+      },
       state: state || null
     };
   }
