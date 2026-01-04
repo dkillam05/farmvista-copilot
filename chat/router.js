@@ -1,19 +1,14 @@
 // /chat/router.js  (FULL FILE)
-// Rev: 2026-01-03-router-field-first-final
+// Rev: 2026-01-03-router-rtk1
 //
-// Deterministic router.
-// CHANGE (FINAL):
-// ✅ ALWAYS try farms/fields first.
-// ✅ Only show category follow-up if farms/fields explicitly falls back.
-// This fixes inputs like:
-//   "Stone Seed"
-//   "0801-Lloyd N340"
-//   "0110"
-//   without keyword guessing or pattern hacks.
+// CHANGE:
+// ✅ Route RTK questions to /handlers/rtk.handler.js BEFORE farms/fields.
+// Keeps existing resolver-state followups and farms/fields behavior.
 
 'use strict';
 
 import { handleFarmsFields } from "../handlers/farmsFields.handler.js";
+import { handleRTK } from "../handlers/rtk.handler.js";
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -39,6 +34,11 @@ const SOFT_TERMS = [
   "grain", "bag", "bags", "putdown", "pickup", "ticket", "elevator",
   "contract", "contracts", "basis", "delivery",
   "equipment", "tractor", "combine", "sprayer", "implement"
+];
+
+// ✅ RTK detection terms (route to RTK handler first)
+const RTK_TERMS = [
+  "rtk", "tower", "towers", "base station", "frequency", "network id"
 ];
 
 function coerceCandidatesFromResponse(r) {
@@ -113,7 +113,7 @@ function pickCandidateFromUserText(q, candidates) {
 }
 
 /* =====================================================================
-   Router (FINAL LOGIC)
+   Router
 ===================================================================== */
 
 export async function routeQuestion({ question, snapshot, user, state = null }) {
@@ -123,13 +123,13 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
   if (!q) {
     return {
       ok: true,
-      answer: 'Ask me something about a field or farm. Example: "How many active fields do we have?"',
+      answer: 'Ask me something about a field, farm, or RTK tower.',
       meta: { routed: "none", reason: "empty" },
       state: state || null
     };
   }
 
-  // 1️⃣ Resolver follow-up path (UNCHANGED)
+  // 1) Resolver follow-up path (UNCHANGED) — stays farms/fields specific
   if (state && state.mode === "pick_field" && Array.isArray(state.candidates) && state.candidates.length) {
     const picked = pickCandidateFromUserText(q, state.candidates);
 
@@ -163,7 +163,26 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
 
   const includeArchived = detectIncludeArchived(q);
 
-  // 2️⃣ ALWAYS try farms/fields first
+  // ✅ 2) RTK route FIRST (prevents farms/fields from eating RTK questions)
+  if (hasAny(q, RTK_TERMS)) {
+    const r = await handleRTK({
+      question: raw,
+      snapshot,
+      user,
+      includeArchived,
+      meta: { routerReason: "rtk_terms" }
+    });
+
+    return {
+      ok: r?.ok !== false,
+      answer: r?.answer,
+      action: r?.action || null,
+      meta: r?.meta || {},
+      state: null
+    };
+  }
+
+  // 3) ALWAYS try farms/fields next (your current behavior)
   const r = await handleFarmsFields({
     question: raw,
     snapshot,
@@ -183,7 +202,7 @@ export async function routeQuestion({ question, snapshot, user, state = null }) 
     };
   }
 
-  // 3️⃣ Only now do category fallback
+  // 4) Soft fallback (still goes to farms/fields; it will respond with debug, not menus)
   const softHit = hasAny(q, SOFT_TERMS);
 
   return await handleFarmsFields({
