@@ -1,14 +1,9 @@
 // /data/rtkData.js  (FULL FILE)
-// Rev: 2026-01-03-rtkData1
+// Rev: 2026-01-04-rtkData2-tillable
 //
-// Snapshot-only RTK helpers.
-// Reuses snapshot parsing + field resolver from /data/fieldData.js.
-//
-// Exports:
-// - lookupTowerByName({ snapshot, towerName })
-// - summarizeTowersUsed({ snapshot, includeArchived })
-// - getTowerUsage({ snapshot, towerId, includeArchived })
-// - getFieldTowerSummary({ snapshot, fieldQuery, includeArchived })
+// CHANGE:
+// ✅ getTowerUsage() now includes per-field tillable and totals.tillable
+// ✅ getFieldTowerSummary unchanged
 
 'use strict';
 
@@ -26,6 +21,11 @@ function isActiveStatus(s) {
   const v = norm(s);
   if (!v) return true;
   return v !== "archived" && v !== "inactive";
+}
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
 }
 
 export function lookupTowerByName({ snapshot, towerName }) {
@@ -49,6 +49,8 @@ export function getTowerUsage({ snapshot, towerId, includeArchived = false }) {
   const fields = [];
   const farmIds = new Set();
 
+  let totalTillable = 0;
+
   for (const [fieldId, f] of Object.entries(cols.fields || {})) {
     const active = isActiveStatus(f?.status);
     if (!includeArchived && !active) continue;
@@ -59,11 +61,15 @@ export function getTowerUsage({ snapshot, towerId, includeArchived = false }) {
     const farmId = (f?.farmId || "").toString().trim();
     if (farmId) farmIds.add(farmId);
 
+    const till = num(f?.tillable);
+    totalTillable += till;
+
     fields.push({
       fieldId,
       name: (f?.name || fieldId).toString(),
       farmId: farmId || null,
-      farmName: farmId ? (cols.farms?.[farmId]?.name || farmId).toString() : ""
+      farmName: farmId ? (cols.farms?.[farmId]?.name || farmId).toString() : "",
+      tillable: till
     });
   }
 
@@ -83,7 +89,8 @@ export function getTowerUsage({ snapshot, towerId, includeArchived = false }) {
     tower,
     farms,
     fields,
-    counts: { farms: farms.length, fields: fields.length }
+    counts: { farms: farms.length, fields: fields.length },
+    totals: { tillable: totalTillable }
   };
 }
 
@@ -108,6 +115,7 @@ export function getFieldTowerSummary({ snapshot, fieldQuery, includeArchived = f
     towerName: tower ? (tower.name || tower.id || "").toString() : "",
     tower: tower || null,
     confidence: res.confidence || null,
-    ambiguous: !!res.ambiguous
+    ambiguous: !!res.ambiguous,
+    debug: res.debug || null
   };
 }
