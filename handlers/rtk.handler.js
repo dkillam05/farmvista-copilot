@@ -2,17 +2,8 @@
 // Rev: 2026-01-03-rtkHandler1
 //
 // RTK towers handler.
-// Answers (examples):
-// - "How many RTK towers do we use?"
-// - "List RTK towers we use"
-// - "What RTK tower is 0801-Lloyd N340 assigned to?"
-// - "What farms use the Girard tower?"
-// - "Show fields on the Girard tower"
-//
-// Supports:
-// - paging via meta.continuation
-// - contextDelta for global follow-ups (same thing / show all / etc.)
-// No menus, no multi-choice.
+// Supports paging via meta.continuation and conversation via meta.contextDelta.
+// No menus, no multi-choice prompts.
 
 'use strict';
 
@@ -45,22 +36,15 @@ function wantsFields(q) {
   return q.includes("fields");
 }
 
-function wantsAssigned(q) {
-  return q.includes("assigned") || q.includes("assignment") || q.includes("on ") || q.includes("uses") || q.includes("using");
-}
-
 function extractTowerNameGuess(raw) {
   const s = (raw || "").toString().trim();
 
-  // "use the Girard tower" / "on the Girard tower"
   let m = s.match(/\b(?:use|uses|using|on|for|from)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "<name> tower"
   m = s.match(/\b([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
-  // "tower Girard"
   m = s.match(/\btower\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
   if (m && m[1]) return m[1].trim();
 
@@ -68,13 +52,15 @@ function extractTowerNameGuess(raw) {
 }
 
 function extractFieldGuess(raw) {
-  // naive: if it contains a 3–4 digit id or has a dash + letters, treat as field query string
   const s = (raw || "").toString().trim();
-  if (!s) return "";
-
-  // if question includes "field", strip leading words
-  const m = s.match(/(?:field\s+)?(.+)$/i);
-  return m ? (m[1] || "").trim() : s.trim();
+  // strip common prefixes like "what rtk tower is"
+  return s
+    .replace(/^what\s+rtk\s+tower\s+is\s+/i, "")
+    .replace(/^which\s+rtk\s+tower\s+is\s+/i, "")
+    .replace(/^what\s+tower\s+is\s+/i, "")
+    .replace(/^which\s+tower\s+is\s+/i, "")
+    .replace(/^rtk\s+tower\s+for\s+/i, "")
+    .trim();
 }
 
 export async function handleRTK({ question, snapshot, user, includeArchived = false, meta = {} }) {
@@ -92,21 +78,19 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // Build lines
     const lines = (s.towers || []).map(t => {
       const name = (t.name || t.towerId || "").toString();
       const freq = (t.frequencyMHz || "").toString().trim();
       const net = (t.networkId != null ? String(t.networkId) : "").trim();
-      const metaBits = [];
-      if (freq) metaBits.push(`${freq} MHz`);
-      if (net) metaBits.push(`Net ${net}`);
-      const metaStr = metaBits.length ? ` • ${metaBits.join(" • ")}` : "";
+      const bits = [];
+      if (freq) bits.push(`${freq} MHz`);
+      if (net) bits.push(`Net ${net}`);
+      const metaStr = bits.length ? ` • ${bits.join(" • ")}` : "";
       return `• ${name}: ${fmtInt(t.fieldCount)} fields${metaStr}`;
     });
 
     const title = `RTK towers used (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(s.towersUsedCount || lines.length)}`;
 
-    // Page
     const pageSize = 12;
     const first = lines.slice(0, pageSize);
     const remaining = lines.length - first.length;
@@ -122,19 +106,13 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       meta: {
         routed: "rtk",
         intent: "rtk_towers_used",
-        continuation: (remaining > 0) ? {
-          kind: "page",
-          title,
-          lines,
-          offset: pageSize,
-          pageSize
-        } : null,
+        continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null,
         contextDelta: { lastIntent: "rtk_towers_used", lastBy: "tower", lastScope: { includeArchived: !!includeArchived } }
       }
     };
   }
 
-  // 2) Field -> tower (assignment)
+  // 2) Field -> tower assignment
   if ((q.includes("rtk") || q.includes("tower")) && (q.includes("assigned") || q.includes("what tower") || q.includes("which tower"))) {
     const fieldGuess = extractFieldGuess(raw);
     const fs = getFieldTowerSummary({ snapshot, fieldQuery: fieldGuess, includeArchived });
@@ -150,10 +128,8 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     const lines = [];
     lines.push(`Field: ${fs.fieldName}`);
     if (fs.farmName) lines.push(`Farm: ${fs.farmName}`);
-    if (fs.towerName) lines.push(`RTK tower: ${fs.towerName}`);
-    else lines.push(`RTK tower: (none assigned)`);
+    lines.push(`RTK tower: ${fs.towerName ? fs.towerName : "(none assigned)"}`);
 
-    // include tower details if available
     if (fs.tower?.frequencyMHz) lines.push(`Frequency: ${String(fs.tower.frequencyMHz)} MHz`);
     if (fs.tower?.networkId != null) lines.push(`Network ID: ${String(fs.tower.networkId)}`);
 
@@ -172,7 +148,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     };
   }
 
-  // 3) Tower -> farms/fields using it (by tower name)
+  // 3) Tower -> farms/fields using it
   if (q.includes("tower") || q.includes("rtk")) {
     const towerGuess = extractTowerNameGuess(raw);
     if (towerGuess) {
@@ -194,10 +170,10 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
         };
       }
 
-      // If user asked farms: list farms
       if (wantsFarms(q)) {
         const title = `Farms using ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
         const lines = (usage.farms || []).map(f => `• ${f.name}`);
+
         const pageSize = 20;
         const first = lines.slice(0, pageSize);
         const remaining = lines.length - first.length;
@@ -219,10 +195,10 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
         };
       }
 
-      // If user asked fields: list fields
       if (wantsFields(q) || q.includes("show fields")) {
         const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
         const lines = (usage.fields || []).map(f => `• ${f.name}${f.farmName ? ` (${f.farmName})` : ""}`);
+
         const pageSize = 40;
         const first = lines.slice(0, pageSize);
         const remaining = lines.length - first.length;
@@ -244,7 +220,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
         };
       }
 
-      // Default tower detail
+      // tower detail
       const lines = [];
       lines.push(`RTK tower: ${usage.tower.name || usage.tower.id}`);
       if (usage.tower.frequencyMHz) lines.push(`Frequency: ${String(usage.tower.frequencyMHz)} MHz`);
@@ -264,7 +240,6 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     }
   }
 
-  // fallback (no menus)
   return {
     ok: false,
     answer: "Please check /handlers/rtk.handler.js — RTK intent not recognized from this question.",
