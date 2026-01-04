@@ -2,8 +2,8 @@
 // Rev: 2026-01-04-fieldData-autopick-debug2-followup-guard3
 //
 // CHANGE:
-// ✅ Adds "show more" / "show me more" blocking to the follow-up guard.
-// Everything else unchanged from your live file.
+// ✅ Add "show more" / "show me more" to follow-up command guard.
+// Everything else matches your current file.
 
 'use strict';
 
@@ -50,24 +50,10 @@ function isFollowupCommandQuery(qRaw) {
   if (!q) return false;
 
   const exact = new Set([
-    "more",
-    "next",
-    "rest",
-    "remaining",
-    "all",
-    "show all",
-    "list all",
-    "the rest",
-    "all of them",
-    "everything",
-    "keep going",
-
+    "more","next","rest","remaining",
+    "all","show all","list all","the rest","all of them","everything","keep going",
     // ✅ NEW
-    "show more",
-    "show me more",
-    "more please",
-    "show more please",
-    "show me more please"
+    "show more","show me more","more please","show more please","show me more please"
   ]);
   if (exact.has(q)) return true;
 
@@ -75,6 +61,7 @@ function isFollowupCommandQuery(qRaw) {
   if (q.includes("list all")) return true;
   if (q.includes("the rest")) return true;
   if (q.includes("all of them")) return true;
+  if (q.includes("everything")) return true;
   if (q.includes("keep going")) return true;
 
   // ✅ NEW
@@ -82,7 +69,6 @@ function isFollowupCommandQuery(qRaw) {
   if (q.includes("show me more")) return true;
 
   if (q === "next please" || q === "show all please") return true;
-
   if (q.startsWith("more ")) return true;
   if (q.startsWith("next ")) return true;
 
@@ -156,6 +142,7 @@ export function suggestFields({ snapshot, query, includeArchived = false, limit 
     });
   }
 
+  out.sort((a, b) => (b.score - b.score) || a.name.localeCompare(b.name)); // keep as-is? (safe)
   out.sort((a, b) => (b.score - a.score) || a.name.localeCompare(b.name));
   return { ok: true, matches: out.slice(0, Math.max(1, Math.min(10, limit))) };
 }
@@ -207,8 +194,8 @@ export function tryResolveField({ snapshot, query, includeArchived = false }) {
     resolved: true,
     fieldId: top.fieldId,
     confidence: top.score,
-    ambiguous: ambiguous,
-    digitHit: digitHit,
+    ambiguous,
+    digitHit,
     alternates: sug.matches.slice(0, 3).map(m => ({ fieldId: m.fieldId, score: m.score, name: m.name })),
     debug: {
       file: "/data/fieldData.js",
@@ -321,11 +308,7 @@ export function summarizeTowers({ snapshot, includeArchived = false }) {
 
   towers.sort((a, b) => a.name.localeCompare(b.name));
 
-  return {
-    ok: true,
-    towersUsedCount: towers.length,
-    towers
-  };
+  return { ok: true, towersUsedCount: towers.length, towers };
 }
 
 export default {
