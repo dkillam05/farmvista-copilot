@@ -1,15 +1,15 @@
 // /data/rtkData.js  (FULL FILE)
-// Rev: 2026-01-04-rtkData2-tillable
+// Rev: 2026-01-04-rtkData3-robust-lookup
 //
 // CHANGE:
-// ✅ getTowerUsage() now includes per-field tillable and totals.tillable
+// ✅ Robust tower lookup (normalizes punctuation/spaces, matches towerId too)
+// ✅ getTowerUsage includes tillable totals/fields (kept)
 // ✅ getFieldTowerSummary unchanged
 
 'use strict';
 
 import {
   getSnapshotCollections,
-  lookupTowerByName as lookupTowerByNameFromFieldData,
   summarizeTowers as summarizeTowersFromFieldData,
   tryResolveField,
   buildFieldBundle
@@ -28,11 +28,62 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function cleanName(s) {
+  // Lowercase, remove the words rtk/tower, replace non-alphanum with spaces, collapse.
+  return norm(s)
+    .replace(/\b(rtk|tower|towers|base\s*station)\b/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function lookupTowerByName({ snapshot, towerName }) {
-  return lookupTowerByNameFromFieldData({ snapshot, towerName });
+  const cols = getSnapshotCollections(snapshot);
+  if (!cols.ok) return { ok: false, reason: cols.reason, tower: null };
+
+  const raw = (towerName || "").toString().trim();
+  if (!raw) return { ok: false, reason: "missing_name", tower: null };
+
+  const needle = cleanName(raw);
+  if (!needle) return { ok: false, reason: "missing_name", tower: null };
+
+  // 1) Direct id hit (allow user to paste towerId)
+  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
+    if (cleanName(id) === needle) return { ok: true, tower: { id, ...t } };
+  }
+
+  // 2) Exact normalized name match
+  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
+    const n = cleanName(t?.name || "");
+    if (n && n === needle) return { ok: true, tower: { id, ...t } };
+  }
+
+  // 3) Starts-with / includes best match scoring
+  let best = null;
+  let bestScore = 0;
+
+  for (const [id, t] of Object.entries(cols.rtkTowers || {})) {
+    const name = (t?.name || "").toString();
+    const n = cleanName(name);
+    if (!n) continue;
+
+    let score = 0;
+    if (n.startsWith(needle)) score = 90;
+    else if (n.includes(needle)) score = 75;
+    else if (needle.includes(n) && n.length >= 4) score = 60;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = { id, ...t };
+    }
+  }
+
+  if (best) return { ok: true, tower: best };
+  return { ok: false, reason: "not_found", tower: null };
 }
 
 export function summarizeTowersUsed({ snapshot, includeArchived = false }) {
+  // keep using your already-correct summarize logic from fieldData.js
   return summarizeTowersFromFieldData({ snapshot, includeArchived });
 }
 
