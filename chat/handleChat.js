@@ -1,16 +1,8 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-04-handleChat-conversation5-openai-planning-requestdebug
+// Rev: 2026-01-05-handleChat-conversation6-openai-planning-showdetail
 //
-// Adds:
-// ✅ OpenAI planning (llmPlanner) with request-controlled debugAI
-// ✅ Visible footer when debugAI=true (no Cloud Run env required)
-// ✅ pendingClarify stored in conversationStore for scope follow-up replies
-//
-// Keeps:
-// ✅ normalize
-// ✅ paging followups + continuation
-// ✅ followupInterpreter
-// ✅ contextDelta persistence
+// Change:
+// ✅ If OpenAI planner fails and debugAI=true, append planner error detail to answer footer.
 
 'use strict';
 
@@ -36,11 +28,6 @@ function makeThreadId() {
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-function boolish(v) {
-  const s = safeStr(v).toLowerCase();
-  return s === "1" || s === "true" || s === "yes";
-}
-
 export async function handleChat({
   question,
   snapshot,
@@ -62,19 +49,17 @@ export async function handleChat({
     return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot data isn’t available right now. Try /context/reload, then retry.", action: null, meta: { intent: "chat", error: true, snapshotOk: !!snapshot?.ok, threadId: tid }, state: state || null };
   }
 
-  // normalize
   const n = normalizeQuestion(qRaw0);
   const qRaw = safeStr(n?.text || qRaw0);
 
   const token = extractBearer(authHeader);
   const user = token ? { hasAuth: true } : null;
 
-  // seed continuation if provided
   try { if (continuation && typeof continuation === "object") setContinuation(tid, continuation); } catch {}
 
   const ctx = getThreadContext(tid) || {};
 
-  // 1) paging followups first
+  // 1) paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
@@ -109,7 +94,7 @@ export async function handleChat({
     debug
   });
 
-  // planner failed -> fallback execute without planner
+  // planner failed -> fallback deterministic
   if (!planRes.ok || !planRes.plan) {
     const r = await executePlannedQuestion({ rewriteQuestion: routedQuestion, snapshot, user, state, includeArchived: false });
 
@@ -121,50 +106,34 @@ export async function handleChat({
 
     let answer = safeStr(r?.answer) || "No response.";
     if (debug) {
-      answer += `\n\n[AI Planner: OFF • ${planRes?.meta?.error || planRes?.error || "planner_failed"}]`;
+      const head = `[AI Planner: OFF • ${planRes?.meta?.error || planRes?.meta?.error || planRes?.error || "planner_failed"}]`;
+      const detail = safeStr(planRes?.meta?.detail || "");
+      answer += `\n\n${head}`;
+      if (detail) answer += `\n${detail}`;
     }
 
     return {
       ok: r?.ok !== false,
       answer,
       action: r?.action || null,
-      meta: {
-        ...(r?.meta || {}),
-        threadId: tid,
-        aiPlanner: planRes.meta,
-        ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
-      },
+      meta: { ...(r?.meta || {}), threadId: tid, aiPlanner: planRes.meta },
       state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null)
     };
   }
 
   const plan = planRes.plan;
 
-  // 3a) clarify
+  // clarify
   if (plan.action === "clarify") {
-    applyContextDelta(tid, {
-      pendingClarify: { baseQuestion: safeStr(plan.rewriteQuestion || routedQuestion), asked: safeStr(plan.ask) }
-    });
+    applyContextDelta(tid, { pendingClarify: { baseQuestion: safeStr(plan.rewriteQuestion || routedQuestion), asked: safeStr(plan.ask) } });
 
     let answer = safeStr(plan.ask) || "Active only, or include archived?";
-    if (debug) {
-      answer += `\n\n[AI Planner: ON • clarify • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
-    }
+    if (debug) answer += `\n\n[AI Planner: ON • clarify • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
 
-    return {
-      ok: true,
-      answer,
-      action: null,
-      meta: {
-        routed: "llm_clarify",
-        threadId: tid,
-        aiPlanner: { ...planRes.meta, action: "clarify", includeArchived: plan.includeArchived ?? null, rewriteQuestion: plan.rewriteQuestion }
-      },
-      state: state || null
-    };
+    return { ok: true, answer, action: null, meta: { routed: "llm_clarify", threadId: tid, aiPlanner: { ...planRes.meta, action: "clarify" } }, state: state || null };
   }
 
-  // 3b) execute
+  // execute
   const includeArchived = plan.includeArchived === true;
   const rewriteQuestion = safeStr(plan.rewriteQuestion) || routedQuestion;
 
@@ -179,19 +148,13 @@ export async function handleChat({
   applyContextDelta(tid, { pendingClarify: null });
 
   let answer = safeStr(r?.answer) || "No response.";
-  if (debug) {
-    answer += `\n\n[AI Planner: ON • execute • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
-  }
+  if (debug) answer += `\n\n[AI Planner: ON • execute • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
 
   return {
     ok: r?.ok !== false,
     answer,
     action: r?.action || null,
-    meta: {
-      ...(r?.meta || {}),
-      threadId: tid,
-      aiPlanner: { ...planRes.meta, action: "execute", includeArchived, rewriteQuestion }
-    },
+    meta: { ...(r?.meta || {}), threadId: tid, aiPlanner: { ...planRes.meta, action: "execute", includeArchived, rewriteQuestion } },
     state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null)
   };
 }
