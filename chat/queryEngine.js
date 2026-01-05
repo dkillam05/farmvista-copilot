@@ -1,21 +1,13 @@
 // /chat/queryEngine.js  (FULL FILE)
-// Rev: 2026-01-04-queryEngine1-fields
+// Rev: 2026-01-04-queryEngine2-guards-countyfix
 //
-// Generic, deterministic query engine for fields/farms/counties.
-// Purpose: stop adding one-off handlers for basic sums/counts/group-bys/lists.
+// Fixes:
+// ✅ Correct routing for county questions vs farm questions
+// ✅ Implements "Tillable acres by county" and "List fields in <County> County with acres"
+// ✅ Adds hard guardrails so engine won't hijack equipment/grain/contracts/rtk/etc.
+// ✅ Fixes missing wantsCounty() bug
 //
-// Supported (examples):
-// - "How many farms do we have?"
-// - "List all farms"
-// - "How many counties do we farm in?"
-// - "Tillable acres by county"
-// - "HEL acres by farm"
-// - "List fields in Macoupin County"
-// - "List fields in Sangamon County with acres"
-// - "How many fields in Sangamon County?"
-//
-// Returns:
-// { ok:true, answer, meta:{ continuation?, contextDelta? } }  or null if not recognized.
+// Still deterministic: no AI, no OpenAI calls.
 
 'use strict';
 
@@ -33,7 +25,11 @@ function fmtAcre(n) {
   return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
-function wants(q, term) { return norm(q).includes(term); }
+function isActiveStatus(s) {
+  const v = norm(s);
+  if (!v) return true;
+  return v !== "archived" && v !== "inactive";
+}
 
 function wantsCount(q) {
   const s = norm(q);
@@ -53,10 +49,23 @@ function wantsByCounty(q) {
 }
 function wantsAcres(q) {
   const s = norm(q);
-  return s.includes("acres") || s.includes("tillable");
+  return s.includes("acres") || s.includes("tillable") || s.includes("acre");
 }
 function wantsHEL(q) { return norm(q).includes("hel"); }
 function wantsCRP(q) { return norm(q).includes("crp"); }
+
+function mentionsFarms(q) {
+  const s = norm(q);
+  return s.includes(" farm ") || s.endsWith(" farm") || s.includes(" farms") || s.includes("farms");
+}
+function mentionsCounties(q) {
+  const s = norm(q);
+  return s.includes("county") || s.includes("counties") || s.includes("countys");
+}
+function mentionsFields(q) {
+  const s = norm(q);
+  return s.includes("field") || s.includes("fields");
+}
 
 function extractCountyGuess(raw) {
   const s = String(raw || "").trim();
@@ -71,12 +80,6 @@ function extractCountyGuess(raw) {
   if (m && m[1]) return m[1].trim();
 
   return "";
-}
-
-function isActiveStatus(s) {
-  const v = norm(s);
-  if (!v) return true;
-  return v !== "archived" && v !== "inactive";
 }
 
 function countyKey(f) {
@@ -108,28 +111,61 @@ function buildPagedAnswer({ title, lines, pageSizeDefault = 25 }) {
   };
 }
 
+// ✅ Guardrails: don't hijack other domains
+function hasBlockedDomainTerms(q) {
+  const s = norm(q);
+  const blocked = [
+    "equipment", "tractor", "combine", "sprayer", "implement",
+    "work order", "workorder", "maintenance", "service",
+    "grain", "contract", "basis", "delivery", "elevator",
+    "employee", "vendor", "invoice", "receipt",
+    "rtk", "tower", "towers", "network id", "mhz"
+  ];
+  return blocked.some(t => s.includes(t));
+}
+
 export function tryGenericQuery({ question, snapshot, includeArchived = false }) {
   const cols = getSnapshotCollections(snapshot);
-  if (!cols.ok) return { ok: false, answer: "Please check /data/fieldData.js — snapshot collections not loaded.", meta: { debugFile: "/data/fieldData.js" } };
+  if (!cols.ok) {
+    return { ok: false, answer: "Please check /data/fieldData.js — snapshot collections not loaded.", meta: { debugFile: "/data/fieldData.js" } };
+  }
 
   const raw = (question || "").toString();
   const q = norm(raw);
 
-  // Only engage for the "query-ish" questions (farms/counties/fields/acres/HEL/CRP).
+  // If it smells like other domains, bail.
+  if (hasBlockedDomainTerms(q)) return null;
+
+  // Only engage when question is about fields/farms/counties/acres/HEL/CRP
   const likely =
-    q.includes("farm") || q.includes("farms") ||
-    q.includes("county") || q.includes("counties") ||
-    q.includes("field") || q.includes("fields") ||
-    q.includes("tillable") || q.includes("acres") ||
-    q.includes("hel") || q.includes("crp");
+    mentionsFarms(q) || mentionsCounties(q) || mentionsFields(q) ||
+    wantsAcres(q) || wantsHEL(q) || wantsCRP(q);
 
   if (!likely) return null;
 
   // -----------------------------
-  // A) HOW MANY FARMS?
-  // (distinct farmIds used by eligible fields)
+  // 1) HOW MANY COUNTIES?
+  // (must come BEFORE farm count)
   // -----------------------------
-  if (wantsCount(q) && q.includes("farm")) {
+  if (wantsCount(q) && mentionsCounties(q)) {
+    const keys = new Set();
+    for (const [, f] of Object.entries(cols.fields || {})) {
+      const active = isActiveStatus(f?.status);
+      if (!includeArchived && !active) continue;
+      const k = countyKey(f);
+      if (k) keys.add(k);
+    }
+    return {
+      ok: true,
+      answer: `Counties (from fields): ${fmtInt(keys.size)}.`,
+      meta: { routed: "genericQuery", intent: "count_counties" }
+    };
+  }
+
+  // -----------------------------
+  // 2) HOW MANY FARMS?
+  // -----------------------------
+  if (wantsCount(q) && mentionsFarms(q)) {
     const farmIds = new Set();
     for (const [, f] of Object.entries(cols.fields || {})) {
       const active = isActiveStatus(f?.status);
@@ -145,9 +181,9 @@ export function tryGenericQuery({ question, snapshot, includeArchived = false })
   }
 
   // -----------------------------
-  // B) LIST FARMS
+  // 3) LIST FARMS
   // -----------------------------
-  if ((wantsList(q) || q.includes("all")) && q.includes("farm")) {
+  if ((wantsList(q) || q.includes("all")) && mentionsFarms(q) && !mentionsFields(q)) {
     const names = new Set();
     for (const [, f] of Object.entries(cols.fields || {})) {
       const active = isActiveStatus(f?.status);
@@ -171,29 +207,48 @@ export function tryGenericQuery({ question, snapshot, includeArchived = false })
   }
 
   // -----------------------------
-  // C) HOW MANY COUNTIES?
+  // 4) LIST FIELDS IN A COUNTY (with optional acres)
   // -----------------------------
-  if (wantsCount(q) && (q.includes("county") || q.includes("counties"))) {
-    const keys = new Set();
-    for (const [, f] of Object.entries(cols.fields || {})) {
+  if ((wantsList(q) || q.includes("which")) && mentionsFields(q) && mentionsCounties(q)) {
+    const countyGuess = extractCountyGuess(raw);
+    if (!countyGuess) return null;
+
+    const needle = norm(countyGuess);
+    const includeAcres = wantsAcres(q) || q.includes("with acres");
+
+    const matches = [];
+    for (const [fieldId, f] of Object.entries(cols.fields || {})) {
       const active = isActiveStatus(f?.status);
       if (!includeArchived && !active) continue;
-      const k = countyKey(f);
-      if (k) keys.add(k);
+
+      const c = norm(f?.county);
+      if (!c) continue;
+      if (c !== needle && !c.startsWith(needle) && !c.includes(needle)) continue;
+
+      const label = formatFieldOptionLine({ snapshot, fieldId }) || fieldId;
+      const till = num(f?.tillable);
+      matches.push({ label, till });
     }
+
+    matches.sort((a, b) => a.label.localeCompare(b.label));
+
+    const title = `Fields in ${countyGuess} County (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(matches.length)}`;
+    const lines = matches.map(m => includeAcres ? `• ${m.label}\n  ${fmtAcre(m.till)} ac` : `• ${m.label}`);
+
+    const paged = buildPagedAnswer({ title, lines, pageSizeDefault: 25 });
     return {
       ok: true,
-      answer: `Counties (from fields): ${fmtInt(keys.size)}.`,
-      meta: { routed: "genericQuery", intent: "count_counties" }
+      answer: paged.answer,
+      meta: { routed: "genericQuery", intent: "list_fields_in_county", continuation: paged.continuation }
     };
   }
 
   // -----------------------------
-  // D) TILLABLE/HEL/CRP BY COUNTY
+  // 5) TILLABLE/HEL/CRP BY COUNTY
   // -----------------------------
-  if (wantsByCounty(q) && (wantsAcres(q) || wantsHEL(q) || wantsCRP(q) || q.includes("fields"))) {
+  if (wantsByCounty(q) && (wantsAcres(q) || wantsHEL(q) || wantsCRP(q) || mentionsFields(q))) {
     const metric = wantsHEL(q) ? "hel" : wantsCRP(q) ? "crp" : wantsAcres(q) ? "tillable" : "fields";
-    const map = new Map(); // countyKey -> { fields, tillable, hel, crp }
+    const map = new Map();
 
     for (const [, f] of Object.entries(cols.fields || {})) {
       const active = isActiveStatus(f?.status);
@@ -227,19 +282,15 @@ export function tryGenericQuery({ question, snapshot, includeArchived = false })
     });
 
     const paged = buildPagedAnswer({ title, lines, pageSizeDefault: 12 });
-    return {
-      ok: true,
-      answer: paged.answer,
-      meta: { routed: "genericQuery", intent: "by_county", continuation: paged.continuation }
-    };
+    return { ok: true, answer: paged.answer, meta: { routed: "genericQuery", intent: "by_county", continuation: paged.continuation } };
   }
 
   // -----------------------------
-  // E) TILLABLE/HEL/CRP BY FARM
+  // 6) TILLABLE/HEL/CRP BY FARM
   // -----------------------------
-  if (wantsByFarm(q) && (wantsAcres(q) || wantsHEL(q) || wantsCRP(q) || q.includes("fields"))) {
+  if (wantsByFarm(q) && (wantsAcres(q) || wantsHEL(q) || wantsCRP(q) || mentionsFields(q))) {
     const metric = wantsHEL(q) ? "hel" : wantsCRP(q) ? "crp" : wantsAcres(q) ? "tillable" : "fields";
-    const map = new Map(); // farmId -> { fields, tillable, hel, crp, name }
+    const map = new Map();
 
     for (const [, f] of Object.entries(cols.fields || {})) {
       const active = isActiveStatus(f?.status);
@@ -273,48 +324,7 @@ export function tryGenericQuery({ question, snapshot, includeArchived = false })
     });
 
     const paged = buildPagedAnswer({ title, lines, pageSizeDefault: 12 });
-    return {
-      ok: true,
-      answer: paged.answer,
-      meta: { routed: "genericQuery", intent: "by_farm", continuation: paged.continuation }
-    };
-  }
-
-  // -----------------------------
-  // F) LIST FIELDS IN A COUNTY
-  // -----------------------------
-  if (wantsCounty(q) && q.includes("field") && (wantsList(q) || q.includes("which"))) {
-    const countyGuess = extractCountyGuess(raw);
-    if (!countyGuess) return null;
-
-    const needle = norm(countyGuess);
-    const includeAcres = wantsAcres(q) || q.includes("with acres");
-
-    const matches = [];
-    for (const [fieldId, f] of Object.entries(cols.fields || {})) {
-      const active = isActiveStatus(f?.status);
-      if (!includeArchived && !active) continue;
-
-      const c = norm(f?.county);
-      if (!c) continue;
-      if (c !== needle && !c.startsWith(needle) && !c.includes(needle)) continue;
-
-      const label = formatFieldOptionLine({ snapshot, fieldId }) || fieldId;
-      const till = num(f?.tillable);
-      matches.push({ label, till });
-    }
-
-    matches.sort((a, b) => a.label.localeCompare(b.label));
-
-    const title = `Fields in ${countyGuess} County (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(matches.length)}`;
-    const lines = matches.map(m => includeAcres ? `• ${m.label}\n  ${fmtAcre(m.till)} ac` : `• ${m.label}`);
-
-    const paged = buildPagedAnswer({ title, lines, pageSizeDefault: 25 });
-    return {
-      ok: true,
-      answer: paged.answer,
-      meta: { routed: "genericQuery", intent: "list_fields_in_county", continuation: paged.continuation }
-    };
+    return { ok: true, answer: paged.answer, meta: { routed: "genericQuery", intent: "by_farm", continuation: paged.continuation } };
   }
 
   return null;
