@@ -1,9 +1,9 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-04-followupInterpreter3-pendingClarify
+// Rev: 2026-01-04-followupInterpreter4-pendingClarify
 //
 // Adds:
-// ✅ If ctx.pendingClarify exists and user replies "active only" or "include archived",
-//    rewrite to the stored baseQuestion plus the scope directive.
+// ✅ pendingClarify support: if bot asked scope question and user replies "include archived" or "active only",
+//    rewrite to rerun the pending base question with that scope directive.
 
 'use strict';
 
@@ -70,7 +70,7 @@ function buildTotalsQuestion({ metric, by }) {
     if (m === "hel") return "HEL acres by county";
     if (m === "crp") return "CRP acres by county";
     if (m === "fields") return "How many fields by county";
-    return "County totals by county";
+    return "Tillable acres by county";
   }
   if (m === "hel") return "Total HEL acres";
   if (m === "crp") return "Total CRP acres";
@@ -85,7 +85,7 @@ export function interpretFollowup({ question, ctx }) {
 
   const c = ctx || {};
 
-  // ✅ Pending clarification: user replies with scope
+  // ✅ Pending clarify: user replies with scope choice
   if (c.pendingClarify && (wantsIncludeArchived(q) || wantsActiveOnly(q))) {
     const base = (c.pendingClarify.baseQuestion || "").toString().trim();
     if (!base) return null;
@@ -133,7 +133,7 @@ export function interpretFollowup({ question, ctx }) {
   if (isThatEntityFollowup(q) && lastEntity) {
     if (lastEntity.type === "field") return { rewriteQuestion: `Tell me about ${lastEntity.id || lastEntity.name}`.trim(), contextDelta: {} };
     if (lastEntity.type === "farm") return { rewriteQuestion: `Farm totals for ${lastEntity.name || lastEntity.id}`.trim(), contextDelta: {} };
-    if (lastEntity.type === "county") return { rewriteQuestion: `County totals for ${lastEntity.name || lastEntity.id} County`.trim(), contextDelta: {} };
+    if (lastEntity.type === "county") return { rewriteQuestion: `Tillable acres by county`.trim(), contextDelta: {} };
   }
 
   return null;
