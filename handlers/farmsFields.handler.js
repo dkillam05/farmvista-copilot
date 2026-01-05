@@ -1,22 +1,30 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-05-handler-filteredlists2-counties-metric-by
+// Rev: 2026-01-05-handler-filteredlists2-counties-metric-by-helcrp-autofilter
 //
 // Adds:
 // ✅ Metric summaries by county and by farm:
 //    - "Tillable acres by county"
 //    - "HEL acres by county"
+//    - "CRP acres by county"
 //    - "Fields by county"
 //    - "Tillable acres by farm"
 //    - "HEL acres by farm"
+//    - "CRP acres by farm"
 //    - "Fields by farm"
 //
+// Adds (NEW fallback):
+// ✅ Natural language "fields with HEL/CRP" => auto-rewrite to "> 0" filtered list
+//    - "Fields with hel ground"
+//    - "Show me just the fields with hel acres"
+//    - "Fields that have crp acres"
+//
 // Keeps:
-// ✅ filtered field lists (option C grouping)
+// ✅ filtered field lists (threshold + optional group by farm)
 // ✅ counties we farm in list intent
-// ✅ totals / breakdowns
-// ✅ list fields on a farm
-// ✅ field lookup (auto-pick resolver)
-// ✅ no menus / no 3-choice lists
+// ✅ totals / breakdowns (existing)
+// ✅ list fields on a farm (existing)
+// ✅ field lookup (auto-pick resolver) (existing)
+// ✅ paging via meta.continuation
 // ✅ contextDelta for conversation carry
 
 'use strict';
@@ -74,42 +82,11 @@ function wantsCountiesWeFarmIn(q) {
   if (s.includes("what counties") && s.includes("farm")) return true;
   if ((s.includes("list") || s.includes("show")) && s.includes("count") && s.includes("farm")) return true;
 
+  // also accept "tillable acres per county" style
   if (s.includes("per county") && s.includes("tillable")) return true;
 
   return false;
 }
-// ADD THIS BLOCK near the top of handleFarmsFields(), after `const q = norm(raw);`
-
-  // ✅ NEW: Natural-language "list fields with HEL/CRP" fallback
-  // If user asks for fields with HEL (or CRP) but doesn't give a threshold,
-  // treat it as "> 0" and route through the existing filtered-list engine.
-  //
-  // Examples:
-  // - "Fields with hel ground"
-  // - "Show me just the fields with hel acres"
-  // - "List fields with CRP"
-  const wantsFieldsWithHel = (q.includes("field") || q.includes("fields")) && q.includes("hel") && (wantsList(q) || q.includes("just") || q.includes("only"));
-  const wantsFieldsWithCrp = (q.includes("field") || q.includes("fields")) && q.includes("crp") && (wantsList(q) || q.includes("just") || q.includes("only"));
-
-  // If they didn't specify a comparator/threshold, assume > 0
-  const hasComparator =
-    q.includes(">") || q.includes(">=") || q.includes("more than") || q.includes("greater than") ||
-    q.includes("over ") || q.includes("above ") || q.includes("at least");
-
-  if ((wantsFieldsWithHel || wantsFieldsWithCrp) && !hasComparator) {
-    const rewritten = wantsFieldsWithHel
-      ? "Show fields with HEL acres > 0"
-      : "Show fields with CRP acres > 0";
-
-    // Re-run handler recursively once with explicit filter text
-    return await handleFarmsFields({
-      question: rewritten,
-      snapshot,
-      user,
-      includeArchived,
-      meta: { ...(meta || {}), routerReason: "nl_fields_with_metric_autothreshold" }
-    });
-  }
 
 function looksLikeFilteredList(q) {
   if (!(wantsList(q) || q.includes("which"))) return false;
@@ -323,10 +300,48 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   const raw = (question || "").toString();
   const q = norm(raw);
 
-  // =====================================================================
-  // ✅ NEW: METRIC BY COUNTY (tillable/HEL/CRP/fields)
-  // Must be BEFORE askedTotals to avoid falling into generic totals.
-  // =====================================================================
+  // ✅ NEW: Natural-language "fields with HEL/CRP" fallback (auto threshold > 0)
+  // Place near the top so it catches employee phrasing.
+  const _autofilterGuard = meta?.routerReason === "nl_fields_with_metric_autothreshold";
+
+  const mentionsFields = (q.includes("field") || q.includes("fields"));
+  const mentionsHel = q.includes("hel");
+  const mentionsCrp = q.includes("crp");
+
+  const wantsTheseFields =
+    wantsList(q) ||
+    q.includes("just") ||
+    q.includes("only") ||
+    q.includes("with ") ||
+    q.includes("has ") ||
+    q.includes("have ") ||
+    q.includes("that have") ||
+    q.includes("where ");
+
+  const wantsFieldsWithHel = mentionsFields && mentionsHel && wantsTheseFields;
+  const wantsFieldsWithCrp = mentionsFields && mentionsCrp && wantsTheseFields;
+
+  const hasComparator =
+    q.includes(">") || q.includes(">=") ||
+    q.includes("more than") || q.includes("greater than") ||
+    q.includes("over ") || q.includes("above ") ||
+    q.includes("at least");
+
+  if (!_autofilterGuard && (wantsFieldsWithHel || wantsFieldsWithCrp) && !hasComparator) {
+    const rewritten = wantsFieldsWithHel
+      ? "Show fields with HEL acres > 0"
+      : "Show fields with CRP acres > 0";
+
+    return await handleFarmsFields({
+      question: rewritten,
+      snapshot,
+      user,
+      includeArchived,
+      meta: { ...(meta || {}), routerReason: "nl_fields_with_metric_autothreshold" }
+    });
+  }
+
+  // ✅ Metric summaries by county (tillable/HEL/CRP/fields)
   if (q.includes("by county") && (wantsAcres(q) || wantsHel(q) || wantsCrp(q) || q.includes("fields"))) {
     const metric =
       wantsHel(q) ? "hel" :
@@ -335,7 +350,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       "tillable";
 
     const arr = totalsByCounty({ cols, includeArchived });
-
     const title = `${metricLabel(metric)} by county (${includeArchived ? "incl archived" : "active only"}):`;
 
     const lines = arr.map(r => {
@@ -367,9 +381,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     };
   }
 
-  // =====================================================================
-  // ✅ NEW: METRIC BY FARM (tillable/HEL/CRP/fields)
-  // =====================================================================
+  // ✅ Metric summaries by farm (tillable/HEL/CRP/fields)
   if (q.includes("by farm") && (wantsAcres(q) || wantsHel(q) || wantsCrp(q) || q.includes("fields"))) {
     const metric =
       wantsHel(q) ? "hel" :
@@ -378,7 +390,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       "tillable";
 
     const arr = totalsByFarm({ cols, includeArchived });
-
     const title = `${metricLabel(metric)} by farm (${includeArchived ? "incl archived" : "active only"}):`;
 
     const lines = arr.map(r => {
@@ -411,7 +422,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   }
 
   // =====================================================================
-  // 0) FILTERED FIELD LISTS (already working)
+  // 0) FILTERED FIELD LISTS (existing)
   // =====================================================================
   if (looksLikeFilteredList(q)) {
     const metric = metricFromQuery(q);
@@ -542,7 +553,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   }
 
   // =====================================================================
-  // 1) COUNTIES WE FARM IN
+  // 1) COUNTIES WE FARM IN (existing)
   // =====================================================================
   if (wantsCountiesWeFarmIn(q)) {
     const arr = totalsByCounty({ cols, includeArchived });
@@ -590,7 +601,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   }
 
   // -----------------------
-  // A) TOTALS / BREAKDOWNS
+  // A) TOTALS / BREAKDOWNS (existing)
   // -----------------------
   const askedTotals =
     wantsCount(q) ||
@@ -605,85 +616,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
   const farmGuessHit = farmGuessForTotals ? findFarmByName(cols, farmGuessForTotals) : null;
 
   if (askedTotals) {
-    if (wantsByFarm(q)) {
-      const arr = totalsByFarm({ cols, includeArchived });
-
-      const allLines = arr.map(r =>
-        `• ${r.name}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
-      );
-
-      const pageSize = 10;
-      const first = allLines.slice(0, pageSize);
-      const remaining = allLines.length - first.length;
-
-      const out = [];
-      out.push(`Farm totals (${includeArchived ? "incl archived" : "active only"}):`);
-      out.push(...first);
-      if (remaining > 0) out.push(`…plus ${remaining} more farms.`);
-
-      return {
-        ok: true,
-        answer: out.join("\n"),
-        meta: {
-          routed: "farmsFields",
-          intent: "totals_by_farm",
-          continuation: (remaining > 0) ? {
-            kind: "page",
-            title: `Farm totals (${includeArchived ? "incl archived" : "active only"}):`,
-            lines: allLines,
-            offset: pageSize,
-            pageSize
-          } : null,
-          contextDelta: {
-            lastIntent: "totals_by_farm",
-            lastMetric: wantsHel(q) ? "hel" : wantsCrp(q) ? "crp" : wantsAcres(q) ? "tillable" : "all",
-            lastBy: "farm",
-            lastScope: { includeArchived: !!includeArchived }
-          }
-        }
-      };
-    }
-
-    if (wantsByCounty(q)) {
-      const arr = totalsByCounty({ cols, includeArchived });
-
-      const allLines = arr.map(r =>
-        `• ${r.key}: ${fmtAcre(r.tillable)} tillable ac • HEL ${fmtAcre(r.hel)} • CRP ${fmtAcre(r.crp)} • ${r.fields} fields`
-      );
-
-      const pageSize = 10;
-      const first = allLines.slice(0, pageSize);
-      const remaining = allLines.length - first.length;
-
-      const out = [];
-      out.push(`County totals (${includeArchived ? "incl archived" : "active only"}):`);
-      out.push(...first);
-      if (remaining > 0) out.push(`…plus ${remaining} more counties.`);
-
-      return {
-        ok: true,
-        answer: out.join("\n"),
-        meta: {
-          routed: "farmsFields",
-          intent: "totals_by_county",
-          continuation: (remaining > 0) ? {
-            kind: "page",
-            title: `County totals (${includeArchived ? "incl archived" : "active only"}):`,
-            lines: allLines,
-            offset: pageSize,
-            pageSize
-          } : null,
-          contextDelta: {
-            lastIntent: "totals_by_county",
-            lastMetric: wantsHel(q) ? "hel" : wantsCrp(q) ? "crp" : wantsAcres(q) ? "tillable" : "all",
-            lastBy: "county",
-            lastScope: { includeArchived: !!includeArchived }
-          }
-        }
-      };
-    }
-
-    // Default overall totals
     const t = buildTotals({ cols, includeArchived });
 
     const lines = [];
@@ -696,12 +628,17 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     return {
       ok: true,
       answer: lines.join("\n"),
-      meta: { routed: "farmsFields", intent: "totals_overall", ...t }
+      meta: {
+        routed: "farmsFields",
+        intent: "totals_overall",
+        ...t,
+        contextDelta: { lastIntent: "totals_overall", lastMetric: wantsHel(q) ? "hel" : wantsCrp(q) ? "crp" : wantsAcres(q) ? "tillable" : "all", lastBy: "", lastScope: { includeArchived: !!includeArchived } }
+      }
     };
   }
 
   // -----------------------
-  // B) LIST FIELDS ON A FARM
+  // B) LIST FIELDS ON A FARM (existing)
   // -----------------------
   if ((wantsList(q) || q.includes("show")) && q.includes("field") && (q.includes(" on ") || q.includes(" in "))) {
     const farmGuess = extractFarmNameGuess(raw);
@@ -711,7 +648,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
       return {
         ok: false,
         answer: "Please check /handlers/farmsFields.handler.js — could not extract farm name for list-fields query.",
-        meta: { routed: "farmsFields", intent: "list_fields_on_farm_failed", debugFile: "/handlers/farmsFields.handler.js", farmGuess }
+        meta: { routed: "farmsFields", intent: "list_fields_on_farm_failed", farmGuess }
       };
     }
 
@@ -740,11 +677,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     return {
       ok: true,
       answer: out.join("\n"),
-      meta: {
-        routed: "farmsFields",
-        intent: "list_fields_on_farm",
-        continuation: (remaining > 0) ? { kind: "page", title: `Fields on ${farm.name || farm.id} (${ids.length}):`, lines: allLines, offset: pageSize, pageSize } : null
-      }
+      meta: { routed: "farmsFields", intent: "list_fields_on_farm", continuation: (remaining > 0) ? { kind: "page", title: `Fields on ${farm.name || farm.id} (${ids.length}):`, lines: allLines, offset: pageSize, pageSize } : null }
     };
   }
 
