@@ -1,27 +1,27 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-04-handleChat-conversation3-normalize
+// Rev: 2026-01-04-handleChat-llm2
 //
-// CHANGE:
-// ✅ Adds global input normalization via /chat/normalize.js
-//    - fixes common typos like "how mans"
-//    - normalizes paging commands like "show more" -> "more"
-// ✅ Normalization is applied BEFORE followups, interpreter, and routing.
-// ✅ Adds meta.normalized + meta.normalizedRules when a rewrite occurs.
+// Adds OpenAI planning:
+// ✅ OpenAI decides clarify vs execute and rewrites the question
+// ✅ Deterministic execution uses snapshot-only handlers (no hallucinations)
+// ✅ If scope is ambiguous, asks: "Active only, or include archived?" and stores pendingClarify
 //
 // Keeps:
-// ✅ threadId / continuation passthrough
-// ✅ paging followups
-// ✅ conversation interpreter
-// ✅ contextDelta persistence
+// ✅ normalize.js
+// ✅ followups.js paging
+// ✅ followupInterpreter.js deterministic rewrites
+// ✅ conversationStore context + delta
+// ✅ threadId + continuation passthrough
 
 'use strict';
 
 import crypto from "crypto";
-import { routeQuestion } from "./router.js";
 import { tryHandleFollowup, setContinuation, clearContinuation } from "./followups.js";
 import { getThreadContext, applyContextDelta } from "./conversationStore.js";
 import { interpretFollowup } from "./followupInterpreter.js";
 import { normalizeQuestion } from "./normalize.js";
+import { llmPlan } from "./llmPlanner.js";
+import { executePlannedQuestion } from "./executePlannedQuestion.js";
 
 function safeStr(v) {
   return (v == null ? "" : String(v)).trim();
@@ -72,25 +72,23 @@ export async function handleChat({
     };
   }
 
-  // ✅ Normalize input once, globally
+  // ✅ Normalize
   const n = normalizeQuestion(qRaw0);
   const qRaw = safeStr(n?.text || qRaw0);
 
   const token = extractBearer(authHeader);
   const user = token ? { hasAuth: true } : null;
 
-  // If client sent a continuation, seed the followup store.
+  // Seed continuation if provided
   try {
     if (continuation && typeof continuation === "object") {
       setContinuation(tid, continuation);
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
 
   const ctx = getThreadContext(tid) || {};
 
-  // 1) Paging follow-ups first (after normalization)
+  // 1) Paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
@@ -110,7 +108,7 @@ export async function handleChat({
     clearContinuation(tid);
   }
 
-  // 2) Conversational follow-ups (same thing but CRP/by county/etc.)
+  // 2) Deterministic followup interpreter
   let routedQuestion = qRaw;
   try {
     const interp = interpretFollowup({ question: qRaw, ctx });
@@ -120,9 +118,17 @@ export async function handleChat({
     }
   } catch {}
 
-  // 3) Route normally
-  try {
-    const r = await routeQuestion({ question: routedQuestion, snapshot, user, state });
+  // 3) OpenAI plan
+  const planRes = await llmPlan({
+    question: routedQuestion,
+    threadCtx: getThreadContext(tid) || {},
+    snapshot,
+    authPresent: !!token
+  });
+
+  // If planner fails, fallback to execute routedQuestion as-is (active only)
+  if (!planRes.ok || !planRes.plan) {
+    const r = await executePlannedQuestion({ rewriteQuestion: routedQuestion, snapshot, user, includeArchived: false });
 
     const cont = r?.meta?.continuation || null;
     if (cont) setContinuation(tid, cont);
@@ -137,23 +143,64 @@ export async function handleChat({
       meta: {
         ...(r?.meta || {}),
         threadId: tid,
+        llm: { ok: false, error: planRes?.error || "planner_failed" },
         ...(routedQuestion !== qRaw ? { routedQuestion } : {}),
         ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
       },
-      state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null)
+      state: state || null
     };
-  } catch (e) {
+  }
+
+  const plan = planRes.plan;
+
+  // 3a) Clarify
+  if (plan.action === "clarify") {
+    applyContextDelta(tid, {
+      pendingClarify: {
+        baseQuestion: safeStr(plan.rewriteQuestion || routedQuestion),
+        asked: safeStr(plan.ask || "Active only, or include archived?")
+      }
+    });
+
     return {
-      ok: false,
-      error: "chat_failed",
-      answer: "Sorry — the chat service hit an error.",
+      ok: true,
+      answer: safeStr(plan.ask) || "Active only, or include archived?",
       action: null,
       meta: {
-        detail: safeStr(e?.message || e),
+        routed: "llm_clarify",
         threadId: tid,
         ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
       },
       state: state || null
     };
   }
+
+  // 3b) Execute
+  const includeArchived = plan.includeArchived === true ? true : false;
+  const rewriteQuestion = safeStr(plan.rewriteQuestion) || routedQuestion;
+
+  const r = await executePlannedQuestion({ rewriteQuestion, snapshot, user, includeArchived });
+
+  const cont = r?.meta?.continuation || null;
+  if (cont) setContinuation(tid, cont);
+
+  const delta = r?.meta?.contextDelta || null;
+  if (delta) applyContextDelta(tid, delta);
+
+  // clear pending clarify once we execute
+  applyContextDelta(tid, { pendingClarify: null });
+
+  return {
+    ok: r?.ok !== false,
+    answer: safeStr(r?.answer) || "No response.",
+    action: r?.action || null,
+    meta: {
+      ...(r?.meta || {}),
+      threadId: tid,
+      planned: { includeArchived, rewriteQuestion },
+      ...(routedQuestion !== qRaw ? { routedQuestion } : {}),
+      ...(n?.meta?.changed ? { normalized: qRaw, normalizedRules: n.meta.rules } : {})
+    },
+    state: state || null
+  };
 }
