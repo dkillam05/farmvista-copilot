@@ -1,7 +1,8 @@
 // /chat/executePlannedQuestion.js  (FULL FILE)
-// Rev: 2026-01-04-execPlan1
+// Rev: 2026-01-04-executePlannedQuestion2
 //
-// Executes the planner's rewriteQuestion against existing deterministic handlers.
+// Executes OpenAI plan against your deterministic handlers.
+// This is where "looks at snapshot" actually happens.
 
 'use strict';
 
@@ -17,17 +18,28 @@ function looksRTK(q) {
     s.includes("tower") ||
     s.includes("mhz") ||
     s.includes("network id") ||
-    s.includes("net ")
+    /\bnet\s+\d+\b/.test(s)
   );
 }
 
 export async function executePlannedQuestion({ rewriteQuestion, snapshot, user, includeArchived = false }) {
   const q = (rewriteQuestion || "").toString();
 
-  // Route RTK vs farms/fields
   if (looksRTK(q)) {
-    return await handleRTK({ question: q, snapshot, user, includeArchived, meta: { routerReason: "llm_plan_rtk" } });
+    return await handleRTK({
+      question: q,
+      snapshot,
+      user,
+      includeArchived,
+      meta: { routerReason: "llm_plan_rtk" }
+    });
   }
 
-  return await handleFarmsFields({ question: q, snapshot, user, includeArchived, meta: { routerReason: "llm_plan_ff" } });
+  return await handleFarmsFields({
+    question: q,
+    snapshot,
+    user,
+    includeArchived,
+    meta: { routerReason: "llm_plan_ff" }
+  });
 }
