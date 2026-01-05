@@ -1,10 +1,9 @@
 // /chat/llmPlanner.js  (FULL FILE)
-// Rev: 2026-01-05-llmPlanner6-no-response-format
+// Rev: 2026-01-05-llmPlanner7-hel-fields
 //
-// Fix:
-// ✅ Remove response_format entirely (common cause of OpenAI HTTP 400)
-// ✅ Strong prompt: "return ONLY valid JSON"
-// ✅ On HTTP errors, return the response body in meta.detail (for debugAI display)
+// Change:
+// ✅ Better canonical rewrites for "fields with HEL", "HEL ground", "just the fields with HEL acres"
+// ✅ Forces list intent to become an explicit filter (> 0) so deterministic handlers can execute.
 
 'use strict';
 
@@ -75,14 +74,23 @@ Rules:
 - If user explicitly says include archived/inactive => includeArchived=true.
 - If user explicitly says active only => includeArchived=false.
 - Paging commands: "show all", "more", "next" => action="execute" and rewriteQuestion exactly that command.
-- Canonical rewrites examples:
-  - "Tillable acres by county"
-  - "HEL acres by farm"
-  - "List fields in Sangamon County with acres"
-  - "List all farms"
-  - "How many counties do we farm in?"
-  - "List fields on Carlinville tower with tillable acres"
-  - "What RTK tower does field 0515 use?"
+
+IMPORTANT: When user asks to LIST specific fields (not totals), rewrite into an explicit filter query so deterministic handlers can execute:
+- "fields with hel ground" => "Show fields with HEL acres > 0"
+- "show me just the fields with hel acres" => "Show fields with HEL acres > 0"
+- "fields with crp" => "Show fields with CRP acres > 0"
+- "fields with tillable over 300" => keep threshold query
+
+Canonical rewrite examples:
+- "Tillable acres by county"
+- "HEL acres by farm"
+- "Show fields with HEL acres > 0"
+- "Show fields with CRP acres > 0"
+- "List fields in Sangamon County with acres"
+- "List all farms"
+- "How many counties do we farm in?"
+- "List fields on Carlinville tower with tillable acres"
+- "What RTK tower does field 0515 use?"
 
 If user asks about equipment/work orders/grain/contracts and not fields/farms:
 action="clarify" and ask "Do you mean fields/farms data, or equipment/work orders/grain/contracts?"
@@ -121,14 +129,7 @@ action="clarify" and ask "Do you mean fields/farms data, or equipment/work order
       return {
         ok: false,
         plan: null,
-        meta: {
-          used: true,
-          ok: false,
-          model,
-          ms,
-          error: `OpenAI HTTP ${r.status}`,
-          detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250)
-        }
+        meta: { used: true, ok: false, model, ms, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250) }
       };
     }
 
@@ -136,7 +137,6 @@ action="clarify" and ask "Do you mean fields/farms data, or equipment/work order
 
     let outText = safeStr(j?.output_text || "");
     if (!outText) {
-      // fallback extraction
       try {
         const chunks = [];
         for (const item of (j.output || [])) {
@@ -149,27 +149,17 @@ action="clarify" and ask "Do you mean fields/farms data, or equipment/work order
       } catch {}
     }
 
-    if (!outText) {
-      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "OpenAI returned empty plan" } };
-    }
+    if (!outText) return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "OpenAI returned empty plan" } };
 
     let plan = null;
     try { plan = JSON.parse(outText); }
     catch {
-      return {
-        ok: false,
-        plan: null,
-        meta: { used: true, ok: false, model, ms, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250) }
-      };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250) } };
     }
 
     const action = safeStr(plan?.action);
     if (action !== "execute" && action !== "clarify") {
-      return {
-        ok: false,
-        plan: null,
-        meta: { used: true, ok: false, model, ms, error: "Plan missing valid action", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250) }
-      };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "Plan missing valid action", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250) } };
     }
 
     const rewriteQuestion = safeStr(plan?.rewriteQuestion) || q;
