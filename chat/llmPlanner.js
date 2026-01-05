@@ -1,9 +1,11 @@
 // /chat/llmPlanner.js  (FULL FILE)
-// Rev: 2026-01-04-llmPlanner1
+// Rev: 2026-01-04-llmPlanner2
 //
-// OpenAI planner:
-// - Reads question + small snapshot summary + thread context
-// - Returns JSON plan: { action: "execute"|"clarify", rewriteQuestion?, includeArchived?, ask? }
+// OpenAI planner: produces a deterministic plan JSON.
+// It does NOT answer with data. It only decides:
+// - clarify vs execute
+// - includeArchived flag
+// - rewriteQuestion (canonical phrasing for your deterministic handlers)
 
 'use strict';
 
@@ -27,19 +29,20 @@ function buildSchemaSummary(snapshot) {
   function firstValues(obj, limit) {
     try { return Object.values(obj || {}).slice(0, limit); } catch { return []; }
   }
+  function firstKeys(obj, limit) {
+    try { return Object.keys(obj || {}).slice(0, limit); } catch { return []; }
+  }
 
   const PREVIEW = 6;
 
   for (const name of names) {
     const map = cols?.[name] || {};
-    const keys = Object.keys(map || {});
-    counts[name] = keys.length;
+    counts[name] = Object.keys(map).length;
 
     if (name === "farms" || name === "fields" || name === "rtkTowers") {
-      const vals = firstValues(map, PREVIEW).map(v => (v?.name || "").toString()).filter(Boolean);
-      previews[name] = vals;
+      previews[name] = firstValues(map, PREVIEW).map(v => (v?.name || "").toString()).filter(Boolean);
     } else {
-      previews[name] = keys.slice(0, PREVIEW);
+      previews[name] = firstKeys(map, PREVIEW);
     }
   }
 
@@ -51,11 +54,7 @@ export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent 
   const model = safeStr(process.env.OPENAI_MODEL || "gpt-4.1-mini");
 
   if (!apiKey) {
-    return {
-      ok: false,
-      error: "OPENAI_API_KEY not set",
-      plan: null
-    };
+    return { ok: false, error: "OPENAI_API_KEY not set", plan: null };
   }
 
   const q = safeStr(question);
@@ -64,32 +63,45 @@ export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent 
   const system = `
 You are FarmVista Copilot Planner.
 
-You MUST:
-- Decide whether to ASK A CLARIFYING QUESTION (action="clarify") or EXECUTE (action="execute").
-- Never fabricate data. You do not answer with data; you only output a plan.
-- Plans must be grounded in snapshot-only operations supported by the app.
+You output JSON ONLY (no extra text). You do NOT answer with data.
 
-Key rules:
-- Default scope is ACTIVE ONLY unless the user explicitly says include archived/inactive.
-- If the user’s request depends on scope and could change the answer materially, ask a single clarifying question: "Active only, or include archived?"
-- Follow-ups like "show all", "more", "next" are paging commands (handled elsewhere). If the user asks those, action should still be "execute" with rewriteQuestion equal to that command.
+Goal:
+- Decide if you should "clarify" or "execute".
+- Provide rewriteQuestion (canonical) + includeArchived (boolean).
 
-Supported domains:
-1) RTK:
-   - "How many RTK towers do we use?"
-   - "List RTK towers we use"
-   - "Fields on <tower>"
-   - "Fields on <tower> with tillable acres"
-   - "What RTK tower does field <id/name> use?"
-2) Farms/Fields/Counties:
-   - "How many fields/farms/counties"
-   - "List farms"
-   - "Counties we farm in with tillable acres per county"
-   - "Tillable acres by county" / "HEL acres by farm"
-   - "List fields in <County> County (with acres / by farm)"
+Rules:
+- Default scope is ACTIVE ONLY.
+- If the user question is ambiguous about scope AND likely to change the answer materially, ask ONE follow-up:
+  "Active only, or include archived?"
+  Use action="clarify" and set ask accordingly.
+- If the user explicitly says include archived/inactive => includeArchived=true.
+- If they explicitly say active only => includeArchived=false.
+- Paging commands: "show all", "more", "next" should return action="execute" and rewriteQuestion exactly equal to that command.
 
-Output JSON ONLY matching schema.
-`;
+Supported deterministic execution capabilities:
+RTK:
+- "How many RTK towers do we use?"
+- "List RTK towers we use"
+- "Fields on <tower>" (and with tillable acres)
+- "What RTK tower does field <id/name> use?"
+Farms/Fields/Counties:
+- "How many farms do we have?"
+- "List all farms"
+- "How many counties do we farm in?"
+- "Tillable acres by county"
+- "HEL acres by farm"
+- "List fields in <County> County" (and with acres)
+
+When rewriting:
+- Prefer short canonical forms like:
+  - "Tillable acres by county"
+  - "HEL acres by farm"
+  - "List fields in Sangamon County with acres"
+  - "Fields on Carlinville tower with tillable acres"
+- Keep the user’s county/tower/farm names.
+
+Return JSON matching schema exactly.
+`.trim();
 
   const schema = {
     name: "farmvista_plan",
@@ -118,19 +130,16 @@ Output JSON ONLY matching schema.
   const body = {
     model,
     input: [
-      { role: "system", content: system.trim() },
+      { role: "system", content: system },
       { role: "user", content: JSON.stringify(user) }
     ],
     response_format: { type: "json_schema", json_schema: schema },
-    max_output_tokens: 600
+    max_output_tokens: 650
   };
 
   const r = await fetch(OPENAI_URL, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
 
@@ -146,17 +155,15 @@ Output JSON ONLY matching schema.
   let plan = null;
   try { plan = JSON.parse(txt); } catch { return { ok: false, error: "Invalid JSON plan from OpenAI", raw: txt, plan: null }; }
 
-  // hard safety: ensure shape
   if (!plan || (plan.action !== "execute" && plan.action !== "clarify")) {
-    return { ok: false, error: "Plan missing action", plan: null, raw: txt };
-  }
-
-  // If clarify, ask should be present; rewriteQuestion can be the original question.
-  if (plan.action === "clarify") {
-    const ask = safeStr(plan.ask) || "Active only, or include archived?";
-    plan.ask = ask;
+    return { ok: false, error: "Plan missing action", raw: txt, plan: null };
   }
 
   plan.rewriteQuestion = safeStr(plan.rewriteQuestion) || q;
+  if (plan.action === "clarify") {
+    plan.ask = safeStr(plan.ask) || "Active only, or include archived?";
+  }
+
+  // includeArchived null => treat as false by default later
   return { ok: true, plan };
 }
