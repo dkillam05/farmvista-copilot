@@ -1,18 +1,15 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-04-followupInterpreter4-pendingClarify
+// Rev: 2026-01-04-followupInterpreter5-pendingClarify
 //
-// Adds:
-// ✅ pendingClarify support: if bot asked scope question and user replies "include archived" or "active only",
-//    rewrite to rerun the pending base question with that scope directive.
+// Adds pendingClarify support:
+// - If ctx.pendingClarify exists and user replies "active only" or "include archived",
+//   we rewrite to the stored baseQuestion plus scope directive.
 
 'use strict';
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
-function hasAny(s, arr) {
-  for (const t of arr) if (s.includes(t)) return true;
-  return false;
-}
+function hasAny(s, arr) { for (const t of arr) if (s.includes(t)) return true; return false; }
 
 function wantsIncludeArchived(s) {
   const q = norm(s);
@@ -33,30 +30,12 @@ function extractMetric(s) {
   return "";
 }
 
-function wantsByFarm(s) {
-  const q = norm(s);
-  return q.includes("by farm") || (q.includes("by") && q.includes("farm"));
-}
+function wantsByFarm(s) { const q = norm(s); return q.includes("by farm") || (q.includes("by") && q.includes("farm")); }
+function wantsByCounty(s) { const q = norm(s); return q.includes("by county") || (q.includes("by") && q.includes("county")); }
 
-function wantsByCounty(s) {
-  const q = norm(s);
-  return q.includes("by county") || (q.includes("by") && q.includes("county"));
-}
-
-function isSameThingFollowup(s) {
-  const q = norm(s);
-  return hasAny(q, ["same", "same thing", "same but", "do that again", "do it again"]);
-}
-
-function isSwitchBreakdownFollowup(s) {
-  const q = norm(s);
-  return wantsByFarm(q) || wantsByCounty(q);
-}
-
-function isThatEntityFollowup(s) {
-  const q = norm(s);
-  return hasAny(q, ["that field", "that one", "that farm", "that county", "that"]);
-}
+function isSameThingFollowup(s) { const q = norm(s); return hasAny(q, ["same", "same thing", "same but", "do that again", "do it again"]); }
+function isSwitchBreakdownFollowup(s) { const q = norm(s); return wantsByFarm(q) || wantsByCounty(q); }
+function isThatEntityFollowup(s) { const q = norm(s); return hasAny(q, ["that field", "that one", "that farm", "that county", "that"]); }
 
 function buildTotalsQuestion({ metric, by }) {
   const m = metric || "tillable";
@@ -85,11 +64,10 @@ export function interpretFollowup({ question, ctx }) {
 
   const c = ctx || {};
 
-  // ✅ Pending clarify: user replies with scope choice
+  // ✅ Pending scope clarification
   if (c.pendingClarify && (wantsIncludeArchived(q) || wantsActiveOnly(q))) {
     const base = (c.pendingClarify.baseQuestion || "").toString().trim();
     if (!base) return null;
-
     const suffix = wantsIncludeArchived(q) ? " including archived" : " active only";
     return {
       rewriteQuestion: `${base}${suffix}`.trim(),
@@ -126,7 +104,6 @@ export function interpretFollowup({ question, ctx }) {
     if (lastIntent === "field_lookup" && lastEntity && lastEntity.type === "field") {
       return { rewriteQuestion: `Tell me about ${lastEntity.id || lastEntity.name || ""}`.trim(), contextDelta: {} };
     }
-
     return null;
   }
 
