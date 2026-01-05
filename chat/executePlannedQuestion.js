@@ -1,45 +1,20 @@
 // /chat/executePlannedQuestion.js  (FULL FILE)
-// Rev: 2026-01-04-executePlannedQuestion2
+// Rev: 2026-01-04-executePlannedQuestion3
 //
-// Executes OpenAI plan against your deterministic handlers.
-// This is where "looks at snapshot" actually happens.
+// Executes the LLM plan against your existing deterministic router/handlers.
 
 'use strict';
 
-import { handleFarmsFields } from "../handlers/farmsFields.handler.js";
-import { handleRTK } from "../handlers/rtk.handler.js";
+import { routeQuestion } from "./router.js";
 
-const norm = (s) => (s || "").toString().trim().toLowerCase();
+export async function executePlannedQuestion({ rewriteQuestion, snapshot, user, state = null, includeArchived = false }) {
+  // Force scope via suffix so existing includeArchived detection works without refactors
+  const forced = includeArchived ? `${rewriteQuestion} including archived` : `${rewriteQuestion} active only`;
 
-function looksRTK(q) {
-  const s = norm(q);
-  return (
-    s.includes("rtk") ||
-    s.includes("tower") ||
-    s.includes("mhz") ||
-    s.includes("network id") ||
-    /\bnet\s+\d+\b/.test(s)
-  );
-}
-
-export async function executePlannedQuestion({ rewriteQuestion, snapshot, user, includeArchived = false }) {
-  const q = (rewriteQuestion || "").toString();
-
-  if (looksRTK(q)) {
-    return await handleRTK({
-      question: q,
-      snapshot,
-      user,
-      includeArchived,
-      meta: { routerReason: "llm_plan_rtk" }
-    });
-  }
-
-  return await handleFarmsFields({
-    question: q,
+  return await routeQuestion({
+    question: forced,
     snapshot,
     user,
-    includeArchived,
-    meta: { routerReason: "llm_plan_ff" }
+    state
   });
 }
