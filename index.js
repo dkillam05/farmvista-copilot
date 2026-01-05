@@ -1,11 +1,8 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-04a-min-core3-router2-snapshotbuild-summaryall-chatthread
+// Rev: 2026-01-05a-min-core3-router2-snapshotbuild-summaryall-chatthread-debugai
 //
 // CHANGE (Chat):
-// ✅ forwards threadId, continuation, and state from req.body into handleChat()
-// ✅ returns them back (already part of out), plus your existing meta enrichment
-//
-// Everything else unchanged.
+// ✅ forwards debugAI from req.body into handleChat()
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
@@ -21,21 +18,10 @@ function getRevision() {
   return process.env.K_REVISION || process.env.K_SERVICE || "local";
 }
 
-// --------------------
-// Health
-// --------------------
 app.get("/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "farmvista-copilot-min",
-    ts: new Date().toISOString(),
-    revision: getRevision()
-  });
+  res.status(200).json({ ok: true, service: "farmvista-copilot-min", ts: new Date().toISOString(), revision: getRevision() });
 });
 
-// --------------------
-// Snapshot status / reload
-// --------------------
 app.get("/context/status", async (req, res) => {
   const s = await getSnapshotStatus();
   res.json({ ...s, revision: getRevision() });
@@ -46,14 +32,8 @@ app.post("/context/reload", async (req, res) => {
   res.json({ ...r, revision: getRevision() });
 });
 
-// --------------------
-// Snapshot builder (scheduler target)
-// --------------------
 app.post("/snapshot/build", buildSnapshotHttp);
 
-// --------------------
-// Snapshot summary (UPDATED: all collections)
-// --------------------
 app.get("/context/summary", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
 
@@ -80,58 +60,29 @@ app.get("/context/summary", async (req, res) => {
 
   const counts = {};
   const preview = {};
-
   const colNames = Object.keys(cols || {}).sort((a, b) => a.localeCompare(b));
   const PREVIEW_LIMIT = 10;
 
-  function firstValues(obj, limit) {
-    try {
-      return Object.values(obj || {}).slice(0, limit);
-    } catch {
-      return [];
-    }
-  }
-
-  function firstKeys(obj, limit) {
-    try {
-      return Object.keys(obj || {}).slice(0, limit);
-    } catch {
-      return [];
-    }
-  }
+  function firstValues(obj, limit) { try { return Object.values(obj || {}).slice(0, limit); } catch { return []; } }
+  function firstKeys(obj, limit) { try { return Object.keys(obj || {}).slice(0, limit); } catch { return []; } }
 
   for (const name of colNames) {
     const map = cols?.[name] || {};
     counts[name] = Object.keys(map).length;
 
-    if (name === "farms") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
-      continue;
-    }
-    if (name === "fields") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
-      continue;
-    }
-    if (name === "rtkTowers") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean);
-      continue;
-    }
+    if (name === "farms") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
+    if (name === "fields") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
+    if (name === "rtkTowers") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
     if (name === "employees") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT)
-        .map(x => (x?.name || x?.displayName || x?.email || "").toString())
-        .filter(Boolean);
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.displayName || x?.email || "").toString()).filter(Boolean);
       continue;
     }
     if (name === "equipment") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT)
-        .map(x => (x?.name || x?.unit || x?.assetTag || x?.makeModel || x?.model || "").toString())
-        .filter(Boolean);
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.unit || x?.assetTag || x?.makeModel || x?.model || "").toString()).filter(Boolean);
       continue;
     }
     if (name === "binSites") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT)
-        .map(x => (x?.name || x?.siteName || "").toString())
-        .filter(Boolean);
+      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.siteName || "").toString()).filter(Boolean);
       continue;
     }
 
@@ -151,9 +102,6 @@ app.get("/context/summary", async (req, res) => {
   });
 });
 
-// --------------------
-// Snapshot raw (DEBUG ONLY)
-// --------------------
 app.get("/context/raw", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
   if (!snap?.ok) {
@@ -170,9 +118,6 @@ app.get("/context/raw", async (req, res) => {
   res.json(snap.json);
 });
 
-// --------------------
-// OpenAI health (proves OpenAI is reachable)
-// --------------------
 app.get("/openai/health", async (req, res) => {
   const apiKey = (process.env.OPENAI_API_KEY || "").trim();
   const model = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
@@ -183,48 +128,33 @@ app.get("/openai/health", async (req, res) => {
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        input: [{ role: "user", content: "ping" }],
-        max_output_tokens: 20
-      })
+      body: JSON.stringify({ model, input: [{ role: "user", content: "ping" }], max_output_tokens: 20 })
     });
 
     if (!r.ok) {
       const t = await r.text().catch(() => "");
-      return res.status(200).json({
-        ok: false,
-        error: `OpenAI HTTP ${r.status}`,
-        detail: (t || r.statusText).slice(0, 300),
-        revision: getRevision()
-      });
+      return res.status(200).json({ ok: false, error: `OpenAI HTTP ${r.status}`, detail: (t || r.statusText).slice(0, 300), revision: getRevision() });
     }
 
     const j = await r.json();
-    return res.status(200).json({
-      ok: true,
-      model,
-      sample: (j.output_text || "").slice(0, 80),
-      revision: getRevision()
-    });
+    return res.status(200).json({ ok: true, model, sample: (j.output_text || "").slice(0, 80), revision: getRevision() });
   } catch (e) {
     return res.status(200).json({ ok: false, error: e?.message || String(e), revision: getRevision() });
   }
 });
 
-// --------------------
-// Chat
-// --------------------
 app.post("/chat", async (req, res) => {
   const question = (req.body?.question || "").toString().trim();
   if (!question) return res.status(400).json({ ok: false, error: "Missing question", revision: getRevision() });
 
   const authHeader = (req.headers.authorization || "").toString();
 
-  // ✅ NEW: pass through these fields if present
   const threadId = (req.body?.threadId || "").toString().trim();
   const continuation = (req.body && typeof req.body.continuation === "object") ? req.body.continuation : null;
   const state = (req.body && typeof req.body.state === "object") ? req.body.state : null;
+
+  // ✅ NEW: debugAI comes from client payload (no Cloud Run env required)
+  const debugAI = !!req.body?.debugAI;
 
   const snap = await loadSnapshot({ force: false });
 
@@ -234,7 +164,8 @@ app.post("/chat", async (req, res) => {
     authHeader,
     threadId,
     continuation,
-    state
+    state,
+    debugAI
   });
 
   res.json({
@@ -251,9 +182,6 @@ app.post("/chat", async (req, res) => {
   });
 });
 
-// --------------------
-// Start server
-// --------------------
 const PORT = Number(process.env.PORT || 8080);
 app.listen(PORT, () => {
   console.log(`🚜 FarmVista Copilot running on port ${PORT} (rev: ${getRevision()})`);
