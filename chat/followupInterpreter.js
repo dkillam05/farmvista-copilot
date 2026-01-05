@@ -1,11 +1,12 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-03-followupInterpreter1
+// Rev: 2026-01-04-followupInterpreter2-rtk-tower-followups
 //
-// Global follow-up interpreter (deterministic).
-// Translates short follow-ups into explicit questions using stored context.
+// CHANGE:
+// ✅ If last context is an RTK tower fields list, then:
+//    - "include tillable acres" => rerun same tower fields with acres
+//    - "total those acres" / "sum those acres" => total tillable acres for that tower
 //
-// NOTE: Paging ("more", "the rest") is handled by /chat/followups.js.
-// This file handles "same thing but CRP", "by county", "including archived", etc.
+// Keeps existing behavior for farms/fields totals follow-ups.
 
 'use strict';
 
@@ -18,12 +19,10 @@ function hasAny(s, arr) {
 
 function extractMetric(s) {
   const q = norm(s);
-
   if (q.includes("hel")) return "hel";
   if (q.includes("crp")) return "crp";
-  if (q.includes("tillable") || q.includes("acres")) return "tillable";
+  if (q.includes("tillable") || q.includes("acres") || q.includes("acre")) return "tillable";
   if (q.includes("fields") || q.includes("count")) return "fields";
-
   return "";
 }
 
@@ -54,13 +53,37 @@ function isSameThingFollowup(s) {
 
 function isSwitchBreakdownFollowup(s) {
   const q = norm(s);
-  // "by county", "by farm" even without "same"
   return wantsByFarm(q) || wantsByCounty(q);
 }
 
 function isThatEntityFollowup(s) {
   const q = norm(s);
   return hasAny(q, ["that field", "that one", "that farm", "that county", "that"]);
+}
+
+function isIncludeTillableFollowup(s) {
+  const q = norm(s);
+  return (
+    q === "include tillable acres" ||
+    q === "include acres" ||
+    q === "with acres" ||
+    q.includes("include tillable") ||
+    q.includes("include acres") ||
+    q.includes("with tillable") ||
+    q.includes("with acres")
+  );
+}
+
+function isTotalThoseAcresFollowup(s) {
+  const q = norm(s);
+  return (
+    q.includes("total those acres") ||
+    q.includes("sum those acres") ||
+    q.includes("total the acres") ||
+    q.includes("sum the acres") ||
+    q === "total acres" ||
+    q === "sum acres"
+  );
 }
 
 function buildTotalsQuestion({ metric, by }) {
@@ -77,7 +100,6 @@ function buildTotalsQuestion({ metric, by }) {
     if (m === "fields") return "How many fields by county";
     return "County totals by county";
   }
-  // overall
   if (m === "hel") return "Total HEL acres";
   if (m === "crp") return "Total CRP acres";
   if (m === "fields") return "How many active fields do we have?";
@@ -97,11 +119,31 @@ export function interpretFollowup({ question, ctx }) {
   const c = ctx || {};
   const lastIntent = (c.lastIntent || "").toString();
   const lastMetric = (c.lastMetric || "").toString();
-  const lastBy = (c.lastBy || "").toString(); // "farm" | "county" | ""
-  const lastEntity = c.lastEntity || null;     // { type, id, name }
-  const lastScope = c.lastScope || {};         // { includeArchived, county, farmId, farmName }
+  const lastBy = (c.lastBy || "").toString();
+  const lastEntity = c.lastEntity || null; // { type, id, name }
+  const lastScope = c.lastScope || {};
 
-  // If user says "including archived" / "active only" as a follow-up, keep same intent
+  // ✅ RTK tower fields follow-ups (global)
+  // If we just listed fields for a tower, keep that tower context.
+  if (lastEntity && lastEntity.type === "tower" && (lastIntent === "tower_fields" || lastIntent === "tower_fields_tillable")) {
+    const towerName = (lastEntity.name || lastEntity.id || "").toString().trim();
+
+    if (isIncludeTillableFollowup(q)) {
+      return {
+        rewriteQuestion: `Fields on ${towerName} tower with tillable acres`,
+        contextDelta: { lastIntent: "tower_fields_tillable", lastMetric: "tillable" }
+      };
+    }
+
+    if (isTotalThoseAcresFollowup(q) || (q.includes("total") && q.includes("acres"))) {
+      return {
+        rewriteQuestion: `Total tillable acres for the ${towerName} tower`,
+        contextDelta: { lastIntent: "tower_tillable_total", lastMetric: "tillable" }
+      };
+    }
+  }
+
+  // If user says include archived/active only as follow-up
   if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
     if (lastIntent) {
       const includeArchived = wantsIncludeArchived(q) ? true : (wantsActiveOnly(q) ? false : !!lastScope.includeArchived);
@@ -114,17 +156,21 @@ export function interpretFollowup({ question, ctx }) {
         contextDelta: { lastScope: { includeArchived } }
       };
     }
-    // no prior context; let router handle normally
     return null;
   }
 
-  // "same thing but crp/hel/by county/by farm"
+  // "same thing but ..."
   if (isSameThingFollowup(q) || isSwitchBreakdownFollowup(q)) {
     const metric = extractMetric(q) || lastMetric || "";
     const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : (lastBy || ""));
 
-    // If lastIntent was a totals-type, rewrite to a totals prompt
-    if (lastIntent.includes("totals") || lastIntent.includes("count") || lastIntent.includes("breakdown") || lastIntent.includes("farm") || lastIntent.includes("county")) {
+    if (
+      lastIntent.includes("totals") ||
+      lastIntent.includes("count") ||
+      lastIntent.includes("breakdown") ||
+      lastIntent.includes("farm") ||
+      lastIntent.includes("county")
+    ) {
       const rq = buildTotalsQuestion({ metric, by });
       return {
         rewriteQuestion: rq,
@@ -135,30 +181,26 @@ export function interpretFollowup({ question, ctx }) {
       };
     }
 
-    // If last intent was field lookup, "same thing but hel" means: show HEL for that field (already shown)
     if (lastIntent === "field_lookup" && lastEntity && lastEntity.type === "field") {
-      // Re-run field lookup for same entity
       return {
         rewriteQuestion: `Tell me about ${lastEntity.id || lastEntity.name || ""}`.trim(),
         contextDelta: {}
       };
     }
 
-    // Otherwise, let router handle
     return null;
   }
 
-  // "that county" / "that farm" / "that field"
+  // "that field/farm/county"
   if (isThatEntityFollowup(q) && lastEntity) {
     if (lastEntity.type === "field") {
       return { rewriteQuestion: `Tell me about ${lastEntity.id || lastEntity.name}`.trim(), contextDelta: {} };
     }
     if (lastEntity.type === "farm") {
       const metric = extractMetric(q) || lastMetric || "tillable";
-      return { rewriteQuestion: `${metric.toUpperCase() === "HEL" ? "HEL acres" : metric === "crp" ? "CRP acres" : "Farm totals"} for ${lastEntity.name || lastEntity.id}`.trim(), contextDelta: {} };
+      return { rewriteQuestion: `${metric === "hel" ? "HEL acres" : metric === "crp" ? "CRP acres" : "Farm totals"} for ${lastEntity.name || lastEntity.id}`.trim(), contextDelta: {} };
     }
     if (lastEntity.type === "county") {
-      const metric = extractMetric(q) || lastMetric || "tillable";
       return { rewriteQuestion: `County totals for ${lastEntity.name || lastEntity.id} County`.trim(), contextDelta: {} };
     }
   }
