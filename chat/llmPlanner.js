@@ -1,11 +1,12 @@
 // /chat/llmPlanner.js  (FULL FILE)
-// Rev: 2026-01-04-llmPlanner2
+// Rev: 2026-01-04-llmPlanner3-debug
 //
-// OpenAI planner: produces a deterministic plan JSON.
-// It does NOT answer with data. It only decides:
-// - clarify vs execute
-// - includeArchived flag
-// - rewriteQuestion (canonical phrasing for your deterministic handlers)
+// OpenAI planner that outputs a JSON "plan".
+// It does NOT answer with farm data; it only decides how to answer.
+//
+// Debug:
+// - Returns timing + model + plan in meta
+// - If OPENAI_API_KEY is missing => ok:false
 
 'use strict';
 
@@ -49,12 +50,23 @@ function buildSchemaSummary(snapshot) {
   return { counts, previews };
 }
 
+function envBool(name) {
+  const v = safeStr(process.env[name]);
+  return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
+}
+
 export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent = false }) {
   const apiKey = safeStr(process.env.OPENAI_API_KEY);
   const model = safeStr(process.env.OPENAI_MODEL || "gpt-4.1-mini");
+  const debug = envBool("FV_AI_DEBUG");
 
   if (!apiKey) {
-    return { ok: false, error: "OPENAI_API_KEY not set", plan: null };
+    return {
+      ok: false,
+      error: "OPENAI_API_KEY not set",
+      meta: { used: false, model, ms: 0 },
+      plan: null
+    };
   }
 
   const q = safeStr(question);
@@ -63,44 +75,41 @@ export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent 
   const system = `
 You are FarmVista Copilot Planner.
 
-You output JSON ONLY (no extra text). You do NOT answer with data.
-
-Goal:
-- Decide if you should "clarify" or "execute".
-- Provide rewriteQuestion (canonical) + includeArchived (boolean).
+You MUST output JSON ONLY (no extra text). You do NOT answer with data.
+Your job is to produce a PLAN that the server will execute deterministically from the snapshot.
 
 Rules:
-- Default scope is ACTIVE ONLY.
-- If the user question is ambiguous about scope AND likely to change the answer materially, ask ONE follow-up:
+- Default is ACTIVE ONLY.
+- If scope is ambiguous AND likely to change the result materially, ask ONE follow-up:
   "Active only, or include archived?"
   Use action="clarify" and set ask accordingly.
-- If the user explicitly says include archived/inactive => includeArchived=true.
-- If they explicitly say active only => includeArchived=false.
-- Paging commands: "show all", "more", "next" should return action="execute" and rewriteQuestion exactly equal to that command.
-
-Supported deterministic execution capabilities:
-RTK:
-- "How many RTK towers do we use?"
-- "List RTK towers we use"
-- "Fields on <tower>" (and with tillable acres)
-- "What RTK tower does field <id/name> use?"
-Farms/Fields/Counties:
-- "How many farms do we have?"
-- "List all farms"
-- "How many counties do we farm in?"
-- "Tillable acres by county"
-- "HEL acres by farm"
-- "List fields in <County> County" (and with acres)
-
-When rewriting:
-- Prefer short canonical forms like:
+- If user says include archived/inactive => includeArchived=true.
+- If user says active only => includeArchived=false.
+- Paging commands: "show all", "more", "next" => action="execute" and rewriteQuestion exactly that command.
+- Prefer canonical short rewrites like:
   - "Tillable acres by county"
   - "HEL acres by farm"
   - "List fields in Sangamon County with acres"
+  - "List all farms"
+  - "How many counties do we farm in?"
   - "Fields on Carlinville tower with tillable acres"
-- Keep the user’s county/tower/farm names.
+  - "What RTK tower does field 0515 use?"
 
-Return JSON matching schema exactly.
+Supported execution domains (deterministic handlers):
+RTK:
+- How many RTK towers do we use?
+- List RTK towers we use
+- Fields on <tower> (with optional tillable acres)
+- What RTK tower does field <id/name> use?
+Farms/Fields/Counties:
+- How many farms/counties/fields
+- List all farms
+- Tillable acres by county
+- HEL acres by farm
+- List fields in <County> County (with optional acres)
+
+If the question is about "farm equipment", "work orders", "grain", "contracts", do NOT rewrite into farms/fields queries.
+Instead, action="clarify" and ask: "Do you mean fields/farms data, or equipment/work orders/grain/contracts?"
 `.trim();
 
   const schema = {
@@ -137,33 +146,68 @@ Return JSON matching schema exactly.
     max_output_tokens: 650
   };
 
-  const r = await fetch(OPENAI_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    return { ok: false, error: `OpenAI HTTP ${r.status}`, detail: (t || "").slice(0, 300), plan: null };
-  }
-
-  const j = await r.json();
-  const txt = safeStr(j?.output_text || "");
-  if (!txt) return { ok: false, error: "OpenAI returned empty plan", plan: null };
-
+  const t0 = Date.now();
   let plan = null;
-  try { plan = JSON.parse(txt); } catch { return { ok: false, error: "Invalid JSON plan from OpenAI", raw: txt, plan: null }; }
 
-  if (!plan || (plan.action !== "execute" && plan.action !== "clarify")) {
-    return { ok: false, error: "Plan missing action", raw: txt, plan: null };
+  // timeout guard
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.FV_AI_TIMEOUT_MS || 12000);
+  const timer = setTimeout(() => controller.abort(), Math.max(2000, timeoutMs));
+
+  try {
+    const r = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    const ms = Date.now() - t0;
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      return {
+        ok: false,
+        error: `OpenAI HTTP ${r.status}`,
+        detail: (txt || "").slice(0, 300),
+        meta: { used: true, ok: false, model, ms },
+        plan: null
+      };
+    }
+
+    const j = await r.json();
+    const outText = safeStr(j?.output_text || "");
+    if (!outText) {
+      return { ok: false, error: "OpenAI returned empty plan", meta: { used: true, ok: false, model, ms }, plan: null };
+    }
+
+    try { plan = JSON.parse(outText); }
+    catch {
+      return { ok: false, error: "Invalid JSON plan from OpenAI", meta: { used: true, ok: false, model, ms, raw: debug ? outText : undefined }, plan: null };
+    }
+
+    // normalize fields
+    if (!plan || (plan.action !== "execute" && plan.action !== "clarify")) {
+      return { ok: false, error: "Plan missing action", meta: { used: true, ok: false, model, ms, raw: debug ? outText : undefined }, plan: null };
+    }
+
+    plan.rewriteQuestion = safeStr(plan.rewriteQuestion) || q;
+    if (plan.action === "clarify") plan.ask = safeStr(plan.ask) || "Active only, or include archived?";
+
+    return {
+      ok: true,
+      meta: { used: true, ok: true, model, ms, plan: debug ? plan : undefined },
+      plan
+    };
+  } catch (e) {
+    const ms = Date.now() - t0;
+    return {
+      ok: false,
+      error: e?.name === "AbortError" ? "OpenAI timeout" : (e?.message || String(e)),
+      meta: { used: true, ok: false, model, ms },
+      plan: null
+    };
+  } finally {
+    clearTimeout(timer);
   }
-
-  plan.rewriteQuestion = safeStr(plan.rewriteQuestion) || q;
-  if (plan.action === "clarify") {
-    plan.ask = safeStr(plan.ask) || "Active only, or include archived?";
-  }
-
-  // includeArchived null => treat as false by default later
-  return { ok: true, plan };
 }
