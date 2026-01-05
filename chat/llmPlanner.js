@@ -1,12 +1,9 @@
 // /chat/llmPlanner.js  (FULL FILE)
-// Rev: 2026-01-04-llmPlanner3-debug
+// Rev: 2026-01-04-llmPlanner4-request-debug
 //
-// OpenAI planner that outputs a JSON "plan".
-// It does NOT answer with farm data; it only decides how to answer.
-//
-// Debug:
-// - Returns timing + model + plan in meta
-// - If OPENAI_API_KEY is missing => ok:false
+// OpenAI planner.
+// Returns: { ok, plan, meta }
+// meta always includes: used, ok, model, ms, error?
 
 'use strict';
 
@@ -27,12 +24,8 @@ function buildSchemaSummary(snapshot) {
   const previews = {};
   const names = Object.keys(cols || {}).sort((a, b) => a.localeCompare(b));
 
-  function firstValues(obj, limit) {
-    try { return Object.values(obj || {}).slice(0, limit); } catch { return []; }
-  }
-  function firstKeys(obj, limit) {
-    try { return Object.keys(obj || {}).slice(0, limit); } catch { return []; }
-  }
+  function firstValues(obj, limit) { try { return Object.values(obj || {}).slice(0, limit); } catch { return []; } }
+  function firstKeys(obj, limit) { try { return Object.keys(obj || {}).slice(0, limit); } catch { return []; } }
 
   const PREVIEW = 6;
 
@@ -50,23 +43,12 @@ function buildSchemaSummary(snapshot) {
   return { counts, previews };
 }
 
-function envBool(name) {
-  const v = safeStr(process.env[name]);
-  return v === "1" || v.toLowerCase() === "true" || v.toLowerCase() === "yes";
-}
-
-export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent = false }) {
+export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent = false, debug = false }) {
   const apiKey = safeStr(process.env.OPENAI_API_KEY);
   const model = safeStr(process.env.OPENAI_MODEL || "gpt-4.1-mini");
-  const debug = envBool("FV_AI_DEBUG");
 
   if (!apiKey) {
-    return {
-      ok: false,
-      error: "OPENAI_API_KEY not set",
-      meta: { used: false, model, ms: 0 },
-      plan: null
-    };
+    return { ok: false, plan: null, meta: { used: false, ok: false, model, ms: 0, error: "OPENAI_API_KEY not set" } };
   }
 
   const q = safeStr(question);
@@ -76,13 +58,13 @@ export async function llmPlan({ question, threadCtx = {}, snapshot, authPresent 
 You are FarmVista Copilot Planner.
 
 You MUST output JSON ONLY (no extra text). You do NOT answer with data.
-Your job is to produce a PLAN that the server will execute deterministically from the snapshot.
+You produce a PLAN that the server will execute deterministically from the snapshot.
 
 Rules:
-- Default is ACTIVE ONLY.
-- If scope is ambiguous AND likely to change the result materially, ask ONE follow-up:
+- Default scope is ACTIVE ONLY.
+- If scope is ambiguous AND likely to change the answer materially, ask ONE follow-up:
   "Active only, or include archived?"
-  Use action="clarify" and set ask accordingly.
+  action="clarify" and set ask.
 - If user says include archived/inactive => includeArchived=true.
 - If user says active only => includeArchived=false.
 - Paging commands: "show all", "more", "next" => action="execute" and rewriteQuestion exactly that command.
@@ -95,21 +77,21 @@ Rules:
   - "Fields on Carlinville tower with tillable acres"
   - "What RTK tower does field 0515 use?"
 
-Supported execution domains (deterministic handlers):
+Supported deterministic execution:
 RTK:
 - How many RTK towers do we use?
 - List RTK towers we use
-- Fields on <tower> (with optional tillable acres)
+- Fields on <tower> (optional tillable acres)
 - What RTK tower does field <id/name> use?
 Farms/Fields/Counties:
 - How many farms/counties/fields
 - List all farms
 - Tillable acres by county
 - HEL acres by farm
-- List fields in <County> County (with optional acres)
+- List fields in <County> County (optional acres)
 
-If the question is about "farm equipment", "work orders", "grain", "contracts", do NOT rewrite into farms/fields queries.
-Instead, action="clarify" and ask: "Do you mean fields/farms data, or equipment/work orders/grain/contracts?"
+If the question is about equipment/work orders/grain/contracts and not fields/farms, action="clarify" and ask:
+"Do you mean fields/farms data, or equipment/work orders/grain/contracts?"
 `.trim();
 
   const schema = {
@@ -147,67 +129,40 @@ Instead, action="clarify" and ask: "Do you mean fields/farms data, or equipment/
   };
 
   const t0 = Date.now();
-  let plan = null;
-
-  // timeout guard
-  const controller = new AbortController();
-  const timeoutMs = Number(process.env.FV_AI_TIMEOUT_MS || 12000);
-  const timer = setTimeout(() => controller.abort(), Math.max(2000, timeoutMs));
-
   try {
     const r = await fetch(OPENAI_URL, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal
+      body: JSON.stringify(body)
     });
 
     const ms = Date.now() - t0;
 
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      return {
-        ok: false,
-        error: `OpenAI HTTP ${r.status}`,
-        detail: (txt || "").slice(0, 300),
-        meta: { used: true, ok: false, model, ms },
-        plan: null
-      };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: `OpenAI HTTP ${r.status}`, detail: (txt || "").slice(0, 200) } };
     }
 
     const j = await r.json();
     const outText = safeStr(j?.output_text || "");
-    if (!outText) {
-      return { ok: false, error: "OpenAI returned empty plan", meta: { used: true, ok: false, model, ms }, plan: null };
-    }
+    if (!outText) return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "OpenAI returned empty plan" } };
 
+    let plan = null;
     try { plan = JSON.parse(outText); }
     catch {
-      return { ok: false, error: "Invalid JSON plan from OpenAI", meta: { used: true, ok: false, model, ms, raw: debug ? outText : undefined }, plan: null };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "Invalid JSON plan", raw: debug ? outText : undefined } };
     }
 
-    // normalize fields
     if (!plan || (plan.action !== "execute" && plan.action !== "clarify")) {
-      return { ok: false, error: "Plan missing action", meta: { used: true, ok: false, model, ms, raw: debug ? outText : undefined }, plan: null };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: "Plan missing action", raw: debug ? outText : undefined } };
     }
 
     plan.rewriteQuestion = safeStr(plan.rewriteQuestion) || q;
     if (plan.action === "clarify") plan.ask = safeStr(plan.ask) || "Active only, or include archived?";
 
-    return {
-      ok: true,
-      meta: { used: true, ok: true, model, ms, plan: debug ? plan : undefined },
-      plan
-    };
+    return { ok: true, plan, meta: { used: true, ok: true, model, ms, plan: debug ? plan : undefined } };
   } catch (e) {
     const ms = Date.now() - t0;
-    return {
-      ok: false,
-      error: e?.name === "AbortError" ? "OpenAI timeout" : (e?.message || String(e)),
-      meta: { used: true, ok: false, model, ms },
-      plan: null
-    };
-  } finally {
-    clearTimeout(timer);
+    return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: e?.message || String(e) } };
   }
 }
