@@ -78,6 +78,38 @@ function wantsCountiesWeFarmIn(q) {
 
   return false;
 }
+// ADD THIS BLOCK near the top of handleFarmsFields(), after `const q = norm(raw);`
+
+  // ✅ NEW: Natural-language "list fields with HEL/CRP" fallback
+  // If user asks for fields with HEL (or CRP) but doesn't give a threshold,
+  // treat it as "> 0" and route through the existing filtered-list engine.
+  //
+  // Examples:
+  // - "Fields with hel ground"
+  // - "Show me just the fields with hel acres"
+  // - "List fields with CRP"
+  const wantsFieldsWithHel = (q.includes("field") || q.includes("fields")) && q.includes("hel") && (wantsList(q) || q.includes("just") || q.includes("only"));
+  const wantsFieldsWithCrp = (q.includes("field") || q.includes("fields")) && q.includes("crp") && (wantsList(q) || q.includes("just") || q.includes("only"));
+
+  // If they didn't specify a comparator/threshold, assume > 0
+  const hasComparator =
+    q.includes(">") || q.includes(">=") || q.includes("more than") || q.includes("greater than") ||
+    q.includes("over ") || q.includes("above ") || q.includes("at least");
+
+  if ((wantsFieldsWithHel || wantsFieldsWithCrp) && !hasComparator) {
+    const rewritten = wantsFieldsWithHel
+      ? "Show fields with HEL acres > 0"
+      : "Show fields with CRP acres > 0";
+
+    // Re-run handler recursively once with explicit filter text
+    return await handleFarmsFields({
+      question: rewritten,
+      snapshot,
+      user,
+      includeArchived,
+      meta: { ...(meta || {}), routerReason: "nl_fields_with_metric_autothreshold" }
+    });
+  }
 
 function looksLikeFilteredList(q) {
   if (!(wantsList(q) || q.includes("which"))) return false;
