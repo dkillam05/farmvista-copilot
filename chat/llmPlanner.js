@@ -1,9 +1,9 @@
 // /chat/llmPlanner.js  (FULL FILE)
-// Rev: 2026-01-05-llmPlanner7-hel-fields
+// Rev: 2026-01-05-llmPlanner8-farm-fieldcount
 //
 // Change:
-// ✅ Better canonical rewrites for "fields with HEL", "HEL ground", "just the fields with HEL acres"
-// ✅ Forces list intent to become an explicit filter (> 0) so deterministic handlers can execute.
+// ✅ Add canonical rewrite for "How many fields in/on the <farm> farm?"
+//    -> "How many fields on <farm> farm"
 
 'use strict';
 
@@ -75,22 +75,23 @@ Rules:
 - If user explicitly says active only => includeArchived=false.
 - Paging commands: "show all", "more", "next" => action="execute" and rewriteQuestion exactly that command.
 
-IMPORTANT: When user asks to LIST specific fields (not totals), rewrite into an explicit filter query so deterministic handlers can execute:
-- "fields with hel ground" => "Show fields with HEL acres > 0"
-- "show me just the fields with hel acres" => "Show fields with HEL acres > 0"
-- "fields with crp" => "Show fields with CRP acres > 0"
-- "fields with tillable over 300" => keep threshold query
+IMPORTANT canonical rewrites that MUST be used:
+- If user asks: "How many fields in/on the <farm> farm?"
+  rewriteQuestion MUST be: "How many fields on <farm> farm"
+  (Example: "How many fields on cville farm")
+
+- If user asks to list specific fields (not totals), rewrite into explicit filter:
+  - "fields with hel ground" => "Show fields with HEL acres > 0"
+  - "fields with crp" => "Show fields with CRP acres > 0"
 
 Canonical rewrite examples:
 - "Tillable acres by county"
 - "HEL acres by farm"
 - "Show fields with HEL acres > 0"
 - "Show fields with CRP acres > 0"
+- "How many fields on cville farm"
 - "List fields in Sangamon County with acres"
-- "List all farms"
-- "How many counties do we farm in?"
 - "List fields on Carlinville tower with tillable acres"
-- "What RTK tower does field 0515 use?"
 
 If user asks about equipment/work orders/grain/contracts and not fields/farms:
 action="clarify" and ask "Do you mean fields/farms data, or equipment/work orders/grain/contracts?"
@@ -126,11 +127,7 @@ action="clarify" and ask "Do you mean fields/farms data, or equipment/work order
 
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      return {
-        ok: false,
-        plan: null,
-        meta: { used: true, ok: false, model, ms, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250) }
-      };
+      return { ok: false, plan: null, meta: { used: true, ok: false, model, ms, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250) } };
     }
 
     const j = await r.json();
