@@ -1,11 +1,11 @@
 // /chat/handlerKit.js  (FULL FILE)
-// Rev: 2026-01-05-handlerKit1
+// Rev: 2026-01-05-handlerKit2
 //
 // Shared rules for ALL handlers:
-// ✅ sorting (A→Z default, largest/smallest override)
-// ✅ field label numeric sort (0504-..., 0801-...)
-// ✅ paging (meta.continuation + display)
-// ✅ standard tips for users
+// ✅ sorting (A→Z default; allow largest/smallest first)
+// ✅ numeric field sort (0504-..., 0801-...)
+// ✅ paging (answer + meta.continuation)
+// ✅ standard "tip" strings
 
 'use strict';
 
@@ -53,7 +53,7 @@ export function detectSortMode(qRaw) {
     q.includes("bottom first")
   );
 
-  // explicit alphabetical phrases
+  // explicit alphabetical
   if (q.includes("a-z") || q.includes("alphabetical") || q.includes("abc")) return "az";
 
   if (largest) return "largest";
@@ -64,6 +64,7 @@ export function detectSortMode(qRaw) {
 // rows: { name, value, raw }
 export function sortRows(rows, mode = "az") {
   const m = mode || "az";
+
   rows.sort((a, b) => {
     const an = alphaKey(a?.name);
     const bn = alphaKey(b?.name);
@@ -82,17 +83,15 @@ export function sortRows(rows, mode = "az") {
     }
     return an.localeCompare(bn);
   });
+
   return rows;
 }
 
 export function sortHintLine(mode) {
-  if (mode === "largest" || mode === "smallest") {
-    return `Tip: say "A-Z" to sort alphabetically.`;
-  }
+  if (mode === "largest" || mode === "smallest") return `Tip: say "A-Z" to sort alphabetically.`;
   return `Tip: say "largest first" to sort by size.`;
 }
 
-// Build paged answer + continuation
 export function buildPaged({ title, lines, pageSize = 25, showTip = false, tipMode = "az" }) {
   const ps = Math.max(10, Math.min(80, Number(pageSize) || 25));
   const first = lines.slice(0, ps);
@@ -110,4 +109,15 @@ export function buildPaged({ title, lines, pageSize = 25, showTip = false, tipMo
     : null;
 
   return { answer: out.join("\n"), continuation };
+}
+
+// Handy helpers
+export function stripBullet(s) {
+  return (s || "").toString().replace(/^\s*•\s*/, "").trim();
+}
+
+export function fmtInt(n) { return Math.round(Number(n) || 0).toLocaleString(); }
+export function fmtAcre(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
