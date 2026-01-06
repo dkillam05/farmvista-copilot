@@ -1,18 +1,17 @@
 // /handlers/farmsFields.handler.js  (FULL FILE)
-// Rev: 2026-01-05-handler-filteredlists2-kit
+// Rev: 2026-01-06-handler-filteredlists2-kit-shorthand
 //
-// Now uses shared rules from /chat/handlerKit.js
-// ✅ Default A→Z for farms/counties summaries, optional largest/smallest first
-// ✅ Fields always numeric sort
-// ✅ Paged output standardized by buildPaged()
-// ✅ Natural-language "fields with hel" => auto threshold > 0 (one place)
+// UPDATE (scalable shorthand):
+// ✅ Uses /chat/entityResolver.js to resolve farm shorthand (cville, illio, etc.)
+// ✅ Adds "How many fields in/on <farm>" (farm shorthand supported)
+// ✅ List fields on a farm uses resolver (shorthand supported)
 //
-// Keeps existing intent set:
-// ✅ filtered field lists
+// Keeps (unchanged core behaviors):
+// ✅ uses shared rules from /chat/handlerKit.js
 // ✅ metric-by-county and metric-by-farm
+// ✅ filtered field lists
 // ✅ counties we farm in
 // ✅ totals overall
-// ✅ list fields on a farm
 // ✅ field lookup
 
 'use strict';
@@ -29,10 +28,11 @@ import {
   sortRows,
   sortFieldsByNumberThenName,
   buildPaged,
-  stripBullet,
   fmtInt,
   fmtAcre
 } from "../chat/handlerKit.js";
+
+import { resolveEntity } from "../chat/entityResolver.js";
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -50,7 +50,7 @@ function num(v) {
 // ------------------------
 // Intent helpers
 // ------------------------
-function wantsCount(q) { return q.includes("how many") || q.includes("count") || q.includes("total") || q.includes("number of"); }
+function wantsCount(q) { return q.includes("how many") || q.includes("how man") || q.includes("count") || q.includes("number of"); }
 function wantsAcres(q) { return q.includes("acres") || q.includes("tillable") || q.includes("acre"); }
 function wantsHel(q) { return q.includes("hel"); }
 function wantsCrp(q) { return q.includes("crp"); }
@@ -219,6 +219,45 @@ function totalsByCounty({ cols, includeArchived }) {
 }
 
 /* =========================
+   Shorthand helpers
+========================= */
+function extractFarmPhrase(raw) {
+  const s = (raw || "").toString();
+
+  // "in the cville farm" / "on cville farm"
+  let m = s.match(/\b(?:in|on|at)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+farm\b/i);
+  if (m && m[1]) return m[1].trim();
+
+  // "cville farm"
+  m = s.match(/\b([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+farm\b/i);
+  if (m && m[1]) return m[1].trim();
+
+  // trailing "on <farm>" / "in <farm>"
+  m = s.match(/\b(?:on|in)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b\s*$/i);
+  if (m && m[1]) return m[1].trim();
+
+  return "";
+}
+
+function resolveFarmFromText({ snapshot, text, includeArchived }) {
+  const guess = (text || "").toString().trim();
+  if (!guess) return null;
+
+  const r = resolveEntity({
+    snapshot,
+    collection: "farms",
+    query: guess,
+    includeArchived: !!includeArchived,
+    limit: 1
+  });
+
+  if (!r.ok || !r.matches?.length) return null;
+
+  const top = r.matches[0];
+  return { id: top.id, name: top.label, score: top.score };
+}
+
+/* =========================
    Handler
 ========================= */
 export async function handleFarmsFields({ question, snapshot, user, includeArchived = false, meta = {} }) {
@@ -268,6 +307,33 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     });
   }
 
+  // ✅ NEW: "How many fields in/on <farm> farm?" (shorthand supported)
+  if (wantsCount(q) && (q.includes("field") || q.includes("fields")) && q.includes("farm")) {
+    const farmPhrase = extractFarmPhrase(raw);
+    const farmHit = resolveFarmFromText({ snapshot, text: farmPhrase, includeArchived });
+
+    if (farmHit) {
+      let count = 0;
+      for (const [, f] of Object.entries(cols.fields || {})) {
+        if (!includeArchived && !isActiveStatus(f?.status)) continue;
+        if ((f?.farmId || "") !== farmHit.id) continue;
+        count += 1;
+      }
+
+      return {
+        ok: true,
+        answer:
+          `Farm: ${farmHit.name}\n` +
+          `Fields: ${fmtInt(count)} (${includeArchived ? "incl archived" : "active only"})`,
+        meta: {
+          routed: "farmsFields",
+          intent: "count_fields_on_farm",
+          farmId: farmHit.id
+        }
+      };
+    }
+  }
+
   // ✅ Metric summaries by county (A→Z default; largest/smallest optional)
   if (q.includes("by county") && (wantsAcres(q) || wantsHel(q) || wantsCrp(q) || q.includes("fields"))) {
     const metric = metricFromQuery(q);
@@ -280,7 +346,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     sortRows(rows, sortMode);
 
     const title = `${metricLabel(metric)} by county (${includeArchived ? "incl archived" : "active only"}) — ${sortMode === "largest" ? "largest first" : sortMode === "smallest" ? "smallest first" : "A-Z"}:`;
-
     const lines = rows.map(x => {
       const r = x.raw;
       if (metric === "fields") return `• ${r.key}\n  ${fmtInt(r.fields)} fields`;
@@ -305,7 +370,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     sortRows(rows, sortMode);
 
     const title = `${metricLabel(metric)} by farm (${includeArchived ? "incl archived" : "active only"}) — ${sortMode === "largest" ? "largest first" : sortMode === "smallest" ? "smallest first" : "A-Z"}:`;
-
     const lines = rows.map(x => {
       const r = x.raw;
       if (metric === "fields") return `• ${r.name}\n  ${fmtInt(r.fields)} fields`;
@@ -333,8 +397,7 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
 
     const matches = [];
     for (const [fieldId, f] of Object.entries(cols.fields || {})) {
-      const active = isActiveStatus(f?.status);
-      if (!includeArchived && !active) continue;
+      if (!includeArchived && !isActiveStatus(f?.status)) continue;
 
       const v = (metric === "hel") ? num(f?.helAcres) : (metric === "crp") ? num(f?.crpAcres) : num(f?.tillable);
       const pass = (op === ">=") ? (v >= minVal) : (v > minVal);
@@ -373,7 +436,6 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
         return { name, items, total };
       });
 
-      // farm order: A→Z default; allow largest/smallest by total
       if (sortMode === "largest") farms.sort((a, b) => (b.total - a.total) || a.name.localeCompare(b.name));
       else if (sortMode === "smallest") farms.sort((a, b) => (a.total - b.total) || a.name.localeCompare(b.name));
       else farms.sort((a, b) => a.name.localeCompare(b.name));
@@ -423,26 +485,27 @@ export async function handleFarmsFields({ question, snapshot, user, includeArchi
     return { ok: true, answer: lines.join("\n"), meta: { routed: "farmsFields", intent: "totals_overall" } };
   }
 
-  // List fields on a farm (numeric field order)
-  if ((wantsList(q) || q.includes("show")) && q.includes("field") && (q.includes(" on ") || q.includes(" in "))) {
-    const farmGuess = (raw.match(/\b(?:on|in)\s+([a-z0-9][a-z0-9\s\-\._]{1,60})$/i)?.[1] || "").trim();
-    const farm = findFarmByName(cols, farmGuess);
-    if (!farm) return { ok: false, answer: `Which farm? Example: "List fields on Illiopolis-MtAuburn"` };
+  // ✅ List fields on a farm (shorthand supported)
+  if ((wantsList(q) || q.includes("show")) && q.includes("field")) {
+    const farmPhrase = extractFarmPhrase(raw);
+    const farmHit = resolveFarmFromText({ snapshot, text: farmPhrase, includeArchived });
 
-    const labels = [];
-    for (const [fieldId, f] of Object.entries(cols.fields || {})) {
-      if (!includeArchived && !isActiveStatus(f?.status)) continue;
-      if ((f?.farmId || "") !== farm.id) continue;
-      labels.push(formatFieldOptionLine({ snapshot, fieldId }) || fieldId);
+    if (farmHit) {
+      const labels = [];
+      for (const [fieldId, f] of Object.entries(cols.fields || {})) {
+        if (!includeArchived && !isActiveStatus(f?.status)) continue;
+        if ((f?.farmId || "") !== farmHit.id) continue;
+        labels.push(formatFieldOptionLine({ snapshot, fieldId }) || fieldId);
+      }
+
+      labels.sort(sortFieldsByNumberThenName);
+      const lines = labels.map(l => `• ${l}`);
+
+      const title = `Fields on ${farmHit.name} (${fmtInt(labels.length)}) — ${includeArchived ? "incl archived" : "active only"}:`;
+      const paged = buildPaged({ title, lines, pageSize: 40 });
+
+      return { ok: true, answer: paged.answer, meta: { routed: "farmsFields", intent: "list_fields_on_farm", continuation: paged.continuation } };
     }
-
-    labels.sort(sortFieldsByNumberThenName);
-    const lines = labels.map(l => `• ${l}`);
-
-    const title = `Fields on ${farm.name || farm.id} (${fmtInt(labels.length)}):`;
-    const paged = buildPaged({ title, lines, pageSize: 40 });
-
-    return { ok: true, answer: paged.answer, meta: { routed: "farmsFields", intent: "list_fields_on_farm", continuation: paged.continuation } };
   }
 
   // Field lookup (default)
