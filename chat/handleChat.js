@@ -1,13 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql1
+// Rev: 2026-01-06-handleChat-sql2-clean-output
 //
 // Change:
+// ✅ Clean output formatting for SQL results (Option A style):
+//    - counts/sums => single number / single line
+//    - list queries => bullets only (no key:value spam)
+//    - default: hide acres unless user asked for acres/tillable
+// ✅ Paging for SQL lists via meta.continuation so "show all / more" works globally
+//
+// Keeps:
 // ✅ Build/ensure SQLite DB from snapshot
 // ✅ OpenAI generates SELECT SQL
 // ✅ Run SQL and format result
 // ✅ Fallback to existing llmPlanner + executePlannedQuestion if SQL fails
-//
-// Keeps:
 // ✅ paging followups (/chat/followups.js)
 // ✅ conversation interpreter (/chat/followupInterpreter.js)
 // ✅ threadId / continuation passthrough
@@ -43,10 +48,61 @@ function makeThreadId() {
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-function formatRows(rows) {
+function norm(s) { return (s || "").toString().trim().toLowerCase(); }
+
+function userAskedForAcres(q) {
+  const s = norm(q);
+  return (
+    s.includes("acres") ||
+    s.includes("tillable") ||
+    s.includes("with acres") ||
+    s.includes("include acres") ||
+    s.includes("including acres") ||
+    s.includes("include tillable") ||
+    s.includes("including tillable")
+  );
+}
+
+function looksLikeListQuery(q) {
+  const s = norm(q);
+  return (
+    s.startsWith("list") ||
+    s.startsWith("show") ||
+    s.includes("list ") ||
+    s.includes("show ") ||
+    s.includes("fields in") ||
+    s.includes("fields on") ||
+    s.includes("farms") ||
+    s.includes("counties") ||
+    s.includes("towers")
+  );
+}
+
+// Prefer readable label fields
+function pickLabelField(row) {
+  if (!row || typeof row !== "object") return null;
+
+  // common
+  if (row.label != null) return "label";
+  if (row.name != null) return "name";
+  if (row.field != null) return "field";
+  if (row.fieldName != null) return "fieldName";
+  if (row.farm != null) return "farm";
+  if (row.farmName != null) return "farmName";
+  if (row.county != null) return "county";
+  if (row.tower != null) return "tower";
+  if (row.towerName != null) return "towerName";
+
+  // fallback: first stringy field
+  for (const [k, v] of Object.entries(row)) {
+    if (typeof v === "string" && v.trim()) return k;
+  }
+  return null;
+}
+
+function formatScalar(rows) {
   if (!Array.isArray(rows) || !rows.length) return "(no matches)";
 
-  // If single scalar result
   if (rows.length === 1) {
     const keys = Object.keys(rows[0] || {});
     if (keys.length === 1) {
@@ -55,19 +111,70 @@ function formatRows(rows) {
     }
   }
 
-  // Print key=value lines for up to 25 rows
-  const max = Math.min(25, rows.length);
+  return null;
+}
+
+// Build a bullet list (Option A): bullets only; acres only if asked and present
+function buildBullets({ rows, includeAcres }) {
   const lines = [];
-  for (let i = 0; i < max; i++) {
-    const r = rows[i] || {};
-    const parts = [];
-    for (const [k, v] of Object.entries(r)) {
-      parts.push(`${k}: ${v}`);
+  for (const r of rows) {
+    const labelKey = pickLabelField(r);
+    const label = labelKey ? String(r[labelKey] ?? "").trim() : "";
+    if (!label) continue;
+
+    let line = `• ${label}`;
+
+    if (includeAcres) {
+      // try common acres columns
+      const acres =
+        (r.acres != null ? Number(r.acres) : null) ??
+        (r.tillable != null ? Number(r.tillable) : null) ??
+        (r.tillableAcres != null ? Number(r.tillableAcres) : null);
+
+      if (Number.isFinite(acres)) {
+        // show with up to 2 decimals, no trailing junk
+        const a = acres.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+        line += ` — ${a} ac`;
+      }
     }
-    lines.push(`• ${parts.join(" • ")}`);
+
+    lines.push(line);
   }
-  if (rows.length > max) lines.push(`…plus ${rows.length - max} more rows.`);
-  return lines.join("\n");
+
+  if (!lines.length) return ["(no matches)"];
+  return lines;
+}
+
+function pageLines({ title, allLines, limit = 25 }) {
+  const pageSize = Math.max(10, Math.min(80, Number(limit) || 25));
+  const first = allLines.slice(0, pageSize);
+  const remaining = allLines.length - first.length;
+
+  const out = [];
+  if (title) out.push(title);
+  out.push(...first);
+  if (remaining > 0) out.push(`…plus ${remaining} more.`);
+
+  const continuation = (remaining > 0)
+    ? { kind: "page", title: title || "", lines: allLines, offset: pageSize, pageSize }
+    : null;
+
+  return { answer: out.join("\n"), continuation };
+}
+
+function formatSqlResult({ question, rows }) {
+  const scalar = formatScalar(rows);
+  if (scalar != null) {
+    // single value answer
+    return { answer: scalar, continuation: null };
+  }
+
+  const includeAcres = userAskedForAcres(question);
+  const allLines = buildBullets({ rows, includeAcres });
+
+  // For lists: show up to 25 by default (paging handled by followups.js)
+  const title = ""; // Option A: no extra header unless you want it later
+  return pageLines({ title, allLines, limit: 25 });
 }
 
 export async function handleChat({
@@ -139,12 +246,10 @@ export async function handleChat({
       const exec = runSql({ db: getDb(), sql: sqlPlan.sql, limitDefault: 80 });
 
       if (exec.ok) {
-        const answer = formatRows(exec.rows);
+        const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows || [] });
 
-        let out = answer;
-        if (debug) {
-          out += `\n\n[AI SQL: ON • ${sqlPlan.meta.model} • ${sqlPlan.meta.ms}ms]`;
-        }
+        let out = safeStr(formatted.answer) || "(no response)";
+        if (debug) out += `\n\n[AI SQL: ON • ${sqlPlan.meta.model} • ${sqlPlan.meta.ms}ms]`;
 
         return {
           ok: true,
@@ -153,6 +258,7 @@ export async function handleChat({
           meta: {
             routed: "sql",
             threadId: tid,
+            continuation: formatted.continuation || null,
             sql: debug ? exec.sql : undefined,
             sqlRows: exec.rows?.length || 0
           },
