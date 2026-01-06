@@ -1,11 +1,10 @@
 // /handlers/rtk.handler.js  (FULL FILE)
-// Rev: 2026-01-05-rtkHandler7-handlerKit-sorting
+// Rev: 2026-01-06-rtkHandler8-handlerKit-shorthand
 //
-// CHANGE:
-// ✅ Uses shared /chat/handlerKit.js for sorting + paging rules
-// ✅ Default tower list sort: A→Z; allow "largest first"/"smallest first" (by fieldCount)
-// ✅ Field lists sorted numeric by field prefix (0504-, 0801-, etc.)
-// ✅ Adds sort tip line
+// UPDATE (scalable shorthand):
+// ✅ Uses /chat/entityResolver.js to resolve tower shorthand (carlin, cville tower, etc.)
+// ✅ Still uses handlerKit for sorting + paging rules
+// ✅ Fields lists sorted numeric by field prefix
 //
 // Keeps:
 // ✅ meta.contextDelta for tower_fields and tower_fields_tillable
@@ -15,7 +14,6 @@
 
 import {
   summarizeTowersUsed,
-  lookupTowerByName,
   getTowerUsage,
   getFieldTowerSummary
 } from "../data/rtkData.js";
@@ -26,6 +24,8 @@ import {
   sortFieldsByNumberThenName,
   buildPaged
 } from "../chat/handlerKit.js";
+
+import { resolveEntity } from "../chat/entityResolver.js";
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -44,23 +44,24 @@ function wantsFarms(q) { return norm(q).includes("farms"); }
 function wantsFields(q) { return norm(q).includes("fields"); }
 function wantsTillable(q) { const s = norm(q); return s.includes("tillable") || s.includes("acres"); }
 
-function extractTowerNameGuess(raw) {
+function extractTowerPhrase(raw) {
   const s = (raw || "").toString().trim();
   if (!s) return "";
 
-  let m = s.match(/^\s*([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s*:\s*\d+\s*fields?\b/i);
+  // "fields on carlinville tower"
+  let m = s.match(/\bfields\s+(?:for|on|with)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
   if (m && m[1]) return m[1].trim();
 
-  m = s.match(/\bfields\s+(?:for|on|with)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
-  if (m && m[1]) return m[1].trim();
-
-  m = s.match(/\b(?:use|uses|using|on|for|from|with|along\s+with)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
-  if (m && m[1]) return m[1].trim();
-
+  // "... carlinville rtk tower"
   m = s.match(/\b([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\s+(?:rtk\s+)?tower\b/i);
   if (m && m[1]) return m[1].trim();
 
+  // "tower carlinville"
   m = s.match(/\btower\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b/i);
+  if (m && m[1]) return m[1].trim();
+
+  // fallback: try last token chunk
+  m = s.match(/\b(?:on|for|with)\s+([A-Za-z0-9][A-Za-z0-9\s\-\._]{1,60})\b\s*$/i);
   if (m && m[1]) return m[1].trim();
 
   return "";
@@ -82,6 +83,23 @@ function extractFieldGuess(raw) {
 
   s = s.replace(/\b(use|uses|using|assigned|on|for)\b.*$/i, "").trim();
   return s;
+}
+
+function resolveTower({ snapshot, towerText, includeArchived }) {
+  const guess = (towerText || "").toString().trim();
+  if (!guess) return null;
+
+  const r = resolveEntity({
+    snapshot,
+    collection: "rtkTowers",
+    query: guess,
+    includeArchived: !!includeArchived,
+    limit: 1
+  });
+
+  if (!r.ok || !r.matches?.length) return null;
+  const top = r.matches[0];
+  return { id: top.id, name: top.label, score: top.score };
 }
 
 export async function handleRTK({ question, snapshot, user, includeArchived = false, meta = {} }) {
@@ -124,19 +142,12 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     };
   }
 
-  // Tower-specific
-  const towerGuess = extractTowerNameGuess(raw);
-  if (towerGuess) {
-    const lt = lookupTowerByName({ snapshot, towerName: towerGuess });
-    if (!lt.ok || !lt.tower?.id) {
-      return {
-        ok: false,
-        answer: "Please check /data/rtkData.js — tower lookup failed.",
-        meta: { routed: "rtk", intent: "tower_lookup_failed", towerGuess, debugFile: "/data/rtkData.js" }
-      };
-    }
+  // Tower-specific (shorthand)
+  const towerPhrase = extractTowerPhrase(raw);
+  const towerHit = resolveTower({ snapshot, towerText: towerPhrase, includeArchived });
 
-    const usage = getTowerUsage({ snapshot, towerId: lt.tower.id, includeArchived });
+  if (towerHit) {
+    const usage = getTowerUsage({ snapshot, towerId: towerHit.id, includeArchived });
     if (!usage.ok) {
       return {
         ok: false,
@@ -149,23 +160,15 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     if (wantsFields(q) || q.includes("fields for") || q.includes("fields with") || q.includes("fields that use")) {
       const includeTillable = wantsTillable(q);
 
-      // Build labels and sort numeric
       const items = (usage.fields || []).map(f => {
         const base = `${f.name}${f.farmName ? ` (${f.farmName})` : ""}`;
         return includeTillable ? `• ${base}\n  ${fmtAcre(f.tillable || 0)} ac` : `• ${base}`;
       });
 
-      // Sort by the field name prefix in the label (we strip the leading bullet for sort)
       items.sort((a, b) => sortFieldsByNumberThenName(a.replace(/^•\s*/, ""), b.replace(/^•\s*/, "")));
 
       const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
-
-      const paged = buildPaged({
-        title,
-        lines: items,
-        pageSize: 35,
-        showTip: false
-      });
+      const paged = buildPaged({ title, lines: items, pageSize: 35, showTip: false });
 
       return {
         ok: true,
@@ -187,9 +190,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     // Farms list (A→Z only)
     if (wantsFarms(q)) {
       const title = `Farms using ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
-      const lines = (usage.farms || [])
-        .map(f => `• ${f.name}`)
-        .sort((a, b) => a.localeCompare(b));
+      const lines = (usage.farms || []).map(f => `• ${f.name}`).sort((a, b) => a.localeCompare(b));
 
       const paged = buildPaged({ title, lines, pageSize: 20, showTip: false });
 
@@ -241,7 +242,6 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
 
     const title = `RTK towers used (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(s.towersUsedCount || 0)} — ${sortMode === "largest" ? "largest first" : sortMode === "smallest" ? "smallest first" : "A-Z"}`;
 
-    // Build rows then sort via kit
     const rows = (s.towers || []).map(t => ({
       name: (t.name || t.towerId || "").toString(),
       value: Number(t.fieldCount) || 0,
@@ -265,13 +265,7 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       return line2 ? `${line1}\n${line2}` : line1;
     });
 
-    const paged = buildPaged({
-      title,
-      lines,
-      pageSize: 10,
-      showTip: true,
-      tipMode: sortMode
-    });
+    const paged = buildPaged({ title, lines, pageSize: 10, showTip: true, tipMode: sortMode });
 
     return {
       ok: true,
