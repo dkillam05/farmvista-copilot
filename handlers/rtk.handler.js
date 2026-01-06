@@ -1,9 +1,15 @@
 // /handlers/rtk.handler.js  (FULL FILE)
-// Rev: 2026-01-04-rtkHandler6-contextdelta
+// Rev: 2026-01-05-rtkHandler7-handlerKit-sorting
 //
 // CHANGE:
-// ✅ Emit meta.contextDelta for tower_fields and tower_fields_tillable so follow-ups like
-//    "include tillable acres" and "total those acres" work without repeating the tower name.
+// ✅ Uses shared /chat/handlerKit.js for sorting + paging rules
+// ✅ Default tower list sort: A→Z; allow "largest first"/"smallest first" (by fieldCount)
+// ✅ Field lists sorted numeric by field prefix (0504-, 0801-, etc.)
+// ✅ Adds sort tip line
+//
+// Keeps:
+// ✅ meta.contextDelta for tower_fields and tower_fields_tillable
+// ✅ meta.continuation paging
 
 'use strict';
 
@@ -13,6 +19,13 @@ import {
   getTowerUsage,
   getFieldTowerSummary
 } from "../data/rtkData.js";
+
+import {
+  detectSortMode,
+  sortRows,
+  sortFieldsByNumberThenName,
+  buildPaged
+} from "../chat/handlerKit.js";
 
 const norm = (s) => (s || "").toString().trim().toLowerCase();
 
@@ -30,20 +43,6 @@ function wantsList(q) { const s = norm(q); return s.includes("list") || s.includ
 function wantsFarms(q) { return norm(q).includes("farms"); }
 function wantsFields(q) { return norm(q).includes("fields"); }
 function wantsTillable(q) { const s = norm(q); return s.includes("tillable") || s.includes("acres"); }
-
-function towerBullet(t) {
-  const name = (t.name || t.towerId || "").toString();
-  const freq = (t.frequencyMHz || "").toString().trim();
-  const net  = (t.networkId != null ? String(t.networkId) : "").trim();
-  const fc   = fmtInt(t.fieldCount || 0);
-
-  const line1 = `• ${name} — ${fc} fields`;
-  const bits = [];
-  if (freq) bits.push(`${freq} MHz`);
-  if (net) bits.push(`Net ${net}`);
-  const line2 = bits.length ? `  ${bits.join(" • ")}` : "";
-  return line2 ? `${line1}\n${line2}` : line1;
-}
 
 function extractTowerNameGuess(raw) {
   const s = (raw || "").toString().trim();
@@ -88,6 +87,7 @@ function extractFieldGuess(raw) {
 export async function handleRTK({ question, snapshot, user, includeArchived = false, meta = {} }) {
   const raw = (question || "").toString();
   const q = norm(raw);
+  const sortMode = detectSortMode(raw);
 
   // Field -> tower
   if ((q.includes("rtk") || q.includes("tower")) && (q.includes("assigned") || q.includes("what tower") || q.includes("which tower") || q.includes("does field"))) {
@@ -149,29 +149,31 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     if (wantsFields(q) || q.includes("fields for") || q.includes("fields with") || q.includes("fields that use")) {
       const includeTillable = wantsTillable(q);
 
-      const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
-      const lines = (usage.fields || []).map(f => {
-        const base = `• ${f.name}${f.farmName ? ` (${f.farmName})` : ""}`;
-        return includeTillable ? `${base}\n  ${fmtAcre(f.tillable || 0)} ac` : base;
+      // Build labels and sort numeric
+      const items = (usage.fields || []).map(f => {
+        const base = `${f.name}${f.farmName ? ` (${f.farmName})` : ""}`;
+        return includeTillable ? `• ${base}\n  ${fmtAcre(f.tillable || 0)} ac` : `• ${base}`;
       });
 
-      const pageSize = 35;
-      const first = lines.slice(0, pageSize);
-      const remaining = lines.length - first.length;
+      // Sort by the field name prefix in the label (we strip the leading bullet for sort)
+      items.sort((a, b) => sortFieldsByNumberThenName(a.replace(/^•\s*/, ""), b.replace(/^•\s*/, "")));
 
-      const out = [];
-      out.push(title);
-      out.push("");
-      out.push(...first);
-      if (remaining > 0) out.push(`\n…plus ${remaining} more fields.`);
+      const title = `Fields on ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
+
+      const paged = buildPaged({
+        title,
+        lines: items,
+        pageSize: 35,
+        showTip: false
+      });
 
       return {
         ok: true,
-        answer: out.join("\n"),
+        answer: paged.answer,
         meta: {
           routed: "rtk",
           intent: includeTillable ? "tower_fields_tillable" : "tower_fields",
-          continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null,
+          continuation: paged.continuation,
           contextDelta: {
             lastIntent: includeTillable ? "tower_fields_tillable" : "tower_fields",
             lastMetric: includeTillable ? "tillable" : "fields",
@@ -182,28 +184,22 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
       };
     }
 
-    // Farms list
+    // Farms list (A→Z only)
     if (wantsFarms(q)) {
       const title = `Farms using ${usage.tower.name || usage.tower.id} (${includeArchived ? "incl archived" : "active only"}):`;
-      const lines = (usage.farms || []).map(f => `• ${f.name}`);
+      const lines = (usage.farms || [])
+        .map(f => `• ${f.name}`)
+        .sort((a, b) => a.localeCompare(b));
 
-      const pageSize = 20;
-      const first = lines.slice(0, pageSize);
-      const remaining = lines.length - first.length;
-
-      const out = [];
-      out.push(title);
-      out.push("");
-      out.push(...first);
-      if (remaining > 0) out.push(`\n…plus ${remaining} more farms.`);
+      const paged = buildPaged({ title, lines, pageSize: 20, showTip: false });
 
       return {
         ok: true,
-        answer: out.join("\n"),
+        answer: paged.answer,
         meta: {
           routed: "rtk",
           intent: "tower_farms",
-          continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null,
+          continuation: paged.continuation,
           contextDelta: {
             lastIntent: "tower_farms",
             lastEntity: { type: "tower", id: usage.tower.id, name: usage.tower.name || usage.tower.id },
@@ -236,33 +232,54 @@ export async function handleRTK({ question, snapshot, user, includeArchived = fa
     };
   }
 
-  // Summary list
+  // Summary list: towers used
   if ((q.includes("rtk") || q.includes("tower")) && (wantsCount(q) || wantsList(q) || q.includes("towers do we use"))) {
     const s = summarizeTowersUsed({ snapshot, includeArchived });
     if (!s.ok) {
       return { ok: false, answer: "Please check /data/rtkData.js — summarizeTowersUsed failed.", meta: { routed: "rtk", intent: "rtk_summary_failed", reason: s.reason, debugFile: "/data/rtkData.js" } };
     }
 
-    const title = `RTK towers used (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(s.towersUsedCount || 0)}`;
-    const lines = (s.towers || []).map(towerBullet);
+    const title = `RTK towers used (${includeArchived ? "incl archived" : "active only"}): ${fmtInt(s.towersUsedCount || 0)} — ${sortMode === "largest" ? "largest first" : sortMode === "smallest" ? "smallest first" : "A-Z"}`;
 
-    const pageSize = 10;
-    const first = lines.slice(0, pageSize);
-    const remaining = lines.length - first.length;
+    // Build rows then sort via kit
+    const rows = (s.towers || []).map(t => ({
+      name: (t.name || t.towerId || "").toString(),
+      value: Number(t.fieldCount) || 0,
+      raw: t
+    }));
 
-    const out = [];
-    out.push(title);
-    out.push("");
-    out.push(...first);
-    if (remaining > 0) out.push(`\n…plus ${remaining} more towers.`);
+    sortRows(rows, sortMode);
+
+    const lines = rows.map(x => {
+      const t = x.raw;
+      const name = (t.name || t.towerId || "").toString();
+      const fc = fmtInt(t.fieldCount || 0);
+      const freq = (t.frequencyMHz || "").toString().trim();
+      const net = (t.networkId != null ? String(t.networkId) : "").trim();
+
+      const line1 = `• ${name} — ${fc} fields`;
+      const bits = [];
+      if (freq) bits.push(`${freq} MHz`);
+      if (net) bits.push(`Net ${net}`);
+      const line2 = bits.length ? `  ${bits.join(" • ")}` : "";
+      return line2 ? `${line1}\n${line2}` : line1;
+    });
+
+    const paged = buildPaged({
+      title,
+      lines,
+      pageSize: 10,
+      showTip: true,
+      tipMode: sortMode
+    });
 
     return {
       ok: true,
-      answer: out.join("\n"),
+      answer: paged.answer,
       meta: {
         routed: "rtk",
         intent: "rtk_towers_used",
-        continuation: (remaining > 0) ? { kind: "page", title, lines, offset: pageSize, pageSize } : null,
+        continuation: paged.continuation,
         contextDelta: { lastIntent: "rtk_towers_used", lastBy: "tower", lastScope: { includeArchived: !!includeArchived } }
       }
     };
