@@ -1,14 +1,16 @@
 // /index.js  (FULL FILE)
-// Rev: 2026-01-05a-min-core3-router2-snapshotbuild-summaryall-chatthread-debugai
+// Rev: 2026-01-06-index-sql1
 //
-// CHANGE (Chat):
-// ✅ forwards debugAI from req.body into handleChat()
+// Change:
+// ✅ Adds /db/status to verify SQLite snapshot DB is built
+// ✅ Chat supports debugAI passthrough (kept)
 
 import express from "express";
 import { corsMiddleware } from "./utils/cors.js";
 import { getSnapshotStatus, reloadSnapshot, loadSnapshot } from "./context/snapshot.js";
 import { buildSnapshotHttp } from "./context/snapshot-build.js";
 import { handleChat } from "./chat/handleChat.js";
+import { ensureDbFromSnapshot, getDbMeta } from "./context/snapshot-db.js";
 
 const app = express();
 app.use(express.json({ limit: "4mb" }));
@@ -34,6 +36,21 @@ app.post("/context/reload", async (req, res) => {
 
 app.post("/snapshot/build", buildSnapshotHttp);
 
+// ✅ NEW: DB status
+app.get("/db/status", async (req, res) => {
+  const snap = await loadSnapshot({ force: false });
+  let db = null;
+  try { db = ensureDbFromSnapshot(snap); } catch (e) { db = { ok: false, error: (e?.message || String(e)).slice(0, 250) }; }
+  res.status(200).json({
+    ok: !!db?.ok,
+    db,
+    dbMeta: getDbMeta(),
+    snapshotId: snap?.activeSnapshotId || null,
+    loadedAt: snap?.loadedAt || null,
+    revision: getRevision()
+  });
+});
+
 app.get("/context/summary", async (req, res) => {
   const snap = await loadSnapshot({ force: false });
 
@@ -50,7 +67,6 @@ app.get("/context/summary", async (req, res) => {
   }
 
   const root = snap.json || {};
-
   const cols =
     root?.data?.__collections__ ||
     root?.__collections__ ||
@@ -73,18 +89,6 @@ app.get("/context/summary", async (req, res) => {
     if (name === "farms") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
     if (name === "fields") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
     if (name === "rtkTowers") { preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || "").toString()).filter(Boolean); continue; }
-    if (name === "employees") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.displayName || x?.email || "").toString()).filter(Boolean);
-      continue;
-    }
-    if (name === "equipment") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.unit || x?.assetTag || x?.makeModel || x?.model || "").toString()).filter(Boolean);
-      continue;
-    }
-    if (name === "binSites") {
-      preview[name] = firstValues(map, PREVIEW_LIMIT).map(x => (x?.name || x?.siteName || "").toString()).filter(Boolean);
-      continue;
-    }
 
     preview[name] = firstKeys(map, PREVIEW_LIMIT);
   }
@@ -97,7 +101,6 @@ app.get("/context/summary", async (req, res) => {
     loadedAt: snap.loadedAt || null,
     counts,
     preview,
-    topKeys: Object.keys(root).slice(0, 50),
     revision: getRevision()
   });
 });
@@ -148,12 +151,9 @@ app.post("/chat", async (req, res) => {
   if (!question) return res.status(400).json({ ok: false, error: "Missing question", revision: getRevision() });
 
   const authHeader = (req.headers.authorization || "").toString();
-
   const threadId = (req.body?.threadId || "").toString().trim();
   const continuation = (req.body && typeof req.body.continuation === "object") ? req.body.continuation : null;
   const state = (req.body && typeof req.body.state === "object") ? req.body.state : null;
-
-  // ✅ NEW: debugAI comes from client payload (no Cloud Run env required)
   const debugAI = !!req.body?.debugAI;
 
   const snap = await loadSnapshot({ force: false });
