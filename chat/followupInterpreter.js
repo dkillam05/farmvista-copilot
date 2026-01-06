@@ -1,16 +1,17 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-05-followupInterpreter6-rtk-followups
+// Rev: 2026-01-06-followupInterpreter7-smart-list-followups
 //
 // Global follow-up interpreter (deterministic).
-// Translates short follow-ups into explicit questions using stored context.
-//
 // Paging ("more", "show all") is handled by /chat/followups.js.
-// This file handles conversational follow-ups like:
-// - "including archived" / "active only"
-// - "same thing but HEL"
-// - "by county"
-// - ✅ RTK follow-ups:
-//    - After listing tower fields, "including tillable acres" reruns the same tower field list WITH acres.
+//
+// Adds (scalable):
+// ✅ "list fields" / "show fields" follow-up uses lastEntity:
+//    - lastEntity=farm   => "List fields on <farm>"
+//    - lastEntity=county => "List fields in <county> County"
+//    - lastEntity=tower  => "List fields on <tower> tower"
+// ✅ "with acres" / "include tillable acres" upgrades the last list to include acres.
+// ✅ RTK: "including tillable acres" after tower fields list upgrades to acres list.
+// ✅ Scope follow-ups: "include archived" / "active only" keep same intent.
 
 'use strict';
 
@@ -33,12 +34,10 @@ function wantsActiveOnly(s) {
 
 function extractMetric(s) {
   const q = norm(s);
-
   if (q.includes("hel")) return "hel";
   if (q.includes("crp")) return "crp";
   if (q.includes("tillable") || q.includes("acres")) return "tillable";
   if (q.includes("fields") || q.includes("count")) return "fields";
-
   return "";
 }
 
@@ -68,10 +67,59 @@ function isThatEntityFollowup(s) {
 }
 
 /* ===========================
-   NEW: RTK follow-up helpers
+   LIST follow-ups (NEW)
 =========================== */
 
-function wantsIncludeTillable(s) {
+function isListFieldsFollowup(s) {
+  const q = norm(s);
+  // very common employee follow-ups
+  if (q === "list fields" || q === "show fields" || q === "fields") return true;
+  if (q === "list them" || q === "show them") return true;
+  if (q.includes("list fields")) return true;
+  if (q.includes("show fields")) return true;
+  return false;
+}
+
+function wantsWithAcres(s) {
+  const q = norm(s);
+  return q.includes("with acres") || q.includes("with tillable") || q.includes("include acres") || q.includes("including acres") || q.includes("include tillable") || q.includes("including tillable");
+}
+
+function wantsNoAcres(s) {
+  const q = norm(s);
+  return q === "no acres" || q.includes("without acres") || q.includes("remove acres") || q.includes("no tillable");
+}
+
+function buildListFieldsForEntity(entity, withAcres) {
+  if (!entity || !entity.type) return "";
+  const name = (entity.name || entity.id || "").toString().trim();
+  if (!name) return "";
+
+  if (entity.type === "farm") {
+    return withAcres ? `List fields on ${name} with acres` : `List fields on ${name}`;
+  }
+  if (entity.type === "county") {
+    // if they stored "Sangamon, IL" we can still use it
+    // your farmsFields handler recognizes "... County" patterns via planner or future logic;
+    // we keep it simple:
+    const countyName = name.replace(/,\s*[A-Z]{2}\b/i, "").trim() || name;
+    return withAcres ? `List fields in ${countyName} County with acres` : `List fields in ${countyName} County`;
+  }
+  if (entity.type === "tower") {
+    return withAcres ? `List fields on ${name} tower with tillable acres` : `List fields on ${name} tower`;
+  }
+  if (entity.type === "field") {
+    // list fields doesn't apply; return lookup
+    return `Tell me about ${name}`;
+  }
+  return "";
+}
+
+/* ===========================
+   RTK follow-up helpers
+=========================== */
+
+function wantsIncludeTillableRTK(s) {
   const q = norm(s);
   return (
     q.includes("include tillable") ||
@@ -84,7 +132,7 @@ function wantsIncludeTillable(s) {
   );
 }
 
-function wantsRemoveTillable(s) {
+function wantsRemoveTillableRTK(s) {
   const q = norm(s);
   return (
     q.includes("no tillable") ||
@@ -103,7 +151,7 @@ function buildTowerFieldsQuestion(towerName, withTillable) {
 }
 
 /* ===========================
-   Totals question builder
+   Totals builder
 =========================== */
 
 function buildTotalsQuestion({ metric, by }) {
@@ -120,18 +168,16 @@ function buildTotalsQuestion({ metric, by }) {
     if (m === "fields") return "Fields by county";
     return "Tillable acres by county";
   }
-  // overall
   if (m === "hel") return "Total HEL acres";
   if (m === "crp") return "Total CRP acres";
   if (m === "fields") return "How many active fields do we have?";
   return "Total tillable acres";
 }
 
-/**
- * Returns:
- * - null if not a follow-up we can interpret
- * - { rewriteQuestion, contextDelta } if we can rewrite and should proceed to routing
- */
+/* ===========================
+   Main
+=========================== */
+
 export function interpretFollowup({ question, ctx }) {
   const raw = (question || "").toString().trim();
   const q = norm(raw);
@@ -144,7 +190,7 @@ export function interpretFollowup({ question, ctx }) {
   const lastEntity = c.lastEntity || null;
   const lastScope = c.lastScope || {};
 
-  // ✅ Scope follow-ups
+  // ✅ Scope follow-ups keep context
   if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
     if (lastIntent) {
       const includeArchived = wantsIncludeArchived(q) ? true : (wantsActiveOnly(q) ? false : !!lastScope.includeArchived);
@@ -152,43 +198,65 @@ export function interpretFollowup({ question, ctx }) {
       const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : lastBy);
 
       const rq = buildTotalsQuestion({ metric: metric || lastMetric, by: by || lastBy });
-      return {
-        rewriteQuestion: rq,
-        contextDelta: { lastScope: { includeArchived } }
-      };
+      return { rewriteQuestion: rq, contextDelta: { lastScope: { includeArchived } } };
     }
     return null;
   }
 
+  // ✅ NEW: "list fields" follow-up uses lastEntity
+  if (isListFieldsFollowup(q) && lastEntity) {
+    const rq = buildListFieldsForEntity(lastEntity, false);
+    if (rq) {
+      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup" } };
+    }
+  }
+
+  // ✅ NEW: "with acres" upgrades last entity list to include acres
+  if (wantsWithAcres(q) && lastEntity) {
+    const rq = buildListFieldsForEntity(lastEntity, true);
+    if (rq) {
+      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_with_acres_followup", lastMetric: "tillable" } };
+    }
+  }
+
+  // ✅ NEW: "no acres" downgrades the last entity list to non-acres
+  if (wantsNoAcres(q) && lastEntity) {
+    const rq = buildListFieldsForEntity(lastEntity, false);
+    if (rq) {
+      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup", lastMetric: "fields" } };
+    }
+  }
+
   // ✅ RTK follow-up: after listing tower fields, include tillable acres
-  // Works when rtk.handler sets:
-  // lastIntent = "tower_fields" OR "tower_fields_tillable"
-  // lastEntity.type = "tower"
   if ((lastIntent === "tower_fields" || lastIntent === "tower_fields_tillable") && lastEntity && lastEntity.type === "tower") {
     const towerName = (lastEntity.name || lastEntity.id || "").toString().trim();
 
-    if (wantsIncludeTillable(q) && lastIntent !== "tower_fields_tillable") {
+    if (wantsIncludeTillableRTK(q) && lastIntent !== "tower_fields_tillable") {
       const rq = buildTowerFieldsQuestion(towerName, true);
       if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_fields_tillable", lastMetric: "tillable" } };
     }
 
-    if (wantsRemoveTillable(q) && lastIntent !== "tower_fields") {
+    if (wantsRemoveTillableRTK(q) && lastIntent !== "tower_fields") {
       const rq = buildTowerFieldsQuestion(towerName, false);
       if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_fields", lastMetric: "fields" } };
     }
   }
 
-  // ✅ "same thing but ..." / switch breakdowns
+  // ✅ "same thing but …" / switch breakdowns
   if (isSameThingFollowup(q) || isSwitchBreakdownFollowup(q)) {
     const metric = extractMetric(q) || lastMetric || "";
     const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : (lastBy || ""));
 
-    if (lastIntent.includes("totals") || lastIntent.includes("count") || lastIntent.includes("breakdown") || lastIntent.includes("farm") || lastIntent.includes("county") || lastIntent.includes("metric_by_")) {
+    if (
+      lastIntent.includes("totals") ||
+      lastIntent.includes("count") ||
+      lastIntent.includes("breakdown") ||
+      lastIntent.includes("farm") ||
+      lastIntent.includes("county") ||
+      lastIntent.includes("metric_by_")
+    ) {
       const rq = buildTotalsQuestion({ metric, by });
-      return {
-        rewriteQuestion: rq,
-        contextDelta: { lastMetric: metric || lastMetric || null, lastBy: by || lastBy || null }
-      };
+      return { rewriteQuestion: rq, contextDelta: { lastMetric: metric || lastMetric || null, lastBy: by || lastBy || null } };
     }
 
     return null;
@@ -196,20 +264,8 @@ export function interpretFollowup({ question, ctx }) {
 
   // ✅ "that one" entity follow-ups
   if (isThatEntityFollowup(q) && lastEntity) {
-    if (lastEntity.type === "field") {
-      return { rewriteQuestion: `Tell me about ${lastEntity.id || lastEntity.name}`.trim(), contextDelta: {} };
-    }
-    if (lastEntity.type === "farm") {
-      return { rewriteQuestion: `Tillable acres by farm`.trim(), contextDelta: {} };
-    }
-    if (lastEntity.type === "county") {
-      return { rewriteQuestion: `Tillable acres by county`.trim(), contextDelta: {} };
-    }
-    if (lastEntity.type === "tower") {
-      // default: list fields on that tower
-      const rq = buildTowerFieldsQuestion(lastEntity.name || lastEntity.id, false);
-      if (rq) return { rewriteQuestion: rq, contextDelta: {} };
-    }
+    const rq = buildListFieldsForEntity(lastEntity, false);
+    if (rq) return { rewriteQuestion: rq, contextDelta: {} };
   }
 
   return null;
