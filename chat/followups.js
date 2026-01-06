@@ -1,9 +1,14 @@
 // /chat/followups.js  (FULL FILE)
-// Rev: 2026-01-04-followups-global3-robust
+// Rev: 2026-01-05-followups-global3-sum
 //
-// CHANGE:
-// ✅ Recognize "show more" / "show me more" explicitly
-// ✅ Keep returning meta.continuation so client can persist it
+// Global follow-up memory keyed by threadId.
+// Supports:
+// ✅ paging ("more", "next", "rest", "show all")
+// ✅ totals for the last paged list if the list includes acres lines ("total those acres")
+//
+// IMPORTANT:
+// - Continuation is seeded from client (req.body.continuation) in handleChat.
+// - This makes paging + totals work across Cloud Run instances.
 
 'use strict';
 
@@ -11,7 +16,10 @@ const TTL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const STORE = new Map(); // threadId -> { cont, exp }
 
 function nowMs() { return Date.now(); }
-function norm(s) { return (s || "").toString().trim().toLowerCase(); }
+
+function norm(s) {
+  return (s || "").toString().trim().toLowerCase();
+}
 
 function cleanExpired() {
   const t = nowMs();
@@ -47,24 +55,22 @@ export function clearContinuation(threadId) {
   STORE.delete(id);
 }
 
+/* =========================
+   Follow-up detectors
+========================= */
 function wantsMore(q) {
   const s = norm(q);
   if (!s) return false;
 
-  // exact
   if (s === "more" || s === "next" || s === "rest" || s === "remaining") return true;
-  if (s === "show more" || s === "show me more" || s === "more please") return true;
-
-  // contains / startswith
-  if (s.startsWith("more")) return true;
-  if (s.startsWith("next")) return true;
-  if (s.includes("show more")) return true;
-  if (s.includes("show me more")) return true;
   if (s.includes("the rest")) return true;
+  if (s.includes("show more")) return true;
+  if (s.includes("more farms")) return true;
+  if (s.includes("more counties")) return true;
+  if (s.includes("the 11 more")) return true;
+  if (s.includes("the other")) return true;
   if (s.includes("keep going")) return true;
-
-  // "the 11 more"
-  if (s.includes("more") && /\b\d+\b/.test(s)) return true;
+  if (s.includes("11") && s.includes("more")) return true;
 
   return false;
 }
@@ -74,8 +80,6 @@ function wantsAll(q) {
   if (!s) return false;
 
   if (s === "all") return true;
-  if (s === "show all" || s === "list all" || s === "everything") return true;
-
   if (s.includes("show all")) return true;
   if (s.includes("list all")) return true;
   if (s.includes("all of them")) return true;
@@ -84,6 +88,34 @@ function wantsAll(q) {
   return false;
 }
 
+// ✅ NEW: global “sum” follow-up
+function wantsTotal(q) {
+  const s = norm(q);
+  if (!s) return false;
+
+  // common phrasing
+  if (s === "total" || s === "sum") return true;
+  if (s.includes("total those")) return true;
+  if (s.includes("total these")) return true;
+  if (s.includes("total them")) return true;
+  if (s.includes("sum those")) return true;
+  if (s.includes("sum these")) return true;
+  if (s.includes("sum them")) return true;
+  if (s.includes("total those acres")) return true;
+  if (s.includes("sum those acres")) return true;
+  if (s.includes("what's the total")) return true;
+  if (s.includes("what is the total")) return true;
+
+  // “total the acres”
+  if (s.includes("total") && s.includes("acres")) return true;
+  if (s.includes("sum") && s.includes("acres")) return true;
+
+  return false;
+}
+
+/* =========================
+   Paging
+========================= */
 function pageFromContinuation(cont, mode) {
   const lines = Array.isArray(cont?.lines) ? cont.lines : [];
   const title = (cont?.title || "").toString();
@@ -117,6 +149,43 @@ function pageFromContinuation(cont, mode) {
   return { ok: true, answer: out.join("\n"), next, done };
 }
 
+/* =========================
+   NEW: Sum parser
+   Works with any list that includes "  123.45 ac" or "— 123.45 ac"
+========================= */
+function parseAcresFromLine(line) {
+  const s = (line || "").toString();
+
+  // Matches:
+  // "  471.63 ac"
+  // "— 471.63 ac"
+  // "471.63 acres"
+  // "1,234.5 ac"
+  let m = s.match(/(?:^|[^\d])(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:acres?\b|ac\b)/i);
+  if (!m) return null;
+
+  const rawNum = (m[1] || "").replace(/,/g, "");
+  const n = Number(rawNum);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sumAcresFromLines(lines) {
+  let sum = 0;
+  let count = 0;
+
+  for (const ln of (lines || [])) {
+    const n = parseAcresFromLine(ln);
+    if (n == null) continue;
+    sum += n;
+    count += 1;
+  }
+
+  return { sum, count };
+}
+
+/* =========================
+   Entry
+========================= */
 export function tryHandleFollowup({ threadId, question }) {
   cleanExpired();
 
@@ -126,6 +195,37 @@ export function tryHandleFollowup({ threadId, question }) {
   const cont = getContinuation(threadId);
   if (!cont) return null;
 
+  // ✅ totals follow-up
+  if (wantsTotal(q)) {
+    const lines = Array.isArray(cont?.lines) ? cont.lines : [];
+    const title = (cont?.title || "").toString();
+
+    const { sum, count } = sumAcresFromLines(lines);
+
+    if (!count) {
+      return {
+        ok: true,
+        answer: "I can only total acres when the last list includes acre values. Ask: “include tillable acres”, then “total those acres”.",
+        meta: { followup: true, source: "/chat/followups.js", kind: "sum", continuation: cont }
+      };
+    }
+
+    const sumFmt = sum.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+
+    const out = [];
+    if (title) out.push(title);
+    out.push(`Total acres (from last list): ${sumFmt} ac`);
+    out.push(`Counted lines with acres: ${count}`);
+
+    // Do NOT advance paging; keep continuation so user can still say "show all" after totaling.
+    return {
+      ok: true,
+      answer: out.join("\n"),
+      meta: { followup: true, source: "/chat/followups.js", kind: "sum", continuation: cont }
+    };
+  }
+
+  // paging follow-ups
   const all = wantsAll(q);
   const more = wantsMore(q);
 
