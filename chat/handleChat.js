@@ -1,14 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql3-fieldnum-fallback
+// Rev: 2026-01-06-handleChat-sql4-no-handler-for-fieldnum
 //
-// Adds:
-// ✅ If SQL returns 0 rows AND question looks like "field #### rtk/tower",
-//    run deterministic lookup SQL against fields.field_num / id / prefix.
+// Change:
+// ✅ Deterministic DB lookup for "Field #### RTK/tower" (NO handlers, NO OpenAI needed)
+// ✅ If not matched, uses OpenAI -> SQL -> SQLite
+// ✅ Clean output (Option A): bullets only; acres only if user asks
+// ✅ SQL lists get continuation for "show all/more"
 //
 // Keeps:
-// ✅ Clean output formatting (Option A)
-// ✅ SQL paging continuation
-// ✅ fallback to existing llmPlanner/handlers when SQL not available
+// ✅ paging followups (/chat/followups.js)
+// ✅ conversation interpreter (/chat/followupInterpreter.js)
+// ✅ threadId / continuation passthrough
+// ✅ debugAI footer
+// ✅ OLD handler fallback kept as LAST resort (you can remove later)
 
 'use strict';
 
@@ -22,11 +26,12 @@ import { ensureDbFromSnapshot, getDb } from "../context/snapshot-db.js";
 import { planSql } from "./sqlPlanner.js";
 import { runSql } from "./sqlRunner.js";
 
-// existing deterministic fallback
+// old deterministic fallback (last resort)
 import { llmPlan } from "./llmPlanner.js";
 import { executePlannedQuestion } from "./executePlannedQuestion.js";
 
 function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
+function norm(s) { return (s || "").toString().trim().toLowerCase(); }
 
 function extractBearer(authHeader) {
   const h = safeStr(authHeader);
@@ -40,8 +45,9 @@ function makeThreadId() {
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-function norm(s) { return (s || "").toString().trim().toLowerCase(); }
-
+/* =========================
+   Output formatting (Option A)
+========================= */
 function userAskedForAcres(q) {
   const s = norm(q);
   return (
@@ -133,12 +139,13 @@ function formatSqlResult({ question, rows }) {
   return pageLines({ title: "", allLines, limit: 25 });
 }
 
-/* ==========================
-   NEW: field number tower fallback
-========================== */
+/* =========================
+   Deterministic DB primitives (NO handlers)
+========================= */
+
+// field number like 1323 or "field 1323"
 function extractFieldNumber(q) {
   const s = norm(q);
-  // "field 1323" or just "1323"
   let m = s.match(/\bfield\s+(\d{3,4})\b/);
   if (m) return parseInt(m[1], 10);
 
@@ -148,12 +155,12 @@ function extractFieldNumber(q) {
   return null;
 }
 
-function isTowerQuestion(q) {
+function isRtkTowerQuestion(q) {
   const s = norm(q);
   return s.includes("rtk") || s.includes("tower");
 }
 
-function runFieldTowerFallback(db, fieldNum) {
+function runFieldTowerLookup(db, fieldNum) {
   const n = Number(fieldNum);
   if (!Number.isFinite(n)) return { ok: false, rows: [] };
 
@@ -170,7 +177,12 @@ function runFieldTowerFallback(db, fieldNum) {
     LEFT JOIN farms ON farms.id = fields.farmId
     LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
     WHERE
-      (fields.field_num = ${n} OR fields.id = '${n}' OR fields.name_norm LIKE '${n}%' OR fields.name LIKE '${n}-%')
+      (
+        fields.field_num = ${n}
+        OR fields.id = '${n}'
+        OR fields.name_norm LIKE '${n}%'
+        OR fields.name LIKE '${n}-%'
+      )
       AND (fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))
     LIMIT 5
   `.trim();
@@ -178,6 +190,9 @@ function runFieldTowerFallback(db, fieldNum) {
   return runSql({ db, sql, limitDefault: 5 });
 }
 
+/* =========================
+   Main
+========================= */
 export async function handleChat({
   question,
   snapshot,
@@ -199,6 +214,7 @@ export async function handleChat({
     return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot data isn’t available right now. Try /context/reload, then retry.", action: null, meta: { intent: "chat", error: true, snapshotOk: !!snapshot?.ok, threadId: tid }, state: state || null };
   }
 
+  // ensure DB for current snapshot
   let dbInfo = null;
   try { dbInfo = ensureDbFromSnapshot(snapshot); } catch (e) { dbInfo = { ok: false, error: safeStr(e?.message || e) }; }
 
@@ -216,7 +232,13 @@ export async function handleChat({
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
-      return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", action: fu?.action || null, meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
+      return {
+        ok: fu?.ok !== false,
+        answer: safeStr(fu?.answer) || "No response.",
+        action: fu?.action || null,
+        meta: { ...(fu?.meta || {}), threadId: tid },
+        state: state || null
+      };
     }
   } catch {
     clearContinuation(tid);
@@ -232,7 +254,36 @@ export async function handleChat({
     }
   } catch {}
 
-  // 3) SQL path
+  // ✅ 2.5) Deterministic DB lookup for FIELD #### tower questions (no OpenAI, no handlers)
+  if (dbInfo?.ok && getDb() && isRtkTowerQuestion(routedQuestion)) {
+    const fn = extractFieldNumber(routedQuestion);
+    if (fn != null) {
+      const exec = runFieldTowerLookup(getDb(), fn);
+      if (exec.ok && exec.rows && exec.rows.length) {
+        const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows });
+
+        let out = safeStr(formatted.answer) || "(no response)";
+        if (debug) out += `\n\n[DB Lookup: field_num → tower]`;
+
+        return {
+          ok: true,
+          answer: out,
+          action: null,
+          meta: {
+            routed: "db_field_tower",
+            threadId: tid,
+            continuation: formatted.continuation || null,
+            sqlRows: exec.rows.length,
+            sql: debug ? exec.sql : undefined
+          },
+          state: state || null
+        };
+      }
+      // If no match, continue to OpenAI→SQL (maybe the field number wasn't the real ID)
+    }
+  }
+
+  // 3) OpenAI -> SQL -> DB
   if (dbInfo?.ok && getDb()) {
     const sqlPlan = await planSql({ question: routedQuestion, debug });
 
@@ -240,28 +291,6 @@ export async function handleChat({
       const exec = runSql({ db: getDb(), sql: sqlPlan.sql, limitDefault: 80 });
 
       if (exec.ok) {
-        // ✅ NEW: if 0 rows and this looks like field-number tower question, run fallback
-        if ((!exec.rows || exec.rows.length === 0) && isTowerQuestion(routedQuestion)) {
-          const fn = extractFieldNumber(routedQuestion);
-          if (fn != null) {
-            const fb = runFieldTowerFallback(getDb(), fn);
-            if (fb.ok && fb.rows && fb.rows.length) {
-              const formatted = formatSqlResult({ question: routedQuestion, rows: fb.rows });
-
-              let out = safeStr(formatted.answer) || "(no response)";
-              if (debug) out += `\n\n[AI SQL: ON • fieldnum fallback]`;
-
-              return {
-                ok: true,
-                answer: out,
-                action: null,
-                meta: { routed: "sql_fieldnum_fallback", threadId: tid, continuation: formatted.continuation || null, sqlRows: fb.rows.length, sql: debug ? fb.sql : undefined },
-                state: state || null
-              };
-            }
-          }
-        }
-
         const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows || [] });
 
         let out = safeStr(formatted.answer) || "(no response)";
@@ -271,14 +300,20 @@ export async function handleChat({
           ok: true,
           answer: out,
           action: null,
-          meta: { routed: "sql", threadId: tid, continuation: formatted.continuation || null, sql: debug ? exec.sql : undefined, sqlRows: exec.rows?.length || 0 },
+          meta: {
+            routed: "sql",
+            threadId: tid,
+            continuation: formatted.continuation || null,
+            sql: debug ? exec.sql : undefined,
+            sqlRows: exec.rows?.length || 0
+          },
           state: state || null
         };
       }
     }
   }
 
-  // 4) fallback: your current planner/handlers
+  // 4) LAST resort: old planner/handlers
   const planRes = await llmPlan({
     question: routedQuestion,
     threadCtx: getThreadContext(tid) || {},
@@ -290,7 +325,7 @@ export async function handleChat({
   if (!planRes.ok || !planRes.plan) {
     const r = await executePlannedQuestion({ rewriteQuestion: routedQuestion, snapshot, user, state, includeArchived: false });
     let answer = safeStr(r?.answer) || "No response.";
-    if (debug) answer += `\n\n[AI Planner fallback: ON (SQL failed)]`;
+    if (debug) answer += `\n\n[Fallback: handlers]`;
     return { ok: r?.ok !== false, answer, action: r?.action || null, meta: { ...(r?.meta || {}), threadId: tid }, state: r?.state || state || null };
   }
 
@@ -306,12 +341,6 @@ export async function handleChat({
   const rewriteQuestion2 = safeStr(plan.rewriteQuestion) || routedQuestion;
 
   const r = await executePlannedQuestion({ rewriteQuestion: rewriteQuestion2, snapshot, user, state, includeArchived });
-
-  const cont = r?.meta?.continuation || null;
-  if (cont) setContinuation(tid, cont);
-
-  const delta = r?.meta?.contextDelta || null;
-  if (delta) applyContextDelta(tid, delta);
 
   let answer = safeStr(r?.answer) || "No response.";
   if (debug) answer += `\n\n[AI Planner: ON • execute • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
