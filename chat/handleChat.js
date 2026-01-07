@@ -1,17 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql7-fieldtower-real
+// Rev: 2026-01-06-handleChat-sql8-realworld-rtk-field
 //
-// Fixes your exact broken thread:
-// ✅ "RTK tower for field 710" returns tower details (not just field label)
-// ✅ Saves lastEntity=tower so follow-ups like "info from that RTK tower" work
-// ✅ DB-first for field->tower (number OR name), no handlers needed
-// ✅ Clean output: no tips, no giant tower list unless asked
+// DB-first (no handlers) for real-world phrasing:
+// ✅ "RTK tower for field ####" (always resolves field->tower correctly)
+// ✅ "tower info / network id / frequency for <tower>" (tower detail)
+// ✅ "field info for <name>" (field detail list)
+// ✅ "RTK tower info for <field name>" (field->tower by name)
 //
 // Keeps:
-// ✅ paging followups (/chat/followups.js)
-// ✅ followupInterpreter (/chat/followupInterpreter.js)
-// ✅ OpenAI->SQL fallback for other questions
-// ✅ handlers fallback as LAST resort
+// ✅ paging followups
+// ✅ followup interpreter
+// ✅ OpenAI->SQL fallback for everything else
+// ✅ handlers fallback as last resort
+// ✅ clean output: only what user asked (no tips)
 
 'use strict';
 
@@ -45,29 +46,35 @@ function makeThreadId() {
 }
 
 /* =========================
-   Detect question types
+   Basic intent detection
 ========================= */
 function isRtkTowerQuestion(q) {
   const s = norm(q);
   return s.includes("rtk") || s.includes("tower");
 }
-function mentionsField(q) {
-  return norm(q).includes("field");
-}
-function extractFieldNumber(q) {
+function wantsTowerDetail(q) {
   const s = norm(q);
-  let m = s.match(/\bfield\s+(\d{3,4})\b/);
-  if (m) return parseInt(m[1], 10);
-  m = s.match(/\b(\d{3,4})\b/);
-  if (m) return parseInt(m[1], 10);
-  return null;
+  return s.includes("network id") || s.includes("networkid") || s.includes("frequency") || s.includes("mhz") || s.includes("tower info") || s.includes("tower information") || s.includes("details");
 }
-function extractFieldNamePhrase(q) {
-  const s = (q || "").toString();
-  let m = s.match(/\bfield\s+(.+?)(?:\brtk\b|\btower\b|\binfo\b|\binformation\b|\buse\b|\buses\b|\busing\b|\bassigned\b|$)/i);
-  if (m && m[1]) return m[1].toString().trim().replace(/\b(rtK|tower|info|information|use|uses|using|assigned)\b.*$/i, "").trim();
-  return "";
+function wantsFieldInfo(q) {
+  const s = norm(q);
+  return s.includes("field info") || s.includes("field information") || (s.includes("field") && s.includes("information"));
 }
+function wantsFieldToTower(q) {
+  const s = norm(q);
+  // treat any mention of rtk/tower + "field" as field->tower intent
+  return isRtkTowerQuestion(s) && s.includes("field");
+}
+function activeFieldsWhere() {
+  return "(fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))";
+}
+function activeFarmsWhere() {
+  return "(farms.status IS NULL OR farms.status='' OR LOWER(farms.status) NOT IN ('archived','inactive'))";
+}
+
+/* =========================
+   Safe string normalization for SQL LIKE (no injection)
+========================= */
 function normForSqlLike(s) {
   return (s || "")
     .toString()
@@ -81,67 +88,171 @@ function normForSqlLike(s) {
 function squishForSqlLike(s) {
   return normForSqlLike(s).replace(/\s+/g, "").slice(0, 60);
 }
-function activeFieldsWhere() {
-  return "(fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))";
+
+/* =========================
+   Parse "field ####" or bare ####
+========================= */
+function extractFieldNumber(q) {
+  const s = norm(q);
+  let m = s.match(/\bfield\s+(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+  m = s.match(/\b(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+
+/* =========================
+   Extract “target phrase” (for Ruby’s / New Berlin / etc.)
+   - handles: "... for Ruby's field"
+   - handles: "network id for new berlin rtk tower"
+========================= */
+function extractAfterFor(q) {
+  const s = (q || "").toString().trim();
+  let m = s.match(/\bfor\s+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+  return "";
+}
+function stripTrailingWords(s) {
+  return (s || "")
+    .toString()
+    .replace(/\b(rtk|tower|towers|field|fields|info|information|details)\b.*$/i, "")
+    .trim();
+}
+function extractTowerNamePhrase(q) {
+  // best-effort: remove leading question words and keep tower name chunk
+  let s = (q || "").toString().trim();
+  s = s.replace(/^what\s+is\s+/i, "");
+  s = s.replace(/^what\s+are\s+/i, "");
+  s = s.replace(/^give\s+me\s+/i, "");
+  s = s.replace(/^tell\s+me\s+/i, "");
+  s = s.replace(/^i\s+need\s+to\s+know\s+/i, "");
+  s = s.replace(/^can\s+you\s+please\s+provide\s+me\s+with\s+/i, "");
+  s = s.replace(/^can\s+you\s+/i, "");
+
+  // If "for X", grab that
+  const aft = extractAfterFor(s);
+  if (aft) s = aft;
+
+  // remove trailing "rtk tower" etc
+  s = stripTrailingWords(s);
+  return s.trim();
+}
+
+function extractFieldNamePhrase(q) {
+  // Accept:
+  // - "Ruby's field"
+  // - "field information for Ruby's"
+  // - "RTK tower info for Ruby's field"
+  let s = (q || "").toString().trim();
+
+  // if "for X" use that
+  const aft = extractAfterFor(s);
+  if (aft) s = aft;
+
+  // remove "field" word but keep the name
+  s = s.replace(/\bfield\b/ig, "").trim();
+
+  // strip any trailing "rtk/tower/info" words
+  s = stripTrailingWords(s);
+
+  return s.trim();
 }
 
 /* =========================
    Output formatting (clean)
 ========================= */
-function formatFieldTowerRow(row) {
-  const r = row || {};
-  const out = [];
+function formatScalar(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  if (rows.length === 1) {
+    const keys = Object.keys(rows[0] || {});
+    if (keys.length === 1) return `${rows[0][keys[0]]}`;
+  }
+  return null;
+}
 
+function formatFieldTowerRow(r) {
+  const out = [];
   out.push(`Field: ${r.field || "(unknown)"}`);
   if (r.farm) out.push(`Farm: ${r.farm}`);
   if (r.county) out.push(`County: ${r.county}${r.state ? ", " + r.state : ""}`);
-
   out.push(`RTK tower: ${r.tower ? r.tower : "(none assigned)"}`);
   if (r.frequencyMHz) out.push(`Frequency: ${r.frequencyMHz} MHz`);
   if (r.networkId != null && String(r.networkId).trim() !== "") out.push(`Network ID: ${r.networkId}`);
-
   return out.join("\n");
 }
 
+function formatTowerDetailRow(r) {
+  const out = [];
+  out.push(`RTK tower: ${r.tower || "(unknown)"}`);
+  if (r.frequencyMHz) out.push(`Frequency: ${r.frequencyMHz} MHz`);
+  if (r.networkId != null && String(r.networkId).trim() !== "") out.push(`Network ID: ${r.networkId}`);
+  if (r.fieldsUsing != null) out.push(`Fields using tower: ${r.fieldsUsing}`);
+  if (r.farmsUsing != null) out.push(`Farms using tower: ${r.farmsUsing}`);
+  return out.join("\n");
+}
+
+function formatFieldInfoRow(r) {
+  const out = [];
+  out.push(`Field: ${r.field || "(unknown)"}`);
+  if (r.farm) out.push(`Farm: ${r.farm}`);
+  if (r.county) out.push(`County: ${r.county}${r.state ? ", " + r.state : ""}`);
+  if (r.status) out.push(`Status: ${r.status}`);
+  if (r.tillable != null) out.push(`Tillable: ${Number(r.tillable).toLocaleString(undefined,{maximumFractionDigits:2})} ac`);
+  if (r.helAcres != null && Number(r.helAcres) > 0) out.push(`HEL acres: ${Number(r.helAcres).toLocaleString(undefined,{maximumFractionDigits:2})}`);
+  if (r.crpAcres != null && Number(r.crpAcres) > 0) out.push(`CRP acres: ${Number(r.crpAcres).toLocaleString(undefined,{maximumFractionDigits:2})}`);
+  if (r.tower) out.push(`RTK tower: ${r.tower}`);
+  return out.join("\n");
+}
+
+function pageBlocks(blocks, limitBlocks = 3) {
+  const take = Math.min(limitBlocks, blocks.length);
+  const out = [];
+  for (let i = 0; i < take; i++) out.push(blocks[i]);
+  if (blocks.length > take) out.push(`(…plus ${blocks.length - take} more matches)`);
+  return out.join("\n\n");
+}
+
 function formatSqlResult({ question, rows }) {
+  const scalar = formatScalar(rows);
+  if (scalar != null) return { answer: scalar, continuation: null };
+
   if (!Array.isArray(rows) || rows.length === 0) return { answer: "(no matches)", continuation: null };
 
-  // single scalar
-  if (rows.length === 1) {
-    const keys = Object.keys(rows[0] || {});
-    if (keys.length === 1) return { answer: String(rows[0][keys[0]]), continuation: null };
+  // If it looks like our structured projections, render them cleanly
+  const r0 = rows[0] || {};
+  if ("tower" in r0 && ("frequencyMHz" in r0 || "networkId" in r0) && !("field" in r0) && !("tillable" in r0)) {
+    // tower detail
+    const blocks = rows.slice(0, 3).map(formatTowerDetailRow);
+    return { answer: pageBlocks(blocks, 1), continuation: null };
   }
 
-  // If it looks like our field->tower projection, show block
-  if (rows.length >= 1) {
-    const r0 = rows[0] || {};
-    if ("field" in r0 && ("tower" in r0 || "frequencyMHz" in r0 || "networkId" in r0)) {
-      // If multiple matches, show first 3 blocks
-      const blocks = [];
-      const take = Math.min(3, rows.length);
-      for (let i = 0; i < take; i++) blocks.push(formatFieldTowerRow(rows[i]));
-      if (rows.length > take) blocks.push(`(…plus ${rows.length - take} more matches)`);
-      return { answer: blocks.join("\n\n"), continuation: null };
-    }
+  if ("field" in r0 && ("tower" in r0 || "frequencyMHz" in r0 || "networkId" in r0) && !("tillable" in r0)) {
+    // field -> tower
+    const blocks = rows.slice(0, 3).map(formatFieldTowerRow);
+    return { answer: pageBlocks(blocks, 1), continuation: null };
   }
 
-  // default: bullets on label/name/field/etc.
+  if ("field" in r0 && ("tillable" in r0 || "status" in r0 || "helAcres" in r0 || "crpAcres" in r0)) {
+    // field info blocks
+    const blocks = rows.slice(0, 3).map(formatFieldInfoRow);
+    return { answer: pageBlocks(blocks, 3), continuation: null };
+  }
+
+  // fallback: bullets
   const lines = [];
   for (const r of rows) {
     const label = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
-    if (!label) continue;
-    lines.push(`• ${label}`);
+    if (label) lines.push(`• ${label}`);
   }
   return { answer: lines.length ? lines.join("\n") : "(no matches)", continuation: null };
 }
 
 /* =========================
-   Deterministic DB lookups: field -> tower
+   DB queries (deterministic)
 ========================= */
-function runFieldTowerLookupByNumber(db, fieldNum) {
-  const n = Number(fieldNum);
-  if (!Number.isFinite(n)) return { ok: false, rows: [] };
 
+// field -> tower by number
+function dbFieldToTowerByNumber(db, n) {
   const sql = `
     SELECT
       fields.name AS field,
@@ -164,11 +275,11 @@ function runFieldTowerLookupByNumber(db, fieldNum) {
       AND ${activeFieldsWhere()}
     LIMIT 5
   `.trim();
-
   return runSql({ db, sql, limitDefault: 5 });
 }
 
-function runFieldTowerLookupByName(db, phrase) {
+// field -> tower by name phrase
+function dbFieldToTowerByName(db, phrase) {
   const p = normForSqlLike(phrase);
   const sq = squishForSqlLike(phrase);
   if (!p && !sq) return { ok: false, rows: [] };
@@ -200,8 +311,84 @@ function runFieldTowerLookupByName(db, phrase) {
     ORDER BY fields.field_num ASC, fields.name_norm ASC
     LIMIT 5
   `.trim();
-
   return runSql({ db, sql, limitDefault: 5 });
+}
+
+// tower detail by name phrase
+function dbTowerDetailByName(db, phrase) {
+  const p = normForSqlLike(phrase);
+  const sq = squishForSqlLike(phrase);
+  if (!p && !sq) return { ok: false, rows: [] };
+
+  const toks = p.split(" ").filter(t => t.length >= 2).slice(0, 4);
+  const andClauses = toks.map(t => `rtkTowers.name_norm LIKE '%${t}%'`);
+  const squishClause = sq ? `rtkTowers.name_sq LIKE '%${sq}%'` : null;
+
+  const nameMatch =
+    andClauses.length
+      ? `(${andClauses.join(" AND ")}${squishClause ? ` OR ${squishClause}` : ""})`
+      : (squishClause ? `(${squishClause})` : "0=1");
+
+  const sql = `
+    SELECT
+      rtkTowers.name AS tower,
+      rtkTowers.frequencyMHz AS frequencyMHz,
+      rtkTowers.networkId AS networkId,
+      (
+        SELECT COUNT(*)
+        FROM fields
+        WHERE fields.rtkTowerId = rtkTowers.id
+          AND ${activeFieldsWhere()}
+      ) AS fieldsUsing,
+      (
+        SELECT COUNT(DISTINCT fields.farmId)
+        FROM fields
+        WHERE fields.rtkTowerId = rtkTowers.id
+          AND ${activeFieldsWhere()}
+      ) AS farmsUsing
+    FROM rtkTowers
+    WHERE ${nameMatch}
+    LIMIT 3
+  `.trim();
+  return runSql({ db, sql, limitDefault: 3 });
+}
+
+// field info by name phrase
+function dbFieldInfoByName(db, phrase) {
+  const p = normForSqlLike(phrase);
+  const sq = squishForSqlLike(phrase);
+  if (!p && !sq) return { ok: false, rows: [] };
+
+  const toks = p.split(" ").filter(t => t.length >= 2).slice(0, 4);
+  const andClauses = toks.map(t => `fields.name_norm LIKE '%${t}%'`);
+  const squishClause = sq ? `fields.name_sq LIKE '%${sq}%'` : null;
+
+  const nameMatch =
+    andClauses.length
+      ? `(${andClauses.join(" AND ")}${squishClause ? ` OR ${squishClause}` : ""})`
+      : (squishClause ? `(${squishClause})` : "0=1");
+
+  const sql = `
+    SELECT
+      fields.name AS field,
+      farms.name AS farm,
+      fields.county AS county,
+      fields.state AS state,
+      fields.status AS status,
+      fields.tillable AS tillable,
+      fields.helAcres AS helAcres,
+      fields.crpAcres AS crpAcres,
+      rtkTowers.name AS tower
+    FROM fields
+    LEFT JOIN farms ON farms.id = fields.farmId
+    LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
+    WHERE
+      ${nameMatch}
+      AND ${activeFieldsWhere()}
+    ORDER BY fields.field_num ASC, fields.name_norm ASC
+    LIMIT 10
+  `.trim();
+  return runSql({ db, sql, limitDefault: 10 });
 }
 
 /* =========================
@@ -260,55 +447,100 @@ export async function handleChat({
     }
   } catch {}
 
-  // ✅ DB-first: field -> tower (number OR name)
-  if (dbInfo?.ok && getDb() && isRtkTowerQuestion(routedQuestion) && mentionsField(routedQuestion)) {
+  // ===========================
+  // DB-FIRST REAL WORLD INTENTS
+  // ===========================
+  if (dbInfo?.ok && getDb()) {
     const db = getDb();
+    const s = norm(routedQuestion);
 
-    const fn = extractFieldNumber(routedQuestion);
-    let ex = null;
+    // A) Field -> Tower (always correct)
+    if (wantsFieldToTower(routedQuestion) || (isRtkTowerQuestion(routedQuestion) && extractFieldNumber(routedQuestion) != null)) {
+      const fn = extractFieldNumber(routedQuestion);
+      let ex = null;
 
-    if (fn != null) ex = runFieldTowerLookupByNumber(db, fn);
-    if (!ex || !ex.ok || !ex.rows || ex.rows.length === 0) {
-      const phrase = extractFieldNamePhrase(routedQuestion);
-      if (phrase) ex = runFieldTowerLookupByName(db, phrase);
+      if (fn != null) ex = dbFieldToTowerByNumber(db, fn);
+      if (!ex || !ex.ok || !ex.rows || ex.rows.length === 0) {
+        const phrase = extractFieldNamePhrase(routedQuestion);
+        if (phrase) ex = dbFieldToTowerByName(db, phrase);
+      }
+
+      if (ex && ex.ok && ex.rows && ex.rows.length) {
+        const r0 = ex.rows[0] || {};
+        const towerName = (r0.tower || "").toString().trim();
+        if (towerName) {
+          applyContextDelta(tid, { lastEntity: { type: "tower", id: towerName, name: towerName }, lastIntent: "field_tower_lookup" });
+        }
+        const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
+        let out = safeStr(formatted.answer);
+        if (debug) out += `\n\n[DB: field→tower]`;
+        return { ok: true, answer: out, action: null, meta: { routed: "db_field_tower", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
+      }
     }
 
-    if (ex && ex.ok && ex.rows && ex.rows.length) {
-      // store last tower for followups
-      const r0 = ex.rows[0] || {};
-      const towerName = (r0.tower || "").toString().trim();
-      const fieldName = (r0.field || "").toString().trim();
+    // B) Tower detail (network id / frequency)
+    if (isRtkTowerQuestion(routedQuestion) && wantsTowerDetail(routedQuestion) && !s.includes("field")) {
+      const towerPhrase = extractTowerNamePhrase(routedQuestion);
+      const ex = dbTowerDetailByName(db, towerPhrase);
+      if (ex.ok && ex.rows && ex.rows.length) {
+        const towerName = (ex.rows[0].tower || "").toString().trim();
+        if (towerName) applyContextDelta(tid, { lastEntity: { type: "tower", id: towerName, name: towerName }, lastIntent: "tower_detail" });
+        const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
+        let out = safeStr(formatted.answer);
+        if (debug) out += `\n\n[DB: tower detail]`;
+        return { ok: true, answer: out, action: null, meta: { routed: "db_tower_detail", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
+      }
+    }
 
-      applyContextDelta(tid, {
-        lastIntent: "field_tower_lookup",
-        lastEntity: towerName ? { type: "tower", id: towerName, name: towerName } : null,
-        lastField: fieldName ? { id: fieldName, name: fieldName } : null,
-        lastScope: { includeArchived: false }
-      });
+    // C) Field info (Ruby’s field, etc.) — IMPORTANT: must override tower bias
+    if (wantsFieldInfo(routedQuestion) || (s.includes("field information") && !isRtkTowerQuestion(routedQuestion))) {
+      const phrase = extractFieldNamePhrase(routedQuestion);
+      const ex = dbFieldInfoByName(db, phrase);
+      if (ex.ok && ex.rows && ex.rows.length) {
+        const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
+        let out = safeStr(formatted.answer);
+        if (debug) out += `\n\n[DB: field info]`;
+        return { ok: true, answer: out, action: null, meta: { routed: "db_field_info", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
+      }
+    }
 
-      const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
-      let out = safeStr(formatted.answer) || "(no response)";
-      if (debug) out += `\n\n[DB Lookup: field → tower]`;
-
-      return { ok: true, answer: out, action: null, meta: { routed: "db_field_tower", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
+    // D) If user asks “RTK tower info for Ruby’s field” but phrased weird, force field→tower by name
+    if (isRtkTowerQuestion(routedQuestion) && (s.includes("for") || s.includes("ruby")) && !extractFieldNumber(routedQuestion)) {
+      const phrase = extractFieldNamePhrase(routedQuestion);
+      if (phrase) {
+        const ex = dbFieldToTowerByName(db, phrase);
+        if (ex.ok && ex.rows && ex.rows.length) {
+          const r0 = ex.rows[0] || {};
+          const towerName = (r0.tower || "").toString().trim();
+          if (towerName) applyContextDelta(tid, { lastEntity: { type: "tower", id: towerName, name: towerName }, lastIntent: "field_tower_lookup" });
+          const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
+          let out = safeStr(formatted.answer);
+          if (debug) out += `\n\n[DB: field→tower by name]`;
+          return { ok: true, answer: out, action: null, meta: { routed: "db_field_tower_name", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
+        }
+      }
     }
   }
 
-  // OpenAI -> SQL -> DB
+  // ===========================
+  // OpenAI -> SQL fallback
+  // ===========================
   if (dbInfo?.ok && getDb()) {
     const sqlPlan = await planSql({ question: routedQuestion, debug });
     if (sqlPlan.ok && sqlPlan.sql) {
       const exec = runSql({ db: getDb(), sql: sqlPlan.sql, limitDefault: 80 });
       if (exec.ok) {
         const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows || [] });
-        let out = safeStr(formatted.answer) || "(no response)";
+        let out = safeStr(formatted.answer);
         if (debug) out += `\n\n[AI SQL: ON • ${sqlPlan.meta.model} • ${sqlPlan.meta.ms}ms]`;
         return { ok: true, answer: out, action: null, meta: { routed: "sql", threadId: tid, sql: debug ? exec.sql : undefined, sqlRows: exec.rows?.length || 0 }, state: state || null };
       }
     }
   }
 
+  // ===========================
   // LAST resort: old handlers
+  // ===========================
   const planRes = await llmPlan({ question: routedQuestion, threadCtx: getThreadContext(tid) || {}, snapshot, authPresent: !!token, debug });
   if (!planRes.ok || !planRes.plan) {
     const r = await executePlannedQuestion({ rewriteQuestion: routedQuestion, snapshot, user, state, includeArchived: false });
