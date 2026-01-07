@@ -1,9 +1,11 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner1
+// Rev: 2026-01-06-sqlPlanner2-field-number-tower
 //
-// OpenAI -> SQL planner (SELECT-only).
-// Returns { ok, sql, meta }.
-// No response_format (avoids 400s). We force JSON via prompt.
+// Adds:
+// ✅ Explicit pattern for "Field #### tower info" and "what tower does field #### use"
+// ✅ Uses fields.id OR fields.name_norm startswith digits OR fields.field_num
+//
+// Returns SELECT-only SQL JSON: { "sql": "...", "notes": "..." }
 
 'use strict';
 
@@ -30,11 +32,11 @@ Rules:
 - SQLite dialect.
 - SELECT statements ONLY. No semicolons.
 - Default scope is ACTIVE ONLY unless user says include archived/inactive.
-  Active-only rule: fields.status is NULL/empty OR NOT IN ('archived','inactive').
-  Farm active-only: farms.status is NULL/empty OR NOT IN ('archived','inactive').
+  Active-only rule for fields: fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive')
+  Active-only rule for farms: farms.status IS NULL OR farms.status='' OR LOWER(farms.status) NOT IN ('archived','inactive')
 - Always add LIMIT 80 unless question implies a smaller number.
-- Use these tables/columns:
 
+Tables/columns:
 farms(id, name, status, name_norm, name_sq)
 fields(id, name, status, farmId, county, state, tillable, helAcres, crpAcres, rtkTowerId, name_norm, name_sq, county_norm, state_norm, field_num)
 rtkTowers(id, name, frequencyMHz, networkId, name_norm, name_sq)
@@ -44,16 +46,36 @@ fields.farmId = farms.id
 fields.rtkTowerId = rtkTowers.id
 
 Shorthand matching:
-- Use *_norm LIKE '%token%' for user text (lowercase tokens).
+- Use *_norm LIKE '%token%' for user text (tokens are lowercase words).
 - Counties: fields.county_norm LIKE '%macoupin%'
 - Farms: farms.name_norm LIKE '%cville%'
 - Towers: rtkTowers.name_norm LIKE '%carlinville%'
 
 Ordering:
-- Field lists should use ORDER BY fields.field_num ASC, fields.name_norm ASC
-- Farm/county/tower lists default ORDER BY name A-Z unless asked "largest first" / "descending".
+- Field lists: ORDER BY fields.field_num ASC, fields.name_norm ASC
+- Farm/county/tower lists default A-Z unless asked "largest first"/"descending".
 
-If a question is ambiguous (needs farm vs county etc), still choose the most likely interpretation and write SQL for it.
+CRITICAL PATTERN (must handle):
+If user mentions a FIELD NUMBER like 1323 (3–4 digits) and asks RTK/tower info, generate SQL like:
+SELECT
+  fields.name AS field,
+  farms.name AS farm,
+  fields.county AS county,
+  fields.state AS state,
+  rtkTowers.name AS tower,
+  rtkTowers.frequencyMHz AS frequencyMHz,
+  rtkTowers.networkId AS networkId
+FROM fields
+LEFT JOIN farms ON farms.id = fields.farmId
+LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
+WHERE
+  (fields.field_num = 1323 OR fields.id = '1323' OR fields.name_norm LIKE '1323%' OR fields.name LIKE '1323-%')
+  AND (fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))
+LIMIT 5
+
+If user asks "what tower does field #### use" use the same WHERE and return tower columns.
+
+If ambiguous, choose most likely interpretation and still return SQL.
 `.trim();
 
   const body = {
@@ -62,7 +84,7 @@ If a question is ambiguous (needs farm vs county etc), still choose the most lik
       { role: "system", content: system },
       { role: "user", content: q }
     ],
-    max_output_tokens: 800
+    max_output_tokens: 900
   };
 
   const t0 = Date.now();
@@ -83,7 +105,6 @@ If a question is ambiguous (needs farm vs county etc), still choose the most lik
     const j = await r.json();
     let outText = safeStr(j?.output_text || "");
     if (!outText) {
-      // fallback extract
       try {
         const chunks = [];
         for (const item of (j.output || [])) {
