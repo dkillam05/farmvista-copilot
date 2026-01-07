@@ -1,13 +1,16 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-06-followupInterpreter10-smart-list-followups-plus-towerinfo
+// Rev: 2026-01-06-followupInterpreter11-smart-list-followups-plus-towerinfo-guard
 //
 // Your live file, UPDATED (not shortened).
-// Adds ONE missing capability you need for real-life use:
 //
-// ✅ If lastEntity is a tower and user asks for "info/details/information about that RTK tower",
-//    rewrite to a tower detail query instead of falling back to "RTK towers used" list.
+// Fix (critical):
+// ✅ Prevent wrong "last tower" hijack.
+//   If the user says "RTK tower information for Ruby's", that is NOT "that tower".
+//   We only treat "tower info" as referring to lastEntity=tower when user says:
+//     - "that tower" / "this tower" / "same tower" / "that RTK tower"
+//   OR there is no "for <something>" subject.
 //
-// Keeps everything else unchanged.
+// Everything else unchanged.
 
 'use strict';
 
@@ -54,7 +57,6 @@ function isSameThingFollowup(s) {
 
 function isSwitchBreakdownFollowup(s) {
   const q = norm(s);
-  // "by county", "by farm" even without "same"
   return wantsByFarm(q) || wantsByCounty(q);
 }
 
@@ -143,27 +145,29 @@ function buildTowerFieldsQuestion(towerName, withTillable) {
 }
 
 /* ===========================
-   NEW: tower info/details follow-up (the missing piece)
+   Tower detail follow-up (FIXED)
 =========================== */
 
 function wantsTowerInfo(s) {
   const q = norm(s);
 
-  // real employee phrases
-  if (q.includes("info") || q.includes("information") || q.includes("details")) return true;
-  if (q.includes("tell me") && q.includes("tower")) return true;
-  if (q.includes("need to know") && (q.includes("rtk") || q.includes("tower"))) return true;
+  // must indicate "info/details"
+  const infoHit = (q.includes("info") || q.includes("information") || q.includes("details") || (q.includes("network") && q.includes("id")) || q.includes("frequency"));
 
-  // "I need to know the information from that RTK tower"
-  if (q.includes("need to know") && q.includes("information") && (q.includes("rtk") || q.includes("tower"))) return true;
+  if (!infoHit) return false;
 
-  return false;
+  // if they specify a new subject ("for Ruby's"), do NOT hijack to last tower
+  if (q.includes(" for ")) return false;
+
+  // must refer to the previous thing explicitly
+  const refersBack = hasAny(q, ["that", "this", "same"]) || q.includes("that rtk") || q.includes("that tower") || q.includes("this tower") || q.includes("same tower");
+
+  return refersBack;
 }
 
 function buildTowerDetailQuestion(towerName) {
   const t = (towerName || "").toString().trim();
   if (!t) return "";
-  // This is intentionally "details" (not "towers used") so routing hits tower-specific path.
   return `RTK tower ${t} details`;
 }
 
@@ -207,7 +211,7 @@ export function interpretFollowup({ question, ctx }) {
   const lastEntity = c.lastEntity || null;
   const lastScope = c.lastScope || {};
 
-  // ✅ Scope follow-ups keep context
+  // Scope follow-ups keep context
   if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
     if (lastIntent) {
       const includeArchived = wantsIncludeArchived(q) ? true : (wantsActiveOnly(q) ? false : !!lastScope.includeArchived);
@@ -220,43 +224,33 @@ export function interpretFollowup({ question, ctx }) {
     return null;
   }
 
-  // ✅ NEW: tower info/details follow-up uses lastEntity=tower
-  // This is the exact missing behavior in your real-world thread.
+  // ✅ tower info follow-up ONLY when user explicitly refers back ("that/this/same")
   if (lastEntity && lastEntity.type === "tower" && wantsTowerInfo(q)) {
     const rq = buildTowerDetailQuestion(lastEntity.name || lastEntity.id);
     if (rq) {
-      return {
-        rewriteQuestion: rq,
-        contextDelta: { lastIntent: "tower_detail_followup" }
-      };
+      return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_detail_followup" } };
     }
   }
 
-  // ✅ "list fields" follow-up uses lastEntity
+  // "list fields" follow-up uses lastEntity
   if (isListFieldsFollowup(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, false);
-    if (rq) {
-      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup" } };
-    }
+    if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup" } };
   }
 
-  // ✅ "with acres" upgrades last entity list to include acres
+  // "with acres" upgrades last entity list to include acres
   if (wantsWithAcres(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, true);
-    if (rq) {
-      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_with_acres_followup", lastMetric: "tillable" } };
-    }
+    if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_with_acres_followup", lastMetric: "tillable" } };
   }
 
-  // ✅ "no acres" downgrades the last entity list to non-acres
+  // "no acres" downgrades last entity list
   if (wantsNoAcres(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, false);
-    if (rq) {
-      return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup", lastMetric: "fields" } };
-    }
+    if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "list_fields_followup", lastMetric: "fields" } };
   }
 
-  // ✅ RTK follow-up: after listing tower fields, include tillable acres
+  // RTK follow-up: after listing tower fields, include tillable acres
   if ((lastIntent === "tower_fields" || lastIntent === "tower_fields_tillable") && lastEntity && lastEntity.type === "tower") {
     const towerName = (lastEntity.name || lastEntity.id || "").toString().trim();
 
@@ -271,7 +265,7 @@ export function interpretFollowup({ question, ctx }) {
     }
   }
 
-  // ✅ "same thing but …" / switch breakdowns
+  // "same thing but …" / switch breakdowns
   if (isSameThingFollowup(q) || isSwitchBreakdownFollowup(q)) {
     const metric = extractMetric(q) || lastMetric || "";
     const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : (lastBy || ""));
@@ -287,11 +281,10 @@ export function interpretFollowup({ question, ctx }) {
       const rq = buildTotalsQuestion({ metric, by });
       return { rewriteQuestion: rq, contextDelta: { lastMetric: metric || lastMetric || null, lastBy: by || lastBy || null } };
     }
-
     return null;
   }
 
-  // ✅ "that one" entity follow-ups
+  // "that one" entity follow-ups
   if (isThatEntityFollowup(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, false);
     if (rq) return { rewriteQuestion: rq, contextDelta: {} };
