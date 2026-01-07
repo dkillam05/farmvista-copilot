@@ -1,22 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql2-clean-output
+// Rev: 2026-01-06-handleChat-sql3-fieldnum-fallback
 //
-// Change:
-// ✅ Clean output formatting for SQL results (Option A style):
-//    - counts/sums => single number / single line
-//    - list queries => bullets only (no key:value spam)
-//    - default: hide acres unless user asked for acres/tillable
-// ✅ Paging for SQL lists via meta.continuation so "show all / more" works globally
+// Adds:
+// ✅ If SQL returns 0 rows AND question looks like "field #### rtk/tower",
+//    run deterministic lookup SQL against fields.field_num / id / prefix.
 //
 // Keeps:
-// ✅ Build/ensure SQLite DB from snapshot
-// ✅ OpenAI generates SELECT SQL
-// ✅ Run SQL and format result
-// ✅ Fallback to existing llmPlanner + executePlannedQuestion if SQL fails
-// ✅ paging followups (/chat/followups.js)
-// ✅ conversation interpreter (/chat/followupInterpreter.js)
-// ✅ threadId / continuation passthrough
-// ✅ debugAI footer
+// ✅ Clean output formatting (Option A)
+// ✅ SQL paging continuation
+// ✅ fallback to existing llmPlanner/handlers when SQL not available
 
 'use strict';
 
@@ -63,26 +55,17 @@ function userAskedForAcres(q) {
   );
 }
 
-function looksLikeListQuery(q) {
-  const s = norm(q);
-  return (
-    s.startsWith("list") ||
-    s.startsWith("show") ||
-    s.includes("list ") ||
-    s.includes("show ") ||
-    s.includes("fields in") ||
-    s.includes("fields on") ||
-    s.includes("farms") ||
-    s.includes("counties") ||
-    s.includes("towers")
-  );
+function formatScalar(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  if (rows.length === 1) {
+    const keys = Object.keys(rows[0] || {});
+    if (keys.length === 1) return `${rows[0][keys[0]]}`;
+  }
+  return null;
 }
 
-// Prefer readable label fields
 function pickLabelField(row) {
   if (!row || typeof row !== "object") return null;
-
-  // common
   if (row.label != null) return "label";
   if (row.name != null) return "name";
   if (row.field != null) return "field";
@@ -92,29 +75,12 @@ function pickLabelField(row) {
   if (row.county != null) return "county";
   if (row.tower != null) return "tower";
   if (row.towerName != null) return "towerName";
-
-  // fallback: first stringy field
   for (const [k, v] of Object.entries(row)) {
     if (typeof v === "string" && v.trim()) return k;
   }
   return null;
 }
 
-function formatScalar(rows) {
-  if (!Array.isArray(rows) || !rows.length) return "(no matches)";
-
-  if (rows.length === 1) {
-    const keys = Object.keys(rows[0] || {});
-    if (keys.length === 1) {
-      const v = rows[0][keys[0]];
-      return `${v}`;
-    }
-  }
-
-  return null;
-}
-
-// Build a bullet list (Option A): bullets only; acres only if asked and present
 function buildBullets({ rows, includeAcres }) {
   const lines = [];
   for (const r of rows) {
@@ -125,14 +91,12 @@ function buildBullets({ rows, includeAcres }) {
     let line = `• ${label}`;
 
     if (includeAcres) {
-      // try common acres columns
       const acres =
         (r.acres != null ? Number(r.acres) : null) ??
         (r.tillable != null ? Number(r.tillable) : null) ??
         (r.tillableAcres != null ? Number(r.tillableAcres) : null);
 
       if (Number.isFinite(acres)) {
-        // show with up to 2 decimals, no trailing junk
         const a = acres.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
         line += ` — ${a} ac`;
       }
@@ -140,9 +104,7 @@ function buildBullets({ rows, includeAcres }) {
 
     lines.push(line);
   }
-
-  if (!lines.length) return ["(no matches)"];
-  return lines;
+  return lines.length ? lines : ["(no matches)"];
 }
 
 function pageLines({ title, allLines, limit = 25 }) {
@@ -156,7 +118,7 @@ function pageLines({ title, allLines, limit = 25 }) {
   if (remaining > 0) out.push(`…plus ${remaining} more.`);
 
   const continuation = (remaining > 0)
-    ? { kind: "page", title: title || "", lines: allLines, offset: pageSize, pageSize }
+    ? { kind: "page", title: title || "", lines: allLines, offset: pageSize, pageSize: pageSize }
     : null;
 
   return { answer: out.join("\n"), continuation };
@@ -164,17 +126,56 @@ function pageLines({ title, allLines, limit = 25 }) {
 
 function formatSqlResult({ question, rows }) {
   const scalar = formatScalar(rows);
-  if (scalar != null) {
-    // single value answer
-    return { answer: scalar, continuation: null };
-  }
+  if (scalar != null) return { answer: scalar, continuation: null };
 
   const includeAcres = userAskedForAcres(question);
   const allLines = buildBullets({ rows, includeAcres });
+  return pageLines({ title: "", allLines, limit: 25 });
+}
 
-  // For lists: show up to 25 by default (paging handled by followups.js)
-  const title = ""; // Option A: no extra header unless you want it later
-  return pageLines({ title, allLines, limit: 25 });
+/* ==========================
+   NEW: field number tower fallback
+========================== */
+function extractFieldNumber(q) {
+  const s = norm(q);
+  // "field 1323" or just "1323"
+  let m = s.match(/\bfield\s+(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+
+  m = s.match(/\b(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+
+  return null;
+}
+
+function isTowerQuestion(q) {
+  const s = norm(q);
+  return s.includes("rtk") || s.includes("tower");
+}
+
+function runFieldTowerFallback(db, fieldNum) {
+  const n = Number(fieldNum);
+  if (!Number.isFinite(n)) return { ok: false, rows: [] };
+
+  const sql = `
+    SELECT
+      fields.name AS field,
+      farms.name AS farm,
+      fields.county AS county,
+      fields.state AS state,
+      rtkTowers.name AS tower,
+      rtkTowers.frequencyMHz AS frequencyMHz,
+      rtkTowers.networkId AS networkId
+    FROM fields
+    LEFT JOIN farms ON farms.id = fields.farmId
+    LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
+    WHERE
+      (fields.field_num = ${n} OR fields.id = '${n}' OR fields.name_norm LIKE '${n}%' OR fields.name LIKE '${n}-%')
+      AND (fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))
+    LIMIT 5
+  `.trim();
+
+  return runSql({ db, sql, limitDefault: 5 });
 }
 
 export async function handleChat({
@@ -198,12 +199,11 @@ export async function handleChat({
     return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot data isn’t available right now. Try /context/reload, then retry.", action: null, meta: { intent: "chat", error: true, snapshotOk: !!snapshot?.ok, threadId: tid }, state: state || null };
   }
 
-  // ensure DB for current snapshot
   let dbInfo = null;
   try { dbInfo = ensureDbFromSnapshot(snapshot); } catch (e) { dbInfo = { ok: false, error: safeStr(e?.message || e) }; }
 
-  const n = normalizeQuestion(qRaw0);
-  const qRaw = safeStr(n?.text || qRaw0);
+  const nrm = normalizeQuestion(qRaw0);
+  const qRaw = safeStr(nrm?.text || qRaw0);
 
   const token = extractBearer(authHeader);
   const user = token ? { hasAuth: true } : null;
@@ -216,13 +216,7 @@ export async function handleChat({
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
-      return {
-        ok: fu?.ok !== false,
-        answer: safeStr(fu?.answer) || "No response.",
-        action: fu?.action || null,
-        meta: { ...(fu?.meta || {}), threadId: tid },
-        state: state || null
-      };
+      return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", action: fu?.action || null, meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
     }
   } catch {
     clearContinuation(tid);
@@ -238,7 +232,7 @@ export async function handleChat({
     }
   } catch {}
 
-  // 3) SQL path (best answers)
+  // 3) SQL path
   if (dbInfo?.ok && getDb()) {
     const sqlPlan = await planSql({ question: routedQuestion, debug });
 
@@ -246,6 +240,28 @@ export async function handleChat({
       const exec = runSql({ db: getDb(), sql: sqlPlan.sql, limitDefault: 80 });
 
       if (exec.ok) {
+        // ✅ NEW: if 0 rows and this looks like field-number tower question, run fallback
+        if ((!exec.rows || exec.rows.length === 0) && isTowerQuestion(routedQuestion)) {
+          const fn = extractFieldNumber(routedQuestion);
+          if (fn != null) {
+            const fb = runFieldTowerFallback(getDb(), fn);
+            if (fb.ok && fb.rows && fb.rows.length) {
+              const formatted = formatSqlResult({ question: routedQuestion, rows: fb.rows });
+
+              let out = safeStr(formatted.answer) || "(no response)";
+              if (debug) out += `\n\n[AI SQL: ON • fieldnum fallback]`;
+
+              return {
+                ok: true,
+                answer: out,
+                action: null,
+                meta: { routed: "sql_fieldnum_fallback", threadId: tid, continuation: formatted.continuation || null, sqlRows: fb.rows.length, sql: debug ? fb.sql : undefined },
+                state: state || null
+              };
+            }
+          }
+        }
+
         const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows || [] });
 
         let out = safeStr(formatted.answer) || "(no response)";
@@ -255,13 +271,7 @@ export async function handleChat({
           ok: true,
           answer: out,
           action: null,
-          meta: {
-            routed: "sql",
-            threadId: tid,
-            continuation: formatted.continuation || null,
-            sql: debug ? exec.sql : undefined,
-            sqlRows: exec.rows?.length || 0
-          },
+          meta: { routed: "sql", threadId: tid, continuation: formatted.continuation || null, sql: debug ? exec.sql : undefined, sqlRows: exec.rows?.length || 0 },
           state: state || null
         };
       }
