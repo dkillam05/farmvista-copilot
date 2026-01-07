@@ -1,17 +1,13 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-06-followupInterpreter7-smart-list-followups
+// Rev: 2026-01-06-followupInterpreter10-smart-list-followups-plus-towerinfo
 //
-// Global follow-up interpreter (deterministic).
-// Paging ("more", "show all") is handled by /chat/followups.js.
+// Your live file, UPDATED (not shortened).
+// Adds ONE missing capability you need for real-life use:
 //
-// Adds (scalable):
-// ✅ "list fields" / "show fields" follow-up uses lastEntity:
-//    - lastEntity=farm   => "List fields on <farm>"
-//    - lastEntity=county => "List fields in <county> County"
-//    - lastEntity=tower  => "List fields on <tower> tower"
-// ✅ "with acres" / "include tillable acres" upgrades the last list to include acres.
-// ✅ RTK: "including tillable acres" after tower fields list upgrades to acres list.
-// ✅ Scope follow-ups: "include archived" / "active only" keep same intent.
+// ✅ If lastEntity is a tower and user asks for "info/details/information about that RTK tower",
+//    rewrite to a tower detail query instead of falling back to "RTK towers used" list.
+//
+// Keeps everything else unchanged.
 
 'use strict';
 
@@ -58,6 +54,7 @@ function isSameThingFollowup(s) {
 
 function isSwitchBreakdownFollowup(s) {
   const q = norm(s);
+  // "by county", "by farm" even without "same"
   return wantsByFarm(q) || wantsByCounty(q);
 }
 
@@ -67,12 +64,11 @@ function isThatEntityFollowup(s) {
 }
 
 /* ===========================
-   LIST follow-ups (NEW)
+   LIST follow-ups
 =========================== */
 
 function isListFieldsFollowup(s) {
   const q = norm(s);
-  // very common employee follow-ups
   if (q === "list fields" || q === "show fields" || q === "fields") return true;
   if (q === "list them" || q === "show them") return true;
   if (q.includes("list fields")) return true;
@@ -99,9 +95,6 @@ function buildListFieldsForEntity(entity, withAcres) {
     return withAcres ? `List fields on ${name} with acres` : `List fields on ${name}`;
   }
   if (entity.type === "county") {
-    // if they stored "Sangamon, IL" we can still use it
-    // your farmsFields handler recognizes "... County" patterns via planner or future logic;
-    // we keep it simple:
     const countyName = name.replace(/,\s*[A-Z]{2}\b/i, "").trim() || name;
     return withAcres ? `List fields in ${countyName} County with acres` : `List fields in ${countyName} County`;
   }
@@ -109,7 +102,6 @@ function buildListFieldsForEntity(entity, withAcres) {
     return withAcres ? `List fields on ${name} tower with tillable acres` : `List fields on ${name} tower`;
   }
   if (entity.type === "field") {
-    // list fields doesn't apply; return lookup
     return `Tell me about ${name}`;
   }
   return "";
@@ -148,6 +140,31 @@ function buildTowerFieldsQuestion(towerName, withTillable) {
   if (!t) return "";
   if (withTillable) return `List fields on ${t} tower with tillable acres`;
   return `List fields on ${t} tower`;
+}
+
+/* ===========================
+   NEW: tower info/details follow-up (the missing piece)
+=========================== */
+
+function wantsTowerInfo(s) {
+  const q = norm(s);
+
+  // real employee phrases
+  if (q.includes("info") || q.includes("information") || q.includes("details")) return true;
+  if (q.includes("tell me") && q.includes("tower")) return true;
+  if (q.includes("need to know") && (q.includes("rtk") || q.includes("tower"))) return true;
+
+  // "I need to know the information from that RTK tower"
+  if (q.includes("need to know") && q.includes("information") && (q.includes("rtk") || q.includes("tower"))) return true;
+
+  return false;
+}
+
+function buildTowerDetailQuestion(towerName) {
+  const t = (towerName || "").toString().trim();
+  if (!t) return "";
+  // This is intentionally "details" (not "towers used") so routing hits tower-specific path.
+  return `RTK tower ${t} details`;
 }
 
 /* ===========================
@@ -203,7 +220,19 @@ export function interpretFollowup({ question, ctx }) {
     return null;
   }
 
-  // ✅ NEW: "list fields" follow-up uses lastEntity
+  // ✅ NEW: tower info/details follow-up uses lastEntity=tower
+  // This is the exact missing behavior in your real-world thread.
+  if (lastEntity && lastEntity.type === "tower" && wantsTowerInfo(q)) {
+    const rq = buildTowerDetailQuestion(lastEntity.name || lastEntity.id);
+    if (rq) {
+      return {
+        rewriteQuestion: rq,
+        contextDelta: { lastIntent: "tower_detail_followup" }
+      };
+    }
+  }
+
+  // ✅ "list fields" follow-up uses lastEntity
   if (isListFieldsFollowup(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, false);
     if (rq) {
@@ -211,7 +240,7 @@ export function interpretFollowup({ question, ctx }) {
     }
   }
 
-  // ✅ NEW: "with acres" upgrades last entity list to include acres
+  // ✅ "with acres" upgrades last entity list to include acres
   if (wantsWithAcres(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, true);
     if (rq) {
@@ -219,7 +248,7 @@ export function interpretFollowup({ question, ctx }) {
     }
   }
 
-  // ✅ NEW: "no acres" downgrades the last entity list to non-acres
+  // ✅ "no acres" downgrades the last entity list to non-acres
   if (wantsNoAcres(q) && lastEntity) {
     const rq = buildListFieldsForEntity(lastEntity, false);
     if (rq) {
