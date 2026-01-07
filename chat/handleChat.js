@@ -1,18 +1,17 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql4-no-handler-for-fieldnum
+// Rev: 2026-01-06-handleChat-sql7-fieldtower-real
 //
-// Change:
-// ✅ Deterministic DB lookup for "Field #### RTK/tower" (NO handlers, NO OpenAI needed)
-// ✅ If not matched, uses OpenAI -> SQL -> SQLite
-// ✅ Clean output (Option A): bullets only; acres only if user asks
-// ✅ SQL lists get continuation for "show all/more"
+// Fixes your exact broken thread:
+// ✅ "RTK tower for field 710" returns tower details (not just field label)
+// ✅ Saves lastEntity=tower so follow-ups like "info from that RTK tower" work
+// ✅ DB-first for field->tower (number OR name), no handlers needed
+// ✅ Clean output: no tips, no giant tower list unless asked
 //
 // Keeps:
 // ✅ paging followups (/chat/followups.js)
-// ✅ conversation interpreter (/chat/followupInterpreter.js)
-// ✅ threadId / continuation passthrough
-// ✅ debugAI footer
-// ✅ OLD handler fallback kept as LAST resort (you can remove later)
+// ✅ followupInterpreter (/chat/followupInterpreter.js)
+// ✅ OpenAI->SQL fallback for other questions
+// ✅ handlers fallback as LAST resort
 
 'use strict';
 
@@ -26,7 +25,7 @@ import { ensureDbFromSnapshot, getDb } from "../context/snapshot-db.js";
 import { planSql } from "./sqlPlanner.js";
 import { runSql } from "./sqlRunner.js";
 
-// old deterministic fallback (last resort)
+// last resort fallback
 import { llmPlan } from "./llmPlanner.js";
 import { executePlannedQuestion } from "./executePlannedQuestion.js";
 
@@ -46,121 +45,100 @@ function makeThreadId() {
 }
 
 /* =========================
-   Output formatting (Option A)
+   Detect question types
 ========================= */
-function userAskedForAcres(q) {
-  const s = norm(q);
-  return (
-    s.includes("acres") ||
-    s.includes("tillable") ||
-    s.includes("with acres") ||
-    s.includes("include acres") ||
-    s.includes("including acres") ||
-    s.includes("include tillable") ||
-    s.includes("including tillable")
-  );
-}
-
-function formatScalar(rows) {
-  if (!Array.isArray(rows) || !rows.length) return null;
-  if (rows.length === 1) {
-    const keys = Object.keys(rows[0] || {});
-    if (keys.length === 1) return `${rows[0][keys[0]]}`;
-  }
-  return null;
-}
-
-function pickLabelField(row) {
-  if (!row || typeof row !== "object") return null;
-  if (row.label != null) return "label";
-  if (row.name != null) return "name";
-  if (row.field != null) return "field";
-  if (row.fieldName != null) return "fieldName";
-  if (row.farm != null) return "farm";
-  if (row.farmName != null) return "farmName";
-  if (row.county != null) return "county";
-  if (row.tower != null) return "tower";
-  if (row.towerName != null) return "towerName";
-  for (const [k, v] of Object.entries(row)) {
-    if (typeof v === "string" && v.trim()) return k;
-  }
-  return null;
-}
-
-function buildBullets({ rows, includeAcres }) {
-  const lines = [];
-  for (const r of rows) {
-    const labelKey = pickLabelField(r);
-    const label = labelKey ? String(r[labelKey] ?? "").trim() : "";
-    if (!label) continue;
-
-    let line = `• ${label}`;
-
-    if (includeAcres) {
-      const acres =
-        (r.acres != null ? Number(r.acres) : null) ??
-        (r.tillable != null ? Number(r.tillable) : null) ??
-        (r.tillableAcres != null ? Number(r.tillableAcres) : null);
-
-      if (Number.isFinite(acres)) {
-        const a = acres.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-        line += ` — ${a} ac`;
-      }
-    }
-
-    lines.push(line);
-  }
-  return lines.length ? lines : ["(no matches)"];
-}
-
-function pageLines({ title, allLines, limit = 25 }) {
-  const pageSize = Math.max(10, Math.min(80, Number(limit) || 25));
-  const first = allLines.slice(0, pageSize);
-  const remaining = allLines.length - first.length;
-
-  const out = [];
-  if (title) out.push(title);
-  out.push(...first);
-  if (remaining > 0) out.push(`…plus ${remaining} more.`);
-
-  const continuation = (remaining > 0)
-    ? { kind: "page", title: title || "", lines: allLines, offset: pageSize, pageSize: pageSize }
-    : null;
-
-  return { answer: out.join("\n"), continuation };
-}
-
-function formatSqlResult({ question, rows }) {
-  const scalar = formatScalar(rows);
-  if (scalar != null) return { answer: scalar, continuation: null };
-
-  const includeAcres = userAskedForAcres(question);
-  const allLines = buildBullets({ rows, includeAcres });
-  return pageLines({ title: "", allLines, limit: 25 });
-}
-
-/* =========================
-   Deterministic DB primitives (NO handlers)
-========================= */
-
-// field number like 1323 or "field 1323"
-function extractFieldNumber(q) {
-  const s = norm(q);
-  let m = s.match(/\bfield\s+(\d{3,4})\b/);
-  if (m) return parseInt(m[1], 10);
-
-  m = s.match(/\b(\d{3,4})\b/);
-  if (m) return parseInt(m[1], 10);
-
-  return null;
-}
-
 function isRtkTowerQuestion(q) {
   const s = norm(q);
   return s.includes("rtk") || s.includes("tower");
 }
+function mentionsField(q) {
+  return norm(q).includes("field");
+}
+function extractFieldNumber(q) {
+  const s = norm(q);
+  let m = s.match(/\bfield\s+(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+  m = s.match(/\b(\d{3,4})\b/);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+function extractFieldNamePhrase(q) {
+  const s = (q || "").toString();
+  let m = s.match(/\bfield\s+(.+?)(?:\brtk\b|\btower\b|\binfo\b|\binformation\b|\buse\b|\buses\b|\busing\b|\bassigned\b|$)/i);
+  if (m && m[1]) return m[1].toString().trim().replace(/\b(rtK|tower|info|information|use|uses|using|assigned)\b.*$/i, "").trim();
+  return "";
+}
+function normForSqlLike(s) {
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s\-]/g, " ")
+    .replace(/[-–—]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
+}
+function squishForSqlLike(s) {
+  return normForSqlLike(s).replace(/\s+/g, "").slice(0, 60);
+}
+function activeFieldsWhere() {
+  return "(fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))";
+}
 
-function runFieldTowerLookup(db, fieldNum) {
+/* =========================
+   Output formatting (clean)
+========================= */
+function formatFieldTowerRow(row) {
+  const r = row || {};
+  const out = [];
+
+  out.push(`Field: ${r.field || "(unknown)"}`);
+  if (r.farm) out.push(`Farm: ${r.farm}`);
+  if (r.county) out.push(`County: ${r.county}${r.state ? ", " + r.state : ""}`);
+
+  out.push(`RTK tower: ${r.tower ? r.tower : "(none assigned)"}`);
+  if (r.frequencyMHz) out.push(`Frequency: ${r.frequencyMHz} MHz`);
+  if (r.networkId != null && String(r.networkId).trim() !== "") out.push(`Network ID: ${r.networkId}`);
+
+  return out.join("\n");
+}
+
+function formatSqlResult({ question, rows }) {
+  if (!Array.isArray(rows) || rows.length === 0) return { answer: "(no matches)", continuation: null };
+
+  // single scalar
+  if (rows.length === 1) {
+    const keys = Object.keys(rows[0] || {});
+    if (keys.length === 1) return { answer: String(rows[0][keys[0]]), continuation: null };
+  }
+
+  // If it looks like our field->tower projection, show block
+  if (rows.length >= 1) {
+    const r0 = rows[0] || {};
+    if ("field" in r0 && ("tower" in r0 || "frequencyMHz" in r0 || "networkId" in r0)) {
+      // If multiple matches, show first 3 blocks
+      const blocks = [];
+      const take = Math.min(3, rows.length);
+      for (let i = 0; i < take; i++) blocks.push(formatFieldTowerRow(rows[i]));
+      if (rows.length > take) blocks.push(`(…plus ${rows.length - take} more matches)`);
+      return { answer: blocks.join("\n\n"), continuation: null };
+    }
+  }
+
+  // default: bullets on label/name/field/etc.
+  const lines = [];
+  for (const r of rows) {
+    const label = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
+    if (!label) continue;
+    lines.push(`• ${label}`);
+  }
+  return { answer: lines.length ? lines.join("\n") : "(no matches)", continuation: null };
+}
+
+/* =========================
+   Deterministic DB lookups: field -> tower
+========================= */
+function runFieldTowerLookupByNumber(db, fieldNum) {
   const n = Number(fieldNum);
   if (!Number.isFinite(n)) return { ok: false, rows: [] };
 
@@ -183,7 +161,43 @@ function runFieldTowerLookup(db, fieldNum) {
         OR fields.name_norm LIKE '${n}%'
         OR fields.name LIKE '${n}-%'
       )
-      AND (fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))
+      AND ${activeFieldsWhere()}
+    LIMIT 5
+  `.trim();
+
+  return runSql({ db, sql, limitDefault: 5 });
+}
+
+function runFieldTowerLookupByName(db, phrase) {
+  const p = normForSqlLike(phrase);
+  const sq = squishForSqlLike(phrase);
+  if (!p && !sq) return { ok: false, rows: [] };
+
+  const toks = p.split(" ").filter(t => t.length >= 2).slice(0, 4);
+  const andClauses = toks.map(t => `fields.name_norm LIKE '%${t}%'`);
+  const squishClause = sq ? `fields.name_sq LIKE '%${sq}%'` : null;
+
+  const nameMatch =
+    andClauses.length
+      ? `(${andClauses.join(" AND ")}${squishClause ? ` OR ${squishClause}` : ""})`
+      : (squishClause ? `(${squishClause})` : "0=1");
+
+  const sql = `
+    SELECT
+      fields.name AS field,
+      farms.name AS farm,
+      fields.county AS county,
+      fields.state AS state,
+      rtkTowers.name AS tower,
+      rtkTowers.frequencyMHz AS frequencyMHz,
+      rtkTowers.networkId AS networkId
+    FROM fields
+    LEFT JOIN farms ON farms.id = fields.farmId
+    LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
+    WHERE
+      ${nameMatch}
+      AND ${activeFieldsWhere()}
+    ORDER BY fields.field_num ASC, fields.name_norm ASC
     LIMIT 5
   `.trim();
 
@@ -214,7 +228,7 @@ export async function handleChat({
     return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot data isn’t available right now. Try /context/reload, then retry.", action: null, meta: { intent: "chat", error: true, snapshotOk: !!snapshot?.ok, threadId: tid }, state: state || null };
   }
 
-  // ensure DB for current snapshot
+  // ensure DB
   let dbInfo = null;
   try { dbInfo = ensureDbFromSnapshot(snapshot); } catch (e) { dbInfo = { ok: false, error: safeStr(e?.message || e) }; }
 
@@ -228,100 +242,74 @@ export async function handleChat({
 
   const ctx = getThreadContext(tid) || {};
 
-  // 1) paging followups
+  // paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
-      return {
-        ok: fu?.ok !== false,
-        answer: safeStr(fu?.answer) || "No response.",
-        action: fu?.action || null,
-        meta: { ...(fu?.meta || {}), threadId: tid },
-        state: state || null
-      };
+      return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", action: fu?.action || null, meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
     }
-  } catch {
-    clearContinuation(tid);
-  }
+  } catch { clearContinuation(tid); }
 
-  // 2) deterministic followup interpreter
+  // followup interpreter rewrite
   let routedQuestion = qRaw;
   try {
     const interp = interpretFollowup({ question: qRaw, ctx });
-    if (interp && interp.rewriteQuestion) {
+    if (interp?.rewriteQuestion) {
       routedQuestion = interp.rewriteQuestion;
       if (interp.contextDelta) applyContextDelta(tid, interp.contextDelta);
     }
   } catch {}
 
-  // ✅ 2.5) Deterministic DB lookup for FIELD #### tower questions (no OpenAI, no handlers)
-  if (dbInfo?.ok && getDb() && isRtkTowerQuestion(routedQuestion)) {
+  // ✅ DB-first: field -> tower (number OR name)
+  if (dbInfo?.ok && getDb() && isRtkTowerQuestion(routedQuestion) && mentionsField(routedQuestion)) {
+    const db = getDb();
+
     const fn = extractFieldNumber(routedQuestion);
-    if (fn != null) {
-      const exec = runFieldTowerLookup(getDb(), fn);
-      if (exec.ok && exec.rows && exec.rows.length) {
-        const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows });
+    let ex = null;
 
-        let out = safeStr(formatted.answer) || "(no response)";
-        if (debug) out += `\n\n[DB Lookup: field_num → tower]`;
+    if (fn != null) ex = runFieldTowerLookupByNumber(db, fn);
+    if (!ex || !ex.ok || !ex.rows || ex.rows.length === 0) {
+      const phrase = extractFieldNamePhrase(routedQuestion);
+      if (phrase) ex = runFieldTowerLookupByName(db, phrase);
+    }
 
-        return {
-          ok: true,
-          answer: out,
-          action: null,
-          meta: {
-            routed: "db_field_tower",
-            threadId: tid,
-            continuation: formatted.continuation || null,
-            sqlRows: exec.rows.length,
-            sql: debug ? exec.sql : undefined
-          },
-          state: state || null
-        };
-      }
-      // If no match, continue to OpenAI→SQL (maybe the field number wasn't the real ID)
+    if (ex && ex.ok && ex.rows && ex.rows.length) {
+      // store last tower for followups
+      const r0 = ex.rows[0] || {};
+      const towerName = (r0.tower || "").toString().trim();
+      const fieldName = (r0.field || "").toString().trim();
+
+      applyContextDelta(tid, {
+        lastIntent: "field_tower_lookup",
+        lastEntity: towerName ? { type: "tower", id: towerName, name: towerName } : null,
+        lastField: fieldName ? { id: fieldName, name: fieldName } : null,
+        lastScope: { includeArchived: false }
+      });
+
+      const formatted = formatSqlResult({ question: routedQuestion, rows: ex.rows });
+      let out = safeStr(formatted.answer) || "(no response)";
+      if (debug) out += `\n\n[DB Lookup: field → tower]`;
+
+      return { ok: true, answer: out, action: null, meta: { routed: "db_field_tower", threadId: tid, sql: debug ? ex.sql : undefined }, state: state || null };
     }
   }
 
-  // 3) OpenAI -> SQL -> DB
+  // OpenAI -> SQL -> DB
   if (dbInfo?.ok && getDb()) {
     const sqlPlan = await planSql({ question: routedQuestion, debug });
-
     if (sqlPlan.ok && sqlPlan.sql) {
       const exec = runSql({ db: getDb(), sql: sqlPlan.sql, limitDefault: 80 });
-
       if (exec.ok) {
         const formatted = formatSqlResult({ question: routedQuestion, rows: exec.rows || [] });
-
         let out = safeStr(formatted.answer) || "(no response)";
         if (debug) out += `\n\n[AI SQL: ON • ${sqlPlan.meta.model} • ${sqlPlan.meta.ms}ms]`;
-
-        return {
-          ok: true,
-          answer: out,
-          action: null,
-          meta: {
-            routed: "sql",
-            threadId: tid,
-            continuation: formatted.continuation || null,
-            sql: debug ? exec.sql : undefined,
-            sqlRows: exec.rows?.length || 0
-          },
-          state: state || null
-        };
+        return { ok: true, answer: out, action: null, meta: { routed: "sql", threadId: tid, sql: debug ? exec.sql : undefined, sqlRows: exec.rows?.length || 0 }, state: state || null };
       }
     }
   }
 
-  // 4) LAST resort: old planner/handlers
-  const planRes = await llmPlan({
-    question: routedQuestion,
-    threadCtx: getThreadContext(tid) || {},
-    snapshot,
-    authPresent: !!token,
-    debug
-  });
-
+  // LAST resort: old handlers
+  const planRes = await llmPlan({ question: routedQuestion, threadCtx: getThreadContext(tid) || {}, snapshot, authPresent: !!token, debug });
   if (!planRes.ok || !planRes.plan) {
     const r = await executePlannedQuestion({ rewriteQuestion: routedQuestion, snapshot, user, state, includeArchived: false });
     let answer = safeStr(r?.answer) || "No response.";
@@ -330,7 +318,6 @@ export async function handleChat({
   }
 
   const plan = planRes.plan;
-
   if (plan.action === "clarify") {
     let answer = safeStr(plan.ask) || "Active only, or include archived?";
     if (debug) answer += `\n\n[AI Planner: ON • clarify • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
@@ -339,17 +326,9 @@ export async function handleChat({
 
   const includeArchived = plan.includeArchived === true;
   const rewriteQuestion2 = safeStr(plan.rewriteQuestion) || routedQuestion;
-
   const r = await executePlannedQuestion({ rewriteQuestion: rewriteQuestion2, snapshot, user, state, includeArchived });
 
   let answer = safeStr(r?.answer) || "No response.";
   if (debug) answer += `\n\n[AI Planner: ON • execute • ${planRes.meta.model} • ${planRes.meta.ms}ms]`;
-
-  return {
-    ok: r?.ok !== false,
-    answer,
-    action: r?.action || null,
-    meta: { ...(r?.meta || {}), threadId: tid },
-    state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null)
-  };
+  return { ok: r?.ok !== false, answer, action: r?.action || null, meta: { ...(r?.meta || {}), threadId: tid }, state: Object.prototype.hasOwnProperty.call(r || {}, "state") ? (r.state || null) : (state || null) };
 }
