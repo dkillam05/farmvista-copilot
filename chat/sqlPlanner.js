@@ -1,10 +1,13 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner3-intent-sql
+// Rev: 2026-01-06-sqlPlanner4-intent-sql-fieldid
 //
 // OpenAI -> (intent, SQL) planner.
 // Returns ONLY JSON: { "intent": "...", "sql": "SELECT ..." }.
 //
-// No fallbacks in handleChat; planner must produce usable SQL.
+// CRITICAL FIX:
+// ✅ intent="list_fields" MUST return: field_id + field
+//    so result-ops (include hel acres, total those, sort) can operate on stable IDs.
+// ✅ Do NOT rely on labels alone.
 
 'use strict';
 
@@ -56,36 +59,46 @@ NORMALIZED MATCHING:
 - rtkTowers.name_norm LIKE '%token%'
 
 INTENT CONTRACTS (IMPORTANT — MUST MATCH):
+
 1) intent="rtk_tower_info"
    SQL MUST return columns (aliases exactly):
      tower, frequencyMHz, networkId
    Recommended extra columns:
      fieldsUsing, farmsUsing
+
 2) intent="field_rtk_info"
    SQL MUST return columns:
      field, tower, frequencyMHz, networkId
    Recommended extra:
      farm, county, state
+
 3) intent="field_info"
    SQL MUST return at least:
      field
    Recommended:
      farm, county, state, status, tillable, helAcres, crpAcres, tower
-4) intent="list_fields"
-   SQL MUST return:
-     field
-   Optional (ONLY if user asks for acres/tillable):
+
+4) intent="list_fields"   ✅ CRITICAL
+   SQL MUST return columns (aliases exactly):
+     field_id, field
+   Where:
+     fields.id AS field_id,
+     fields.name AS field
+   Optional (ONLY if user explicitly asks for acres in THIS SAME QUESTION):
      acres
-   Ordering for fields list:
+   Ordering:
      ORDER BY fields.field_num ASC, fields.name_norm ASC
+
 5) intent="list_rtk_towers"
    SQL MUST return:
      tower
    Optional:
      fieldCount, frequencyMHz, networkId
+
 6) intent="count" or "sum"
    SQL MUST return:
      value   (single row)
+
 7) intent="group_metric"
    SQL MUST return:
      label, value
@@ -93,13 +106,12 @@ INTENT CONTRACTS (IMPORTANT — MUST MATCH):
 FIELD NUMBER PATTERN:
 If user says "field 0832" or "field number 710":
 Use fields.field_num = 832 / 710 OR fields.name_norm LIKE '0832%' etc.
-But still output the required aliases for the intent.
 
 EXAMPLES:
-- "RTK tower info for field 0832" => intent field_rtk_info
-- "network id and frequency for Carlinville tower" => intent rtk_tower_info
-- "list fields in macoupin county" => intent list_fields
-- "how many fields in cville farm" => intent count (value)
+- "list all fields in macoupin county" => intent list_fields
+  SELECT fields.id AS field_id, fields.name AS field FROM fields WHERE fields.county_norm LIKE '%macoupin%' AND (active-only) ORDER BY fields.field_num ASC LIMIT 80
+- "fields with hel acres > 0" => intent list_fields
+  SELECT fields.id AS field_id, fields.name AS field FROM fields WHERE fields.helAcres > 0 AND (active-only) ORDER BY fields.field_num ASC LIMIT 80
 `.trim();
 
   const body = {
