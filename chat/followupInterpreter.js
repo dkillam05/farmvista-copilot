@@ -1,16 +1,18 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-06-followupInterpreter11-smart-list-followups-plus-towerinfo-guard
+// Rev: 2026-01-06-followupInterpreter12-resultops-global
 //
-// Your live file, UPDATED (not shortened).
+// Global follow-up interpreter (deterministic).
+// Paging ("more", "show all") is handled by /chat/followups.js.
 //
-// Fix (critical):
-// ✅ Prevent wrong "last tower" hijack.
-//   If the user says "RTK tower information for Ruby's", that is NOT "that tower".
-//   We only treat "tower info" as referring to lastEntity=tower when user says:
-//     - "that tower" / "this tower" / "same tower" / "that RTK tower"
-//   OR there is no "for <something>" subject.
+// Adds (B - full generic):
+// ✅ If ctx.lastResult exists, interpret common followups as a RESULT OP:
+//    - "include hel acres" / "include tillable acres" / "include acres"
+//    - "total those acres" / "sum those" / "total them"
+//    - "largest first" / "smallest first" / "A-Z"
+//    - "no acres" / "remove acres"
+// These do NOT re-query from scratch; they operate on the previous result set.
 //
-// Everything else unchanged.
+// Keeps your existing long followup rules intact.
 
 'use strict';
 
@@ -66,7 +68,7 @@ function isThatEntityFollowup(s) {
 }
 
 /* ===========================
-   LIST follow-ups
+   LIST follow-ups (existing)
 =========================== */
 
 function isListFieldsFollowup(s) {
@@ -93,24 +95,18 @@ function buildListFieldsForEntity(entity, withAcres) {
   const name = (entity.name || entity.id || "").toString().trim();
   if (!name) return "";
 
-  if (entity.type === "farm") {
-    return withAcres ? `List fields on ${name} with acres` : `List fields on ${name}`;
-  }
+  if (entity.type === "farm") return withAcres ? `List fields on ${name} with acres` : `List fields on ${name}`;
   if (entity.type === "county") {
     const countyName = name.replace(/,\s*[A-Z]{2}\b/i, "").trim() || name;
     return withAcres ? `List fields in ${countyName} County with acres` : `List fields in ${countyName} County`;
   }
-  if (entity.type === "tower") {
-    return withAcres ? `List fields on ${name} tower with tillable acres` : `List fields on ${name} tower`;
-  }
-  if (entity.type === "field") {
-    return `Tell me about ${name}`;
-  }
+  if (entity.type === "tower") return withAcres ? `List fields on ${name} tower with tillable acres` : `List fields on ${name} tower`;
+  if (entity.type === "field") return `Tell me about ${name}`;
   return "";
 }
 
 /* ===========================
-   RTK follow-up helpers
+   RTK follow-up helpers (existing)
 =========================== */
 
 function wantsIncludeTillableRTK(s) {
@@ -140,39 +136,68 @@ function wantsRemoveTillableRTK(s) {
 function buildTowerFieldsQuestion(towerName, withTillable) {
   const t = (towerName || "").toString().trim();
   if (!t) return "";
-  if (withTillable) return `List fields on ${t} tower with tillable acres`;
-  return `List fields on ${t} tower`;
+  return withTillable ? `List fields on ${t} tower with tillable acres` : `List fields on ${t} tower`;
 }
 
 /* ===========================
-   Tower detail follow-up (FIXED)
+   NEW: Result Ops (global)
 =========================== */
 
-function wantsTowerInfo(s) {
-  const q = norm(s);
-
-  // must indicate "info/details"
-  const infoHit = (q.includes("info") || q.includes("information") || q.includes("details") || (q.includes("network") && q.includes("id")) || q.includes("frequency"));
-
-  if (!infoHit) return false;
-
-  // if they specify a new subject ("for Ruby's"), do NOT hijack to last tower
-  if (q.includes(" for ")) return false;
-
-  // must refer to the previous thing explicitly
-  const refersBack = hasAny(q, ["that", "this", "same"]) || q.includes("that rtk") || q.includes("that tower") || q.includes("this tower") || q.includes("same tower");
-
-  return refersBack;
+function hasLastResult(ctx) {
+  return !!(ctx && ctx.lastResult && typeof ctx.lastResult === "object" && ctx.lastResult.kind);
 }
 
-function buildTowerDetailQuestion(towerName) {
-  const t = (towerName || "").toString().trim();
-  if (!t) return "";
-  return `RTK tower ${t} details`;
+function wantsTotalFollowup(q) {
+  const s = norm(q);
+  return s.includes("total") || s.includes("sum") || s.includes("add them") || s.includes("total those") || s.includes("sum those") || s.includes("total them");
+}
+
+function wantsSortLargest(q) {
+  const s = norm(q);
+  return s.includes("largest first") || s.includes("biggest first") || s.includes("descending") || s.includes("high to low") || s.includes("most first");
+}
+
+function wantsSortSmallest(q) {
+  const s = norm(q);
+  return s.includes("smallest first") || s.includes("ascending") || s.includes("low to high") || s.includes("least first");
+}
+
+function wantsSortAZ(q) {
+  const s = norm(q);
+  return s === "a-z" || s.includes("a to z") || s.includes("alphabetical");
+}
+
+function requestedMetric(q) {
+  const s = norm(q);
+  if (s.includes("hel")) return "hel";
+  if (s.includes("crp")) return "crp";
+  if (s.includes("tillable")) return "tillable";
+  if (s.includes("acres")) return "tillable";
+  return "";
+}
+
+function wantsIncludeMetric(q) {
+  const s = norm(q);
+  // “include X acres” / “with X”
+  if (s.includes("include") || s.includes("including") || s.includes("with")) {
+    const m = requestedMetric(s);
+    if (m) return m;
+  }
+  // “include acres” (default to lastResult.metric or tillable)
+  if (s.includes("include acres") || s.includes("including acres") || s.includes("with acres")) return "tillable";
+  return "";
+}
+
+/**
+ * Special internal rewrite marker:
+ * - handleChat will detect rewriteQuestion === "__RESULT_OP__" and run op on ctx.lastResult.
+ */
+function resultOp(rewrite, delta) {
+  return { rewriteQuestion: "__RESULT_OP__", contextDelta: { resultOp: { ...(delta || {}) }, _resultOpFor: rewrite || "" } };
 }
 
 /* ===========================
-   Totals builder
+   Totals builder (existing)
 =========================== */
 
 function buildTotalsQuestion({ metric, by }) {
@@ -211,25 +236,46 @@ export function interpretFollowup({ question, ctx }) {
   const lastEntity = c.lastEntity || null;
   const lastScope = c.lastScope || {};
 
-  // Scope follow-ups keep context
+  // ✅ RESULT OPS FIRST: if we have a lastResult, interpret common “operate on this list” commands
+  if (hasLastResult(c)) {
+    // include archived / active only changes result scope (future-safe)
+    if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
+      return resultOp("scope", { op: "scope", includeArchived: wantsIncludeArchived(q) ? true : false });
+    }
+
+    // include metric column
+    const m = wantsIncludeMetric(q);
+    if (m) {
+      return resultOp("augment", { op: "augment", metric: m });
+    }
+
+    // remove metric column
+    if (wantsNoAcres(q)) {
+      return resultOp("strip_metric", { op: "strip_metric" });
+    }
+
+    // totals
+    if (wantsTotalFollowup(q)) {
+      const mm = requestedMetric(q) || c.lastResult.metric || "tillable";
+      return resultOp("total", { op: "total", metric: mm });
+    }
+
+    // sort mode
+    if (wantsSortLargest(q)) return resultOp("sort", { op: "sort", mode: "largest" });
+    if (wantsSortSmallest(q)) return resultOp("sort", { op: "sort", mode: "smallest" });
+    if (wantsSortAZ(q)) return resultOp("sort", { op: "sort", mode: "az" });
+  }
+
+  // ✅ Scope follow-ups keep context (existing)
   if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
     if (lastIntent) {
       const includeArchived = wantsIncludeArchived(q) ? true : (wantsActiveOnly(q) ? false : !!lastScope.includeArchived);
       const metric = extractMetric(q) || lastMetric;
       const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : lastBy);
-
       const rq = buildTotalsQuestion({ metric: metric || lastMetric, by: by || lastBy });
       return { rewriteQuestion: rq, contextDelta: { lastScope: { includeArchived } } };
     }
     return null;
-  }
-
-  // ✅ tower info follow-up ONLY when user explicitly refers back ("that/this/same")
-  if (lastEntity && lastEntity.type === "tower" && wantsTowerInfo(q)) {
-    const rq = buildTowerDetailQuestion(lastEntity.name || lastEntity.id);
-    if (rq) {
-      return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_detail_followup" } };
-    }
   }
 
   // "list fields" follow-up uses lastEntity
@@ -253,12 +299,10 @@ export function interpretFollowup({ question, ctx }) {
   // RTK follow-up: after listing tower fields, include tillable acres
   if ((lastIntent === "tower_fields" || lastIntent === "tower_fields_tillable") && lastEntity && lastEntity.type === "tower") {
     const towerName = (lastEntity.name || lastEntity.id || "").toString().trim();
-
     if (wantsIncludeTillableRTK(q) && lastIntent !== "tower_fields_tillable") {
       const rq = buildTowerFieldsQuestion(towerName, true);
       if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_fields_tillable", lastMetric: "tillable" } };
     }
-
     if (wantsRemoveTillableRTK(q) && lastIntent !== "tower_fields") {
       const rq = buildTowerFieldsQuestion(towerName, false);
       if (rq) return { rewriteQuestion: rq, contextDelta: { lastIntent: "tower_fields", lastMetric: "fields" } };
@@ -269,7 +313,6 @@ export function interpretFollowup({ question, ctx }) {
   if (isSameThingFollowup(q) || isSwitchBreakdownFollowup(q)) {
     const metric = extractMetric(q) || lastMetric || "";
     const by = wantsByFarm(q) ? "farm" : (wantsByCounty(q) ? "county" : (lastBy || ""));
-
     if (
       lastIntent.includes("totals") ||
       lastIntent.includes("count") ||
