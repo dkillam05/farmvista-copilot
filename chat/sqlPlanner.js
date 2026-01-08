@@ -1,13 +1,12 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner4-intent-sql-fieldid
+// Rev: 2026-01-06-sqlPlanner6-target-hints
 //
-// OpenAI -> (intent, SQL) planner.
-// Returns ONLY JSON: { "intent": "...", "sql": "SELECT ..." }.
+// Adds optional target hints so the resolver knows what to resolve.
+// Returns ONLY JSON, but now supports optional keys:
+//   targetType: "tower|farm|county|field"
+//   targetText: "Sean creek"
 //
-// CRITICAL FIX:
-// ✅ intent="list_fields" MUST return: field_id + field
-//    so result-ops (include hel acres, total those, sort) can operate on stable IDs.
-// ✅ Do NOT rely on labels alone.
+// (handleChat will ignore if missing.)
 
 'use strict';
 
@@ -19,7 +18,7 @@ export async function planSql({ question, debug = false }) {
   const apiKey = safeStr(process.env.OPENAI_API_KEY);
   const model = safeStr(process.env.OPENAI_MODEL || "gpt-4.1-mini");
   if (!apiKey) {
-    return { ok: false, intent: "", sql: "", meta: { used: false, error: "OPENAI_API_KEY not set", model } };
+    return { ok: false, intent: "", sql: "", targetType: "", targetText: "", meta: { used: false, error: "OPENAI_API_KEY not set", model } };
   }
 
   const q = safeStr(question);
@@ -30,7 +29,9 @@ You are FarmVista Copilot SQL planner.
 Return ONLY valid JSON:
 {
   "intent": "<one of: rtk_tower_info | field_rtk_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
-  "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)"
+  "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)",
+  "targetType": "<optional: tower|farm|county|field>",
+  "targetText": "<optional: user-supplied name to resolve>"
 }
 
 GLOBAL RULES:
@@ -58,60 +59,45 @@ NORMALIZED MATCHING:
 - fields.county_norm LIKE '%token%'
 - rtkTowers.name_norm LIKE '%token%'
 
-INTENT CONTRACTS (IMPORTANT — MUST MATCH):
+CRITICAL INTENT RULE (NO EXCEPTIONS):
+If the user asks for ANY of:
+  - "tower info" / "tower information" / "details"
+  - "frequency" / "mhz"
+  - "network id" / "network"
+then intent MUST be "rtk_tower_info" (NOT list_rtk_towers).
+
+INTENT CONTRACTS (MUST MATCH):
 
 1) intent="rtk_tower_info"
-   SQL MUST return columns (aliases exactly):
-     tower, frequencyMHz, networkId
-   Recommended extra columns:
+   SQL MUST return:
+     rtkTowers.name AS tower,
+     rtkTowers.frequencyMHz AS frequencyMHz,
+     rtkTowers.networkId AS networkId
+   Optional:
      fieldsUsing, farmsUsing
 
-2) intent="field_rtk_info"
-   SQL MUST return columns:
-     field, tower, frequencyMHz, networkId
-   Recommended extra:
-     farm, county, state
+2) intent="list_rtk_towers"
+   SQL MUST return:
+     rtkTowers.name AS tower
 
-3) intent="field_info"
-   SQL MUST return at least:
-     field
-   Recommended:
-     farm, county, state, status, tillable, helAcres, crpAcres, tower
-
-4) intent="list_fields"   ✅ CRITICAL
-   SQL MUST return columns (aliases exactly):
-     field_id, field
-   Where:
+3) intent="list_fields"
+   SQL MUST return:
      fields.id AS field_id,
      fields.name AS field
-   Optional (ONLY if user explicitly asks for acres in THIS SAME QUESTION):
-     acres
-   Ordering:
-     ORDER BY fields.field_num ASC, fields.name_norm ASC
-
-5) intent="list_rtk_towers"
-   SQL MUST return:
-     tower
-   Optional:
-     fieldCount, frequencyMHz, networkId
-
-6) intent="count" or "sum"
-   SQL MUST return:
-     value   (single row)
-
-7) intent="group_metric"
-   SQL MUST return:
-     label, value
+   ORDER BY fields.field_num ASC, fields.name_norm ASC
 
 FIELD NUMBER PATTERN:
 If user says "field 0832" or "field number 710":
-Use fields.field_num = 832 / 710 OR fields.name_norm LIKE '0832%' etc.
+Use fields.field_num = 832/710 OR fields.name_norm LIKE '0832%' etc.
 
-EXAMPLES:
-- "list all fields in macoupin county" => intent list_fields
-  SELECT fields.id AS field_id, fields.name AS field FROM fields WHERE fields.county_norm LIKE '%macoupin%' AND (active-only) ORDER BY fields.field_num ASC LIMIT 80
-- "fields with hel acres > 0" => intent list_fields
-  SELECT fields.id AS field_id, fields.name AS field FROM fields WHERE fields.helAcres > 0 AND (active-only) ORDER BY fields.field_num ASC LIMIT 80
+TARGET HINTS:
+- If intent is rtk_tower_info and user mentions a tower name, set:
+    targetType="tower"
+    targetText="<the name they typed>"
+- If intent is list_fields in a county, set:
+    targetType="county"
+    targetText="<county they typed>"
+
 `.trim();
 
   const body = {
@@ -139,6 +125,8 @@ EXAMPLES:
         ok: false,
         intent: "",
         sql: "",
+        targetType: "",
+        targetText: "",
         meta: { used: true, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250), model, ms }
       };
     }
@@ -160,18 +148,27 @@ EXAMPLES:
 
     let parsed = null;
     try { parsed = JSON.parse(outText); } catch {
-      return { ok: false, intent: "", sql: "", meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms } };
+      return {
+        ok: false,
+        intent: "",
+        sql: "",
+        targetType: "",
+        targetText: "",
+        meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms }
+      };
     }
 
     const intent = safeStr(parsed?.intent);
     const sql = safeStr(parsed?.sql);
+    const targetType = safeStr(parsed?.targetType || "");
+    const targetText = safeStr(parsed?.targetText || "");
 
-    if (!intent) return { ok: false, intent: "", sql: "", meta: { used: true, error: "Missing intent", model, ms } };
-    if (!sql) return { ok: false, intent, sql: "", meta: { used: true, error: "Missing sql", model, ms } };
+    if (!intent) return { ok: false, intent: "", sql: "", targetType, targetText, meta: { used: true, error: "Missing intent", model, ms } };
+    if (!sql) return { ok: false, intent, sql: "", targetType, targetText, meta: { used: true, error: "Missing sql", model, ms } };
 
-    return { ok: true, intent, sql, meta: { used: true, ok: true, model, ms, intent, sql: debug ? sql : undefined } };
+    return { ok: true, intent, sql, targetType, targetText, meta: { used: true, ok: true, model, ms, intent, sql: debug ? sql : undefined } };
   } catch (e) {
     const ms = Date.now() - t0;
-    return { ok: false, intent: "", sql: "", meta: { used: true, error: e?.message || String(e), model, ms } };
+    return { ok: false, intent: "", sql: "", targetType: "", targetText: "", meta: { used: true, error: e?.message || String(e), model, ms } };
   }
 }
