@@ -1,17 +1,16 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner6-target-hints
+// Rev: 2026-01-06-sqlPlanner7-force-tower-info-and-target-hints
 //
-// Adds optional target hints so the resolver knows what to resolve.
-// Returns ONLY JSON, but now supports optional keys:
-//   targetType: "tower|farm|county|field"
-//   targetText: "Sean creek"
-//
-// (handleChat will ignore if missing.)
+// Updates:
+// ✅ list_fields MUST return field_id + field
+// ✅ list_rtk_towers MUST return tower
+// ✅ rtk_tower_info MUST return tower, frequencyMHz, networkId
+// ✅ If user asks "info/details/network/frequency" about a tower => intent MUST be rtk_tower_info
+// ✅ Adds optional targetType/targetText for global entity resolution on 0 matches
 
 'use strict';
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
-
 function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
 
 export async function planSql({ question, debug = false }) {
@@ -31,17 +30,17 @@ Return ONLY valid JSON:
   "intent": "<one of: rtk_tower_info | field_rtk_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
   "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)",
   "targetType": "<optional: tower|farm|county|field>",
-  "targetText": "<optional: user-supplied name to resolve>"
+  "targetText": "<optional: the exact string user typed for the target>"
 }
 
 GLOBAL RULES:
 - SQLite dialect.
-- SELECT statements ONLY. No semicolons.
-- ALWAYS include LIMIT (default 80, unless question implies smaller).
-- Default scope is ACTIVE ONLY unless user says include archived/inactive.
-  Active-only rule for fields:
+- SELECT ONLY. No semicolons.
+- ALWAYS include LIMIT (default 80 unless smaller implied).
+- Default scope ACTIVE ONLY unless user explicitly asks include archived/inactive.
+  Active-only fields:
     fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive')
-  Active-only rule for farms:
+  Active-only farms:
     farms.status IS NULL OR farms.status='' OR LOWER(farms.status) NOT IN ('archived','inactive')
 
 SCHEMA:
@@ -59,22 +58,26 @@ NORMALIZED MATCHING:
 - fields.county_norm LIKE '%token%'
 - rtkTowers.name_norm LIKE '%token%'
 
-CRITICAL INTENT RULE (NO EXCEPTIONS):
-If the user asks for ANY of:
-  - "tower info" / "tower information" / "details"
-  - "frequency" / "mhz"
-  - "network id" / "network"
-then intent MUST be "rtk_tower_info" (NOT list_rtk_towers).
+CRITICAL INTENT RULE:
+If the user asks for any of:
+- info / information / details
+- frequency / mhz
+- network id / network
+about an RTK tower,
+intent MUST be "rtk_tower_info" (NOT list_rtk_towers).
 
 INTENT CONTRACTS (MUST MATCH):
 
 1) intent="rtk_tower_info"
-   SQL MUST return:
+   SQL MUST return aliases EXACT:
      rtkTowers.name AS tower,
      rtkTowers.frequencyMHz AS frequencyMHz,
      rtkTowers.networkId AS networkId
    Optional:
      fieldsUsing, farmsUsing
+   ALSO set:
+     targetType="tower"
+     targetText="<tower name string user typed>"
 
 2) intent="list_rtk_towers"
    SQL MUST return:
@@ -84,20 +87,16 @@ INTENT CONTRACTS (MUST MATCH):
    SQL MUST return:
      fields.id AS field_id,
      fields.name AS field
-   ORDER BY fields.field_num ASC, fields.name_norm ASC
+   ORDER:
+     ORDER BY fields.field_num ASC, fields.name_norm ASC
 
-FIELD NUMBER PATTERN:
+FIELD NUMBER:
 If user says "field 0832" or "field number 710":
-Use fields.field_num = 832/710 OR fields.name_norm LIKE '0832%' etc.
+use fields.field_num = 832/710 OR fields.name_norm LIKE '0832%' OR fields.name LIKE '0832-%'
 
-TARGET HINTS:
-- If intent is rtk_tower_info and user mentions a tower name, set:
-    targetType="tower"
-    targetText="<the name they typed>"
-- If intent is list_fields in a county, set:
-    targetType="county"
-    targetText="<county they typed>"
-
+Examples:
+- "Please give me a full list of all the rtk towers we use" => list_rtk_towers
+- "Can you give me the information on Sean creek tower" => rtk_tower_info + targetText="Sean creek"
 `.trim();
 
   const body = {
@@ -121,14 +120,7 @@ TARGET HINTS:
 
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      return {
-        ok: false,
-        intent: "",
-        sql: "",
-        targetType: "",
-        targetText: "",
-        meta: { used: true, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250), model, ms }
-      };
+      return { ok: false, intent: "", sql: "", targetType: "", targetText: "", meta: { used: true, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250), model, ms } };
     }
 
     const j = await r.json();
@@ -147,15 +139,9 @@ TARGET HINTS:
     }
 
     let parsed = null;
-    try { parsed = JSON.parse(outText); } catch {
-      return {
-        ok: false,
-        intent: "",
-        sql: "",
-        targetType: "",
-        targetText: "",
-        meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms }
-      };
+    try { parsed = JSON.parse(outText); }
+    catch {
+      return { ok: false, intent: "", sql: "", targetType: "", targetText: "", meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms } };
     }
 
     const intent = safeStr(parsed?.intent);
