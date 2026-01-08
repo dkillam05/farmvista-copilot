@@ -1,8 +1,9 @@
 // /chat/entityCatalog.js  (FULL FILE)
-// Rev: 2026-01-06-entityCatalog1
+// Rev: 2026-01-06-entityCatalog2-sqlite
 //
-// Pulls candidate names from SQLite for global "did you mean" resolution.
-// Generic and scalable: add more entity types later.
+// Canonical candidate lists from SQLite (truth sets).
+// Used only for "did you mean..." resolution.
+// No fuzzy logic here; no OpenAI here.
 
 'use strict';
 
@@ -10,13 +11,28 @@ import { runSql } from "./sqlRunner.js";
 
 function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
 
-export function getCandidates({ db, entityType, limit = 250 }) {
-  const t = safeStr(entityType).toLowerCase();
-  const lim = Math.max(25, Math.min(2000, Number(limit) || 250));
+function uniq(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const x of (arr || [])) {
+    const s = safeStr(x);
+    if (!s) continue;
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
 
-  // IMPORTANT: keep queries cheap + predictable.
+export function getCandidates({ db, type, limit = 200 }) {
+  const t = safeStr(type).toLowerCase();
+  const lim = Math.max(20, Math.min(500, Number(limit) || 200));
+
   let sql = "";
-  if (t === "tower" || t === "rtk_tower" || t === "rtk") {
+  let key = "name";
+
+  if (t === "tower" || t === "rtk" || t === "rtk_tower") {
     sql = `
       SELECT rtkTowers.name AS name
       FROM rtkTowers
@@ -24,6 +40,7 @@ export function getCandidates({ db, entityType, limit = 250 }) {
       ORDER BY rtkTowers.name_norm ASC
       LIMIT ${lim}
     `.trim();
+    key = "name";
   } else if (t === "farm") {
     sql = `
       SELECT farms.name AS name
@@ -32,36 +49,38 @@ export function getCandidates({ db, entityType, limit = 250 }) {
       ORDER BY farms.name_norm ASC
       LIMIT ${lim}
     `.trim();
+    key = "name";
   } else if (t === "county") {
-    // distinct counties from fields (fast enough on snapshot DB)
     sql = `
       SELECT DISTINCT
         CASE
-          WHEN fields.state IS NOT NULL AND fields.state <> '' THEN (fields.county || ', ' || fields.state)
-          ELSE fields.county
+          WHEN TRIM(COALESCE(fields.state,'')) <> '' THEN TRIM(fields.county) || ', ' || TRIM(fields.state)
+          ELSE TRIM(fields.county)
         END AS name
       FROM fields
-      WHERE fields.county IS NOT NULL AND fields.county <> ''
+      WHERE TRIM(COALESCE(fields.county,'')) <> ''
       ORDER BY LOWER(name) ASC
       LIMIT ${lim}
     `.trim();
+    key = "name";
   } else if (t === "field") {
-    // fields can be large; keep limit reasonable
-    const L = Math.max(100, Math.min(2000, lim));
+    // large list; keep bounded
+    const L = Math.max(100, Math.min(800, lim));
     sql = `
       SELECT fields.name AS name
       FROM fields
       WHERE fields.name IS NOT NULL AND fields.name <> ''
-      ORDER BY fields.field_num ASC, fields.name_norm ASC
+      ORDER BY COALESCE(fields.field_num, 999999) ASC, fields.name_norm ASC
       LIMIT ${L}
     `.trim();
+    key = "name";
   } else {
-    return { ok: false, reason: "unknown_entityType", names: [] };
+    return { ok: false, error: "unknown_type", candidates: [] };
   }
 
-  const r = runSql({ db, sql, limitDefault: lim });
-  if (!r.ok) return { ok: false, reason: r.error || "sql_failed", names: [] };
+  const ex = runSql({ db, sql, limitDefault: lim });
+  if (!ex.ok) return { ok: false, error: ex.error || "sql_failed", candidates: [] };
 
-  const names = (r.rows || []).map(x => safeStr(x?.name)).filter(Boolean);
-  return { ok: true, names };
+  const vals = (ex.rows || []).map(r => safeStr(r?.[key])).filter(Boolean);
+  return { ok: true, candidates: uniq(vals) };
 }
