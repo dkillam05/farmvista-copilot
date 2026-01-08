@@ -1,11 +1,10 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner2-field-number-tower
+// Rev: 2026-01-06-sqlPlanner3-intent-sql
 //
-// Adds:
-// ✅ Explicit pattern for "Field #### tower info" and "what tower does field #### use"
-// ✅ Uses fields.id OR fields.name_norm startswith digits OR fields.field_num
+// OpenAI -> (intent, SQL) planner.
+// Returns ONLY JSON: { "intent": "...", "sql": "SELECT ..." }.
 //
-// Returns SELECT-only SQL JSON: { "sql": "...", "notes": "..." }
+// No fallbacks in handleChat; planner must produce usable SQL.
 
 'use strict';
 
@@ -16,66 +15,91 @@ function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
 export async function planSql({ question, debug = false }) {
   const apiKey = safeStr(process.env.OPENAI_API_KEY);
   const model = safeStr(process.env.OPENAI_MODEL || "gpt-4.1-mini");
-  if (!apiKey) return { ok: false, sql: "", meta: { used: false, error: "OPENAI_API_KEY not set", model } };
+  if (!apiKey) {
+    return { ok: false, intent: "", sql: "", meta: { used: false, error: "OPENAI_API_KEY not set", model } };
+  }
 
   const q = safeStr(question);
 
   const system = `
-You are a SQL generator for FarmVista Copilot.
-Return ONLY valid JSON with this shape:
+You are FarmVista Copilot SQL planner.
+
+Return ONLY valid JSON:
 {
-  "sql": "SELECT ...",
-  "notes": "optional"
+  "intent": "<one of: rtk_tower_info | field_rtk_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
+  "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)"
 }
 
-Rules:
+GLOBAL RULES:
 - SQLite dialect.
 - SELECT statements ONLY. No semicolons.
+- ALWAYS include LIMIT (default 80, unless question implies smaller).
 - Default scope is ACTIVE ONLY unless user says include archived/inactive.
-  Active-only rule for fields: fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive')
-  Active-only rule for farms: farms.status IS NULL OR farms.status='' OR LOWER(farms.status) NOT IN ('archived','inactive')
-- Always add LIMIT 80 unless question implies a smaller number.
+  Active-only rule for fields:
+    fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive')
+  Active-only rule for farms:
+    farms.status IS NULL OR farms.status='' OR LOWER(farms.status) NOT IN ('archived','inactive')
 
-Tables/columns:
+SCHEMA:
 farms(id, name, status, name_norm, name_sq)
 fields(id, name, status, farmId, county, state, tillable, helAcres, crpAcres, rtkTowerId, name_norm, name_sq, county_norm, state_norm, field_num)
 rtkTowers(id, name, frequencyMHz, networkId, name_norm, name_sq)
 
-Joins:
+JOINS:
 fields.farmId = farms.id
 fields.rtkTowerId = rtkTowers.id
 
-Shorthand matching:
-- Use *_norm LIKE '%token%' for user text (tokens are lowercase words).
-- Counties: fields.county_norm LIKE '%macoupin%'
-- Farms: farms.name_norm LIKE '%cville%'
-- Towers: rtkTowers.name_norm LIKE '%carlinville%'
+NORMALIZED MATCHING:
+- farms.name_norm LIKE '%token%'
+- fields.name_norm LIKE '%token%'
+- fields.county_norm LIKE '%token%'
+- rtkTowers.name_norm LIKE '%token%'
 
-Ordering:
-- Field lists: ORDER BY fields.field_num ASC, fields.name_norm ASC
-- Farm/county/tower lists default A-Z unless asked "largest first"/"descending".
+INTENT CONTRACTS (IMPORTANT — MUST MATCH):
+1) intent="rtk_tower_info"
+   SQL MUST return columns (aliases exactly):
+     tower, frequencyMHz, networkId
+   Recommended extra columns:
+     fieldsUsing, farmsUsing
+2) intent="field_rtk_info"
+   SQL MUST return columns:
+     field, tower, frequencyMHz, networkId
+   Recommended extra:
+     farm, county, state
+3) intent="field_info"
+   SQL MUST return at least:
+     field
+   Recommended:
+     farm, county, state, status, tillable, helAcres, crpAcres, tower
+4) intent="list_fields"
+   SQL MUST return:
+     field
+   Optional (ONLY if user asks for acres/tillable):
+     acres
+   Ordering for fields list:
+     ORDER BY fields.field_num ASC, fields.name_norm ASC
+5) intent="list_rtk_towers"
+   SQL MUST return:
+     tower
+   Optional:
+     fieldCount, frequencyMHz, networkId
+6) intent="count" or "sum"
+   SQL MUST return:
+     value   (single row)
+7) intent="group_metric"
+   SQL MUST return:
+     label, value
 
-CRITICAL PATTERN (must handle):
-If user mentions a FIELD NUMBER like 1323 (3–4 digits) and asks RTK/tower info, generate SQL like:
-SELECT
-  fields.name AS field,
-  farms.name AS farm,
-  fields.county AS county,
-  fields.state AS state,
-  rtkTowers.name AS tower,
-  rtkTowers.frequencyMHz AS frequencyMHz,
-  rtkTowers.networkId AS networkId
-FROM fields
-LEFT JOIN farms ON farms.id = fields.farmId
-LEFT JOIN rtkTowers ON rtkTowers.id = fields.rtkTowerId
-WHERE
-  (fields.field_num = 1323 OR fields.id = '1323' OR fields.name_norm LIKE '1323%' OR fields.name LIKE '1323-%')
-  AND (fields.status IS NULL OR fields.status='' OR LOWER(fields.status) NOT IN ('archived','inactive'))
-LIMIT 5
+FIELD NUMBER PATTERN:
+If user says "field 0832" or "field number 710":
+Use fields.field_num = 832 / 710 OR fields.name_norm LIKE '0832%' etc.
+But still output the required aliases for the intent.
 
-If user asks "what tower does field #### use" use the same WHERE and return tower columns.
-
-If ambiguous, choose most likely interpretation and still return SQL.
+EXAMPLES:
+- "RTK tower info for field 0832" => intent field_rtk_info
+- "network id and frequency for Carlinville tower" => intent rtk_tower_info
+- "list fields in macoupin county" => intent list_fields
+- "how many fields in cville farm" => intent count (value)
 `.trim();
 
   const body = {
@@ -99,7 +123,12 @@ If ambiguous, choose most likely interpretation and still return SQL.
 
     if (!r.ok) {
       const txt = await r.text().catch(() => "");
-      return { ok: false, sql: "", meta: { used: true, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250), model, ms } };
+      return {
+        ok: false,
+        intent: "",
+        sql: "",
+        meta: { used: true, error: `OpenAI HTTP ${r.status}`, detail: debug ? txt.slice(0, 2000) : txt.slice(0, 250), model, ms }
+      };
     }
 
     const j = await r.json();
@@ -119,15 +148,18 @@ If ambiguous, choose most likely interpretation and still return SQL.
 
     let parsed = null;
     try { parsed = JSON.parse(outText); } catch {
-      return { ok: false, sql: "", meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms } };
+      return { ok: false, intent: "", sql: "", meta: { used: true, error: "Planner returned non-JSON", detail: debug ? outText.slice(0, 2000) : outText.slice(0, 250), model, ms } };
     }
 
+    const intent = safeStr(parsed?.intent);
     const sql = safeStr(parsed?.sql);
-    if (!sql) return { ok: false, sql: "", meta: { used: true, error: "Missing sql", model, ms } };
 
-    return { ok: true, sql, meta: { used: true, ok: true, model, ms, notes: safeStr(parsed?.notes || ""), sql: debug ? sql : undefined } };
+    if (!intent) return { ok: false, intent: "", sql: "", meta: { used: true, error: "Missing intent", model, ms } };
+    if (!sql) return { ok: false, intent, sql: "", meta: { used: true, error: "Missing sql", model, ms } };
+
+    return { ok: true, intent, sql, meta: { used: true, ok: true, model, ms, intent, sql: debug ? sql : undefined } };
   } catch (e) {
     const ms = Date.now() - t0;
-    return { ok: false, sql: "", meta: { used: true, error: e?.message || String(e), model, ms } };
+    return { ok: false, intent: "", sql: "", meta: { used: true, error: e?.message || String(e), model, ms } };
   }
 }
