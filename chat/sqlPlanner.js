@@ -1,10 +1,15 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlPlanner8-enforce-rtk-az
+// Rev: 2026-01-08-sqlPlanner9-fieldinfo-contract
 //
 // Fix:
+// ✅ Add strict intent contract for field_info (full field card + RTK details ALWAYS)
+// ✅ Field number lookups: fields.field_num OR name prefix
+// ✅ Field name (non-numeric) lookups: alphabetical ORDER BY fields.name_norm ASC, LIMIT 10 (to detect ambiguity)
+// ✅ Remove need for field_rtk_info (field_info always includes RTK details)
+//
+// Keeps:
 // ✅ list_rtk_towers MUST include ORDER BY rtkTowers.name_norm ASC
 // ✅ list_rtk_towers MUST return rtkTowers.name AS tower
-// Keeps:
 // ✅ list_fields returns field_id+field
 // ✅ force rtk_tower_info for info/details/network/frequency
 // ✅ targetType/targetText hints
@@ -28,7 +33,7 @@ You are FarmVista Copilot SQL planner.
 
 Return ONLY valid JSON:
 {
-  "intent": "<one of: rtk_tower_info | field_rtk_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
+  "intent": "<one of: rtk_tower_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
   "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)",
   "targetType": "<optional: tower|farm|county|field>",
   "targetText": "<optional: the exact string user typed for the target>"
@@ -56,6 +61,7 @@ fields.rtkTowerId = rtkTowers.id
 NORMALIZED MATCHING:
 - farms.name_norm LIKE '%token%'
 - fields.name_norm LIKE '%token%'
+- fields.name_sq LIKE '%squished%'
 - fields.county_norm LIKE '%token%'
 - rtkTowers.name_norm LIKE '%token%'
 
@@ -66,6 +72,10 @@ If the user asks for ANY of:
 - network id / network
 about an RTK tower,
 intent MUST be "rtk_tower_info" (NOT list_rtk_towers).
+
+FIELD NUMBER:
+If user says "field 0832" or "field number 710":
+use fields.field_num = 832/710 OR fields.name_norm LIKE '0832%' OR fields.name LIKE '0832-%'
 
 INTENT CONTRACTS (MUST MATCH):
 
@@ -93,9 +103,37 @@ INTENT CONTRACTS (MUST MATCH):
    AND MUST include:
      ORDER BY fields.field_num ASC, fields.name_norm ASC
 
-FIELD NUMBER:
-If user says "field 0832" or "field number 710":
-use fields.field_num = 832/710 OR fields.name_norm LIKE '0832%' OR fields.name LIKE '0832-%'
+4) intent="field_info"
+   PURPOSE:
+     Return a full field record. RTK info MUST be included EVERY TIME.
+   SQL MUST return ONE ROW (if numeric) or UP TO 10 ROWS (if non-numeric name search), with aliases EXACT:
+     fields.id AS field_id,
+     fields.name AS field,
+     fields.field_num AS field_num,
+     farms.name AS farm,
+     fields.county AS county,
+     fields.state AS state,
+     fields.tillable AS tillable,
+     fields.helAcres AS helAcres,
+     fields.crpAcres AS crpAcres,
+     rtkTowers.name AS rtkTower,
+     rtkTowers.frequencyMHz AS frequencyMHz,
+     rtkTowers.networkId AS networkId,
+     fields.status AS status
+   REQUIRED:
+   - Use LEFT JOIN farms and LEFT JOIN rtkTowers.
+   - Apply active-only fields filter unless user explicitly requests archived/inactive.
+   - If user provides a numeric field number:
+       WHERE (fields.field_num = <num> OR fields.name_norm LIKE '<num>%' OR fields.name LIKE '<num>-%')
+       ORDER BY fields.field_num ASC, fields.name_norm ASC
+       LIMIT 1
+   - If user provides a NON-numeric name query (field has no number / user didn’t give number):
+       WHERE fields.name_norm LIKE '%token%' (AND each meaningful token)
+       ORDER BY fields.name_norm ASC
+       LIMIT 10  (to detect ambiguity; handleChat will ask user to pick if multiple)
+   ALSO set:
+     targetType="field"
+     targetText="<string the user typed for the field target>"
 `.trim();
 
   const body = {
