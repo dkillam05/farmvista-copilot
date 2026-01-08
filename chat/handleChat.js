@@ -1,7 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql15-rtk-list-az
+// Rev: 2026-01-08-handleChat-sql16-fieldinfo-fullcard
 //
 // Fix:
+// ✅ Add explicit handler for intent=field_info
+//    - Always prints full field card
+//    - Always includes RTK tower + frequency + network ID
+//    - If multiple matches (non-numeric name search), return A–Z pick list and ask user to reply with exact one
+//
+// Keeps:
 // ✅ Ensure list_rtk_towers output is always A–Z, even if planner SQL forgets ORDER BY.
 
 'use strict';
@@ -188,6 +194,53 @@ async function tryDidYouMean({ db, plan, userText, debug }) {
 
   if (!res.ok) return null;
   return { ...res, targetType: tType, targetText: tText };
+}
+
+function isFiniteNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatFieldCard(r0) {
+  const field = safeStr(r0?.field || r0?.name || "");
+  const fieldId = safeStr(r0?.field_id || r0?.id || "");
+  const fieldNum = (r0?.field_num != null && safeStr(r0?.field_num) !== "") ? safeStr(r0.field_num) : "";
+  const farm = safeStr(r0?.farm || "");
+  const county = safeStr(r0?.county || "");
+  const state = safeStr(r0?.state || "");
+  const status = safeStr(r0?.status || "");
+
+  const tillableN = isFiniteNum(r0?.tillable);
+  const helN = isFiniteNum(r0?.helAcres);
+  const crpN = isFiniteNum(r0?.crpAcres);
+
+  const rtkTower = safeStr(r0?.rtkTower || r0?.tower || "");
+  const freq = safeStr(r0?.frequencyMHz || "");
+  const net = safeStr(r0?.networkId || "");
+
+  const out = [];
+
+  out.push(`Field: ${field || "(unknown)"}`);
+  if (fieldNum) out.push(`Field # : ${fieldNum}`);
+  if (fieldId) out.push(`Field ID: ${fieldId}`);
+
+  if (farm) out.push(`Farm: ${farm}`);
+
+  const loc = [county, state].filter(Boolean).join(", ");
+  if (loc) out.push(`Location: ${loc}`);
+
+  out.push(`Tillable: ${tillableN != null ? fmtA(tillableN) : "0"} ac`);
+  out.push(`HEL: ${helN != null ? fmtA(helN) : "0"} ac`);
+  out.push(`CRP: ${crpN != null ? fmtA(crpN) : "0"} ac`);
+
+  // RTK ALWAYS (per Dane)
+  out.push(`RTK tower: ${rtkTower || "(none)"}`);
+  out.push(`Frequency: ${freq ? `${freq} MHz` : "(unknown)"}`);
+  out.push(`Network ID: ${net || "(unknown)"}`);
+
+  if (status) out.push(`Status: ${status}`);
+
+  return out.join("\n");
 }
 
 export async function handleChat({
@@ -390,6 +443,36 @@ export async function handleChat({
     if (r0.fieldsUsing != null) out.push(`Fields using tower: ${r0.fieldsUsing}`);
     if (r0.farmsUsing != null) out.push(`Farms using tower: ${r0.farmsUsing}`);
     return { ok: true, answer: out.join("\n"), meta: { threadId: tid } };
+  }
+
+  // ✅ field_info: FULL FIELD CARD (RTK ALWAYS)
+  if (plan.intent === "field_info") {
+    // If planner returned multiple matches (non-numeric name search), show pick list A–Z
+    if ((rows || []).length > 1) {
+      const opts = rows
+        .map(r => safeStr(r.field || r.name))
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+      const ids = rows.map(r => safeStr(r.field_id || r.id)).filter(Boolean);
+      const labels = opts.slice();
+
+      if (labels.length) storeLastResult(tid, { kind: "list", entity: "fields", ids, labels, metric: "", metricIncluded: false, includeArchived: false, idsMissing: ids.length === 0 });
+
+      const lines = opts.map(x => `• ${x}`);
+      const paged = pageLines({ lines, pageSize: 25 });
+      if (paged.continuation) setContinuation(tid, paged.continuation);
+
+      const msg =
+        `I found multiple fields matching that. Reply with the exact one (or type the field number):\n` +
+        `${paged.text}`;
+
+      return { ok: true, answer: msg, meta: { threadId: tid, intent: "field_info", ambiguous: true, continuation: paged.continuation || null } };
+    }
+
+    // Single match: print full card
+    const r0 = (rows || [])[0] || {};
+    return { ok: true, answer: formatFieldCard(r0), meta: { threadId: tid, intent: "field_info" } };
   }
 
   // default
