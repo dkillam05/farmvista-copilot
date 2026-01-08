@@ -1,13 +1,20 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql9-intent-contract-no-fallback
+// Rev: 2026-01-06-handleChat-sql10-resultops
 //
-// LLM-only approach (per your request):
-// ✅ OpenAI -> {intent, SQL}
-// ✅ Execute SQL on SQLite
-// ✅ Validate against intent contract
-// ✅ If anything fails -> return ERROR that tells exactly what file/step to check
+// Adds full generic Result Set Memory (B):
+// ✅ Stores ctx.lastResult for list answers (ids + labels + entity type + metric)
+// ✅ Follow-up ops operate on ctx.lastResult (no re-guessing):
+//    - include hel/tillable/crp
+//    - total those
+//    - largest first / smallest first / A-Z
+//    - no acres
 //
-// NO handler fallback. NO "best effort" answers.
+// Keeps your current flow:
+// ✅ snapshot->sqlite
+// ✅ followups paging
+// ✅ followupInterpreter rewrites to "__RESULT_OP__"
+// ✅ SQL execution
+// ✅ clean output
 
 'use strict';
 
@@ -20,152 +27,159 @@ import { normalizeQuestion } from "./normalize.js";
 import { ensureDbFromSnapshot, getDb } from "../context/snapshot-db.js";
 import { planSql } from "./sqlPlanner.js";
 import { runSql } from "./sqlRunner.js";
-import { INTENT_CONTRACTS } from "./intentContracts.js";
 
 function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
+function norm(s) { return (s || "").toString().trim().toLowerCase(); }
 
 function makeThreadId() {
   try { return crypto.randomUUID(); }
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-function norm(s) { return (s || "").toString().trim().toLowerCase(); }
-
-function ensureLimitPresent(sql) {
-  const s = safeStr(sql);
-  if (!s) return s;
-  const low = s.toLowerCase();
-  return low.includes(" limit ") ? s : `${s} LIMIT 80`;
-}
-
-function contractFor(intent) {
-  return INTENT_CONTRACTS[intent] || null;
-}
-
-function missingColumns(rows, required) {
-  if (!Array.isArray(rows) || !rows.length) return required || [];
-  const cols = new Set(Object.keys(rows[0] || {}));
-  return (required || []).filter(c => !cols.has(c));
-}
-
-function fail({ msg, file, step, detail = "", debug = false, extra = null }) {
-  let out = `ERROR: ${msg}\nPlease check ${file} (${step}).`;
-  const d = safeStr(detail);
-  if (debug && d) out += `\n\n${d}`;
-  if (debug && extra) {
-    try { out += `\n\n${JSON.stringify(extra, null, 2)}`; } catch {}
-  }
-  return out;
-}
-
 /* =========================
-   Clean formatting (Option A)
-   - Only show acres if user asked.
+   Output helpers
 ========================= */
-function userAskedForAcres(q) {
-  const s = norm(q);
-  return s.includes("acres") || s.includes("tillable") || s.includes("with acres") || s.includes("include acres") || s.includes("including acres");
+function fmtA(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
-function formatAnswer({ intent, question, rows }) {
-  // scalar
-  if (Array.isArray(rows) && rows.length === 1) {
-    const keys = Object.keys(rows[0] || {});
-    if (keys.length === 1) return String(rows[0][keys[0]]);
-  }
-
-  if (!Array.isArray(rows) || !rows.length) return "(no matches)";
-
-  // Tower info
-  if (intent === "rtk_tower_info") {
-    const r = rows[0] || {};
-    const out = [];
-    out.push(`RTK tower: ${r.tower}`);
-    out.push(`Frequency: ${r.frequencyMHz} MHz`);
-    out.push(`Network ID: ${r.networkId}`);
-    if (r.fieldsUsing != null) out.push(`Fields using tower: ${r.fieldsUsing}`);
-    if (r.farmsUsing != null) out.push(`Farms using tower: ${r.farmsUsing}`);
-    return out.join("\n");
-  }
-
-  // Field -> tower info
-  if (intent === "field_rtk_info") {
-    const r = rows[0] || {};
-    const out = [];
-    out.push(`Field: ${r.field}`);
-    if (r.farm) out.push(`Farm: ${r.farm}`);
-    if (r.county) out.push(`County: ${r.county}${r.state ? ", " + r.state : ""}`);
-    out.push(`RTK tower: ${r.tower}`);
-    out.push(`Frequency: ${r.frequencyMHz} MHz`);
-    out.push(`Network ID: ${r.networkId}`);
-    return out.join("\n");
-  }
-
-  // Field info blocks (show first 3)
-  if (intent === "field_info") {
-    const blocks = [];
-    const take = Math.min(3, rows.length);
-    for (let i = 0; i < take; i++) {
-      const r = rows[i] || {};
-      const out = [];
-      out.push(`Field: ${r.field}`);
-      if (r.farm) out.push(`Farm: ${r.farm}`);
-      if (r.county) out.push(`County: ${r.county}${r.state ? ", " + r.state : ""}`);
-      if (r.status) out.push(`Status: ${r.status}`);
-      if (r.tillable != null) out.push(`Tillable: ${Number(r.tillable).toLocaleString(undefined,{maximumFractionDigits:2})} ac`);
-      if (r.helAcres != null && Number(r.helAcres) > 0) out.push(`HEL acres: ${Number(r.helAcres).toLocaleString(undefined,{maximumFractionDigits:2})}`);
-      if (r.crpAcres != null && Number(r.crpAcres) > 0) out.push(`CRP acres: ${Number(r.crpAcres).toLocaleString(undefined,{maximumFractionDigits:2})}`);
-      if (r.tower) out.push(`RTK tower: ${r.tower}`);
-      blocks.push(out.join("\n"));
-    }
-    if (rows.length > take) blocks.push(`(…plus ${rows.length - take} more matches)`);
-    return blocks.join("\n\n");
-  }
-
-  // Lists
-  const includeAcres = userAskedForAcres(question);
-
-  const lines = [];
-  for (const r of rows) {
-    if (!r) continue;
-
-    if (intent === "list_fields") {
-      let line = `• ${r.field}`;
-      if (includeAcres && r.acres != null) {
-        line += ` — ${Number(r.acres).toLocaleString(undefined,{maximumFractionDigits:2})} ac`;
-      }
-      lines.push(line);
-      continue;
-    }
-
-    if (intent === "list_farms") { lines.push(`• ${r.farm}`); continue; }
-    if (intent === "list_counties") { lines.push(`• ${r.county}`); continue; }
-    if (intent === "list_rtk_towers") { lines.push(`• ${r.tower}`); continue; }
-
-    // group_metric
-    if (intent === "group_metric") {
-      lines.push(`• ${r.label}\n  ${r.value}`);
-      continue;
-    }
-
-    // fallback list style
-    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
-    if (any) lines.push(`• ${any}`);
-  }
-
-  if (!lines.length) return "(no matches)";
-
-  // paging via global followups
-  const pageSize = 25;
-  const first = lines.slice(0, pageSize);
+function pageLines({ lines, pageSize = 25 }) {
+  const size = Math.max(10, Math.min(80, Number(pageSize) || 25));
+  const first = lines.slice(0, size);
   const remaining = lines.length - first.length;
 
   const out = [];
   out.push(...first);
   if (remaining > 0) out.push(`…plus ${remaining} more.`);
 
-  const continuation = (remaining > 0) ? { kind: "page", title: "", lines, offset: pageSize, pageSize } : null;
+  const continuation = (remaining > 0)
+    ? { kind: "page", title: "", lines, offset: size, pageSize: size }
+    : null;
+
   return { text: out.join("\n"), continuation };
+}
+
+/* =========================
+   Result memory format
+   ctx.lastResult = {
+     kind: "list",
+     entity: "fields" | "towers" | "farms" | "counties" | ...
+     ids: [id...],
+     labels: [label...],   // same order as ids
+     metric: "hel"|"tillable"|"crp"|""  (what the list was about)
+     metricIncluded: boolean
+     includeArchived: boolean
+   }
+========================= */
+
+function storeLastResult(threadId, lastResult) {
+  applyContextDelta(threadId, { lastResult: lastResult || null });
+}
+
+function getLastResult(ctx) {
+  return (ctx && ctx.lastResult && typeof ctx.lastResult === "object") ? ctx.lastResult : null;
+}
+
+/* =========================
+   Execute RESULT_OP on lastResult
+========================= */
+function metricColumn(metric) {
+  if (metric === "hel") return "helAcres";
+  if (metric === "crp") return "crpAcres";
+  return "tillable"; // default
+}
+
+function buildInList(ids) {
+  // ids are doc ids (strings)
+  const safe = (ids || []).map(x => String(x).replace(/'/g, "''"));
+  return safe.length ? safe.map(x => `'${x}'`).join(",") : "";
+}
+
+function runAugmentFields({ db, last, metric, sortMode }) {
+  const col = metricColumn(metric);
+  const inList = buildInList(last.ids);
+  if (!inList) return { ok: false, answer: "(no matches)" };
+
+  // pull label + metric for those exact ids
+  const sql = `
+    SELECT
+      fields.id AS id,
+      fields.name AS label,
+      fields.${col} AS value
+    FROM fields
+    WHERE fields.id IN (${inList})
+    LIMIT 2000
+  `.trim();
+
+  const ex = runSql({ db, sql, limitDefault: 2000 });
+  if (!ex.ok) return { ok: false, answer: "(no matches)" };
+
+  const rows = ex.rows || [];
+  const map = new Map();
+  for (const r of rows) map.set(String(r.id), { label: String(r.label || ""), value: Number(r.value) || 0 });
+
+  // rebuild in the lastResult order
+  const items = [];
+  for (let i = 0; i < last.ids.length; i++) {
+    const id = String(last.ids[i]);
+    const baseLabel = String(last.labels?.[i] || "");
+    const got = map.get(id);
+    items.push({
+      id,
+      label: got?.label ? got.label : baseLabel,
+      value: got ? got.value : 0
+    });
+  }
+
+  // sorting
+  if (sortMode === "largest") items.sort((a, b) => (b.value - a.value) || a.label.localeCompare(b.label));
+  else if (sortMode === "smallest") items.sort((a, b) => (a.value - b.value) || a.label.localeCompare(b.label));
+  else items.sort((a, b) => a.label.localeCompare(b.label));
+
+  const lines = items.map(it => `• ${it.label} — ${fmtA(it.value)} ac`);
+  const paged = pageLines({ lines, pageSize: 25 });
+
+  // update lastResult state (metric now included)
+  const nextLast = {
+    ...last,
+    metric: metric || last.metric || "tillable",
+    metricIncluded: true,
+    ids: items.map(x => x.id),
+    labels: items.map(x => x.label)
+  };
+
+  return { ok: true, text: paged.text, continuation: paged.continuation, nextLast };
+}
+
+function runStripMetric({ last, sortMode }) {
+  const items = (last.labels || []).slice().sort((a, b) => a.localeCompare(b));
+  // If lastResult ids/labels are already ordered by sort, keep it unless asked A-Z
+  const labels = (sortMode === "az") ? items : (last.labels || []);
+  const lines = labels.map(l => `• ${l}`);
+  const paged = pageLines({ lines, pageSize: 25 });
+
+  const nextLast = { ...last, metricIncluded: false };
+  return { ok: true, text: paged.text, continuation: paged.continuation, nextLast };
+}
+
+function runTotal({ db, last, metric }) {
+  const col = metricColumn(metric);
+  const inList = buildInList(last.ids);
+  if (!inList) return { ok: false, answer: "(no matches)" };
+
+  const sql = `
+    SELECT SUM(fields.${col}) AS value
+    FROM fields
+    WHERE fields.id IN (${inList})
+    LIMIT 1
+  `.trim();
+
+  const ex = runSql({ db, sql, limitDefault: 1 });
+  if (!ex.ok || !ex.rows?.length) return { ok: false, answer: "(no matches)" };
+
+  const v = Number(ex.rows[0].value) || 0;
+  return { ok: true, text: fmtA(v), continuation: null, nextLast: last };
 }
 
 export async function handleChat({
@@ -182,156 +196,167 @@ export async function handleChat({
 
   const qRaw0 = safeStr(question);
   if (!qRaw0) {
-    return { ok: false, error: "missing_question", answer: fail({ msg: "Missing question", file: "/chat/handleChat.js", step: "input", debug }), action: null, meta: { threadId: tid }, state: state || null };
+    return { ok: false, error: "missing_question", answer: "Missing question.", action: null, meta: { threadId: tid }, state: state || null };
   }
 
   if (!snapshot?.ok || !snapshot?.json) {
-    return { ok: false, error: "snapshot_not_loaded", answer: fail({ msg: "Snapshot not loaded", file: "/context/snapshot.js", step: "loadSnapshot", detail: snapshot?.error || "", debug }), action: null, meta: { threadId: tid }, state: state || null };
+    return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot not loaded.", action: null, meta: { threadId: tid }, state: state || null };
   }
 
-  // Ensure DB exists for this snapshot
-  try {
-    const dbOk = ensureDbFromSnapshot(snapshot);
-    if (!dbOk?.ok) {
-      return { ok: false, error: "db_not_ready", answer: fail({ msg: "SQLite DB not ready", file: "/context/snapshot-db.js", step: "ensureDbFromSnapshot", detail: dbOk?.reason || dbOk?.error || "", debug }), action: null, meta: { threadId: tid }, state: state || null };
-    }
-  } catch (e) {
-    return { ok: false, error: "db_build_failed", answer: fail({ msg: "SQLite DB build failed", file: "/context/snapshot-db.js", step: "rebuildDbFromSnapshot", detail: e?.message || String(e), debug }), action: null, meta: { threadId: tid }, state: state || null };
+  // ensure DB
+  try { ensureDbFromSnapshot(snapshot); } catch (e) {
+    return { ok: false, error: "db_build_failed", answer: "DB build failed.", meta: { threadId: tid, detail: safeStr(e?.message || e) }, state: state || null };
   }
 
   const db = getDb();
-  if (!db) {
-    return { ok: false, error: "db_null", answer: fail({ msg: "SQLite DB is null", file: "/context/snapshot-db.js", step: "getDb", debug }), action: null, meta: { threadId: tid }, state: state || null };
-  }
+  if (!db) return { ok: false, error: "db_not_ready", answer: "DB not ready.", meta: { threadId: tid }, state: state || null };
 
-  // Normalize
+  // normalization
   const nrm = normalizeQuestion(qRaw0);
   const qRaw = safeStr(nrm?.text || qRaw0);
 
-  // Continuation seed
+  // seed paging continuation store
   try { if (continuation && typeof continuation === "object") setContinuation(tid, continuation); } catch {}
 
-  // Paging followups
+  // paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
       return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", action: fu?.action || null, meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
     }
-  } catch {
-    clearContinuation(tid);
-  }
+  } catch { clearContinuation(tid); }
 
-  // Followup interpreter rewrite
+  // followup interpreter
   let routedQuestion = qRaw;
+  let interpDelta = null;
   try {
-    const ctx = getThreadContext(tid) || {};
-    const interp = interpretFollowup({ question: qRaw, ctx });
+    const ctx0 = getThreadContext(tid) || {};
+    const interp = interpretFollowup({ question: qRaw, ctx: ctx0 });
     if (interp?.rewriteQuestion) {
       routedQuestion = interp.rewriteQuestion;
-      if (interp.contextDelta) applyContextDelta(tid, interp.contextDelta);
+      interpDelta = interp.contextDelta || null;
+      if (interpDelta) applyContextDelta(tid, interpDelta);
     }
   } catch {}
 
-  // OpenAI plan
+  // ✅ RESULT OP execution (global)
+  if (routedQuestion === "__RESULT_OP__") {
+    const ctx = getThreadContext(tid) || {};
+    const last = getLastResult(ctx);
+    const op = ctx?.resultOp?.op || null;
+
+    if (!last || last.kind !== "list" || last.entity !== "fields") {
+      return { ok: false, answer: "No active list to apply that to.", meta: { threadId: tid } };
+    }
+
+    if (op === "augment") {
+      const metric = ctx.resultOp.metric || last.metric || "tillable";
+      const sortMode = ctx.resultOp.mode || "az";
+      const r = runAugmentFields({ db, last, metric, sortMode });
+      if (r.ok) {
+        storeLastResult(tid, r.nextLast);
+        if (r.continuation) setContinuation(tid, r.continuation);
+        return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "augment", continuation: r.continuation || null } };
+      }
+      return { ok: false, answer: "(no matches)", meta: { threadId: tid } };
+    }
+
+    if (op === "strip_metric") {
+      const sortMode = ctx.resultOp.mode || "az";
+      const r = runStripMetric({ last, sortMode });
+      storeLastResult(tid, r.nextLast);
+      if (r.continuation) setContinuation(tid, r.continuation);
+      return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "strip_metric", continuation: r.continuation || null } };
+    }
+
+    if (op === "total") {
+      const metric = ctx.resultOp.metric || last.metric || "tillable";
+      const r = runTotal({ db, last, metric });
+      return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "total", metric } };
+    }
+
+    if (op === "sort") {
+      // sort without requery: if metric included, keep; otherwise A-Z
+      const mode = ctx.resultOp.mode || "az";
+      if (last.metricIncluded) {
+        const metric = last.metric || "tillable";
+        const r = runAugmentFields({ db, last, metric, sortMode: mode });
+        if (r.ok) {
+          storeLastResult(tid, r.nextLast);
+          if (r.continuation) setContinuation(tid, r.continuation);
+          return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "sort", mode } };
+        }
+      } else {
+        const r = runStripMetric({ last, sortMode: mode });
+        storeLastResult(tid, r.nextLast);
+        if (r.continuation) setContinuation(tid, r.continuation);
+        return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "sort", mode } };
+      }
+    }
+
+    return { ok: false, answer: "Unknown follow-up operation.", meta: { threadId: tid } };
+  }
+
+  // ===========================
+  // Normal OpenAI->SQL->DB path
+  // ===========================
   const plan = await planSql({ question: routedQuestion, debug });
   if (!plan.ok) {
-    return {
-      ok: false,
-      error: "planner_failed",
-      answer: fail({ msg: "OpenAI planning failed", file: "/chat/sqlPlanner.js", step: "planSql", detail: plan?.meta?.error || plan?.meta?.detail || "", debug, extra: plan?.meta || null }),
-      action: null,
-      meta: { threadId: tid },
-      state: state || null
-    };
+    return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
   }
 
-  const intent = safeStr(plan.intent);
-  const sql = ensureLimitPresent(plan.sql);
-
-  const contract = contractFor(intent);
-  if (!contract) {
-    return {
-      ok: false,
-      error: "unknown_intent",
-      answer: fail({ msg: `Unknown intent "${intent}"`, file: "/chat/intentContracts.js", step: "INTENT_CONTRACTS", detail: "Planner returned an intent that has no contract.", debug, extra: { intent } }),
-      action: null,
-      meta: { threadId: tid },
-      state: state || null
-    };
-  }
-
-  // Execute SQL
-  const exec = runSql({ db, sql, limitDefault: 80 });
+  const exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
   if (!exec.ok) {
-    return {
-      ok: false,
-      error: exec.error || "sql_exec_failed",
-      answer: fail({ msg: "SQL execution failed", file: "/chat/sqlRunner.js", step: "runSql", detail: exec.detail || exec.error || "", debug, extra: { intent, sql: debug ? exec.sql : undefined } }),
-      action: null,
-      meta: { threadId: tid },
-      state: state || null
-    };
+    return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
   }
 
-  // Validate contract
   const rows = exec.rows || [];
-  const minRows = Number(contract.minRows) || 1;
-  if (rows.length < minRows) {
-    return {
-      ok: false,
-      error: "contract_no_rows",
-      answer: fail({
-        msg: `SQL returned ${rows.length} rows, but intent "${intent}" requires >= ${minRows}.`,
-        file: "/chat/sqlPlanner.js",
-        step: "intent_contract_rows",
-        detail: "Planner generated a query that didn't match anything. Improve filters or add clarification step.",
-        debug,
-        extra: { intent, sql: debug ? exec.sql : undefined }
-      }),
-      action: null,
-      meta: { threadId: tid },
-      state: state || null
-    };
+  if (!rows.length) return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
+
+  // If list_fields intent returns ids, store lastResult for follow-ups
+  if (plan.intent === "list_fields") {
+    // Expect: field_id + field label (planner should be doing this already)
+    const ids = [];
+    const labels = [];
+    for (const r of rows) {
+      const id = (r.field_id || r.id || "").toString().trim();
+      const label = (r.field || r.label || r.name || "").toString().trim();
+      if (!id || !label) continue;
+      ids.push(id);
+      labels.push(label);
+    }
+    if (ids.length) {
+      storeLastResult(tid, {
+        kind: "list",
+        entity: "fields",
+        ids,
+        labels,
+        metric: plan.metric || "",       // optional from planner if provided
+        metricIncluded: false,
+        includeArchived: false
+      });
+    }
   }
 
-  const miss = missingColumns(rows, contract.requiredColumns);
-  if (miss.length) {
-    return {
-      ok: false,
-      error: "contract_missing_columns",
-      answer: fail({
-        msg: `Intent "${intent}" missing required columns: ${miss.join(", ")}.`,
-        file: "/chat/sqlPlanner.js",
-        step: "intent_contract_columns",
-        detail: "Planner must alias output columns exactly as required by the contract.",
-        debug,
-        extra: { intent, required: contract.requiredColumns, got: Object.keys(rows[0] || {}), sql: debug ? exec.sql : undefined }
-      }),
-      action: null,
-      meta: { threadId: tid },
-      state: state || null
-    };
+  // Format default output for list_fields as bullets
+  if (plan.intent === "list_fields") {
+    const lines = rows.map(r => `• ${(r.field || r.label || r.name || "").toString().trim()}`).filter(Boolean);
+    const paged = pageLines({ lines, pageSize: 25 });
+    if (paged.continuation) setContinuation(tid, paged.continuation);
+    return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
   }
 
-  // Format answer
-  const formatted = formatAnswer({ intent, question: routedQuestion, rows });
-
-  // If formatAnswer returned paging object
-  if (formatted && typeof formatted === "object" && typeof formatted.text === "string") {
-    return {
-      ok: true,
-      answer: formatted.text,
-      action: null,
-      meta: { routed: "sql", threadId: tid, intent, continuation: formatted.continuation || null, sql: debug ? exec.sql : undefined },
-      state: state || null
-    };
+  // Fallback generic formatting
+  const firstRow = rows[0] || {};
+  const keys = Object.keys(firstRow || {});
+  if (rows.length === 1 && keys.length === 1) {
+    return { ok: true, answer: String(firstRow[keys[0]]), meta: { threadId: tid } };
   }
 
-  return {
-    ok: true,
-    answer: safeStr(formatted) || "No response.",
-    action: null,
-    meta: { routed: "sql", threadId: tid, intent, sql: debug ? exec.sql : undefined },
-    state: state || null
-  };
+  const lines = [];
+  for (const r of rows.slice(0, 25)) {
+    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
+    if (any) lines.push(`• ${any}`);
+  }
+  return { ok: true, answer: lines.length ? lines.join("\n") : "(no matches)", meta: { threadId: tid } };
 }
