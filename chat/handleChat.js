@@ -1,14 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql13-global-entity-resolve
+// Rev: 2026-01-06-handleChat-sql14-global-didyoumean
 //
-// Adds global OpenAI "did you mean" resolver for ALL entity lookups:
-// ✅ towers / farms / counties / fields
-// ✅ if SQL returns 0 rows and planner provided targetType/targetText, we:
-//    - fetch candidates from DB
-//    - OpenAI chooses best match or asks clarifying question
-//    - auto-retry when confident
+// Adds global OpenAI "did you mean..." when SQL returns 0 rows for an entity lookup.
+// Uses new files:
+//   - /chat/entityCatalog.js
+//   - /chat/entityResolverAI.js
 //
-// Keeps your existing result ops + list_fields id storage.
+// Does NOT replace your existing deterministic /chat/entityResolver.js.
+// Keeps your result ops and list_fields id-guard intact.
 
 'use strict';
 
@@ -23,7 +22,7 @@ import { planSql } from "./sqlPlanner.js";
 import { runSql } from "./sqlRunner.js";
 
 import { getCandidates } from "./entityCatalog.js";
-import { resolveEntityWithOpenAI } from "./entityResolver.js";
+import { resolveEntityWithOpenAI } from "./entityResolverAI.js";
 
 function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
 function norm(s) { return (s || "").toString().trim().toLowerCase(); }
@@ -70,7 +69,7 @@ function getLastResult(ctx) {
 }
 
 /* =========================
-   RESULT_OP (same as your live behavior)
+   Execute RESULT_OP on lastResult
 ========================= */
 function metricColumn(metric) {
   if (metric === "hel") return "helAcres";
@@ -138,6 +137,7 @@ function runStripMetric({ last, sortMode }) {
   const labels = (sortMode === "az") ? items : (last.labels || []);
   const lines = labels.map(l => `• ${l}`);
   const paged = pageLines({ lines, pageSize: 25 });
+
   const nextLast = { ...last, metricIncluded: false };
   return { ok: true, text: paged.text, continuation: paged.continuation, nextLast };
 }
@@ -171,46 +171,48 @@ function runTotal({ db, last, metric }) {
 }
 
 /* =========================
-   NEW: helper to attempt auto-resolve and retry
+   Global "did you mean" helper
 ========================= */
-function escapeRegExp(s) {
-  return (s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function looksLikeYes(raw) {
+  const q = norm(raw);
+  return q === "yes" || q === "yep" || q === "yeah" || q === "correct" || q === "that one" || q === "ok" || q === "do it";
 }
 
-async function resolveAndRetry({ db, routedQuestion, plan, debug }) {
-  const tType = safeStr(plan.targetType || "");
-  const tText = safeStr(plan.targetText || "");
+function buildRetryQuestion(intent, match) {
+  const m = safeStr(match);
+  if (!m) return "";
+  if (intent === "rtk_tower_info") return `RTK tower info for ${m}`;
+  if (intent === "list_fields") return `List fields for ${m}`;
+  if (intent === "list_farms") return `List farms for ${m}`;
+  if (intent === "list_counties") return `List counties for ${m}`;
+  if (intent === "field_info") return `Field info for ${m}`;
+  if (intent === "field_rtk_info") return `RTK tower info for field ${m}`;
+  return m;
+}
+
+async function tryDidYouMean({ db, plan, userText, debug }) {
+  const tType = safeStr(plan?.targetType || "");
+  const tText = safeStr(plan?.targetText || "");
   if (!tType || !tText) return null;
 
-  const cat = getCandidates({ db, type: tType, limit: 250 });
+  const cat = getCandidates({ db, type: tType, limit: tType === "field" ? 600 : 250 });
   if (!cat.ok || !cat.candidates.length) return null;
 
   const res = await resolveEntityWithOpenAI({
-    userText: tText,
     entityType: tType,
+    userText: tText,
     candidates: cat.candidates,
     debug
   });
 
-  if (!res.ok) return { ok: true, action: "no_match", answer: "(no matches)" };
-
-  if (res.action === "clarify") {
-    return { ok: true, action: "clarify", answer: res.ask || "Which one did you mean?" };
-  }
-
-  if (res.action === "retry" && res.match) {
-    // Replace just the targetText portion in the question
-    const re = new RegExp(escapeRegExp(tText), "ig");
-    const rewrittenQuestion = routedQuestion.match(re)
-      ? routedQuestion.replace(re, res.match)
-      : `${routedQuestion} (${res.match})`;
-
-    return { ok: true, action: "retry", rewrittenQuestion, resolved: res.match };
-  }
-
-  return { ok: true, action: "no_match", answer: "(no matches)" };
+  if (!res.ok) return null;
+  return { ...res, targetType: tType, targetText: tText };
 }
 
+/* =========================
+   Main
+========================= */
 export async function handleChat({
   question,
   snapshot,
@@ -224,9 +226,13 @@ export async function handleChat({
   const debug = !!debugAI;
 
   const qRaw0 = safeStr(question);
-  if (!qRaw0) return { ok: false, error: "missing_question", answer: "Missing question.", meta: { threadId: tid }, state: state || null };
+  if (!qRaw0) {
+    return { ok: false, error: "missing_question", answer: "Missing question.", action: null, meta: { threadId: tid }, state: state || null };
+  }
 
-  if (!snapshot?.ok || !snapshot?.json) return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot not loaded.", meta: { threadId: tid }, state: state || null };
+  if (!snapshot?.ok || !snapshot?.json) {
+    return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot not loaded.", action: null, meta: { threadId: tid }, state: state || null };
+  }
 
   try { ensureDbFromSnapshot(snapshot); } catch (e) {
     return { ok: false, error: "db_build_failed", answer: "DB build failed.", meta: { threadId: tid, detail: safeStr(e?.message || e) }, state: state || null };
@@ -238,12 +244,36 @@ export async function handleChat({
   const nrm = normalizeQuestion(qRaw0);
   const qRaw = safeStr(nrm?.text || qRaw0);
 
+  // Accept pending suggestion without touching followupInterpreter
+  try {
+    const ctx = getThreadContext(tid) || {};
+    const pr = ctx?.pendingResolve || null;
+    if (pr && pr.suggestion && pr.intent && (looksLikeYes(qRaw) || norm(qRaw) === norm(pr.suggestion))) {
+      applyContextDelta(tid, { pendingResolve: null });
+      const rq = buildRetryQuestion(pr.intent, pr.suggestion) || pr.suggestion;
+      // re-route by replacing qRaw
+      // (we continue below using rq as the question)
+      return await handleChat({
+        question: rq,
+        snapshot,
+        authHeader,
+        state,
+        threadId: tid,
+        continuation,
+        debugAI
+      });
+    }
+  } catch {}
+
+  // seed paging continuation store
   try { if (continuation && typeof continuation === "object") setContinuation(tid, continuation); } catch {}
 
   // paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
-    if (fu) return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
+    if (fu) {
+      return { ok: fu?.ok !== false, answer: safeStr(fu?.answer) || "No response.", action: fu?.action || null, meta: { ...(fu?.meta || {}), threadId: tid }, state: state || null };
+    }
   } catch { clearContinuation(tid); }
 
   // followup interpreter
@@ -263,7 +293,9 @@ export async function handleChat({
     const last = getLastResult(ctx);
     const op = ctx?.resultOp?.op || null;
 
-    if (!last || last.kind !== "list" || last.entity !== "fields") return { ok: false, answer: "No active list to apply that to.", meta: { threadId: tid } };
+    if (!last || last.kind !== "list" || last.entity !== "fields") {
+      return { ok: false, answer: "No active list to apply that to.", meta: { threadId: tid } };
+    }
 
     if (op === "augment") {
       const metric = ctx.resultOp.metric || last.metric || "tillable";
@@ -313,41 +345,58 @@ export async function handleChat({
     return { ok: false, answer: "Unknown follow-up operation.", meta: { threadId: tid } };
   }
 
-  // OpenAI->SQL plan
-  let plan = await planSql({ question: routedQuestion, debug });
-  if (!plan.ok) return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
-
-  // Execute
-  let exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
-  let rows = exec.ok ? (exec.rows || []) : [];
-
-  // ✅ Global resolver: if 0 rows and planner provided targetType/targetText, resolve and retry
-  if (exec.ok && rows.length === 0 && plan.targetType && plan.targetText) {
-    const rr = await resolveAndRetry({ db, routedQuestion, plan, debug });
-    if (rr?.action === "clarify") {
-      return { ok: true, answer: rr.answer, meta: { threadId: tid, routed: "resolver_clarify", targetType: plan.targetType, targetText: plan.targetText } };
-    }
-    if (rr?.action === "retry" && rr.rewrittenQuestion) {
-      // replan with corrected text
-      plan = await planSql({ question: rr.rewrittenQuestion, debug });
-      if (!plan.ok) return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
-
-      exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
-      rows = exec.ok ? (exec.rows || []) : [];
-
-      if (exec.ok && rows.length === 0) {
-        return { ok: true, answer: "(no matches)", meta: { threadId: tid, routed: "resolver_retry_no_match", resolved: rr.resolved } };
-      }
-    }
+  // OpenAI->SQL
+  const plan = await planSql({ question: routedQuestion, debug });
+  if (!plan.ok) {
+    return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
   }
 
-  if (!exec.ok) return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
-  if (!rows.length) return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
+  const exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
+  if (!exec.ok) {
+    return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
+  }
+
+  let rows = exec.rows || [];
+
+  // ✅ Global did-you-mean on 0 rows (when planner provided targetType/targetText)
+  if (rows.length === 0) {
+    const dy = await tryDidYouMean({ db, plan, userText: routedQuestion, debug });
+    if (dy && dy.ok && dy.action === "retry" && dy.match) {
+      // High confidence => auto-run corrected question once
+      if ((dy.confidence || "").toLowerCase() === "high") {
+        const rq = buildRetryQuestion(plan.intent, dy.match) || dy.match;
+        const plan2 = await planSql({ question: rq, debug });
+        if (plan2.ok) {
+          const ex2 = runSql({ db, sql: plan2.sql, limitDefault: 80 });
+          if (ex2.ok && (ex2.rows || []).length) {
+            rows = ex2.rows || [];
+            // proceed to formatting below with plan2 intent
+            plan.intent = plan2.intent;
+          } else {
+            applyContextDelta(tid, { pendingResolve: { intent: plan.intent, suggestion: dy.match } });
+            return { ok: true, answer: `I don’t see "${plan.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
+          }
+        }
+      } else {
+        applyContextDelta(tid, { pendingResolve: { intent: plan.intent, suggestion: dy.match } });
+        return { ok: true, answer: `I don’t see "${plan.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
+      }
+    }
+
+    if (dy && dy.ok && dy.action === "clarify") {
+      const opts = Array.isArray(dy.options) ? dy.options.slice(0, 4) : [];
+      const lines = opts.length ? `\n${opts.map(o => `• ${o}`).join("\n")}` : "";
+      return { ok: true, answer: `${safeStr(dy.ask) || "Which one did you mean?"}${lines}`, meta: { threadId: tid, routed: "did_you_mean_clarify" } };
+    }
+
+    return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
+  }
 
   // Store lastResult for list_fields
   if (plan.intent === "list_fields") {
     const ids = [];
     const labels = [];
+
     for (const r of rows) {
       const id = (r.field_id || r.id || "").toString().trim();
       const label = (r.field || r.label || r.name || "").toString().trim();
@@ -355,17 +404,37 @@ export async function handleChat({
       ids.push(id);
       labels.push(label);
     }
-    if (ids.length) storeLastResult(tid, { kind: "list", entity: "fields", ids, labels, metric: "", metricIncluded: false, includeArchived: false });
+
+    if (labels.length) {
+      storeLastResult(tid, {
+        kind: "list",
+        entity: "fields",
+        ids,
+        labels,
+        metric: "",
+        metricIncluded: false,
+        includeArchived: false,
+        idsMissing: ids.length === 0
+      });
+    }
+  }
+
+  // Output list_fields
+  if (plan.intent === "list_fields") {
+    const lines = rows.map(r => `• ${(r.field || r.label || r.name || "").toString().trim()}`).filter(Boolean);
+    const paged = pageLines({ lines, pageSize: 25 });
+    if (paged.continuation) setContinuation(tid, paged.continuation);
+    return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
   }
 
   // Output list_rtk_towers
   if (plan.intent === "list_rtk_towers") {
-    const lines = rows.map(r => `• ${(r.tower || "").toString().trim()}`).filter(Boolean);
-    const paged = pageLines({ lines, pageSize: 80 });
+    const lines = rows.map(r => `• ${(r.tower || r.name || "").toString().trim()}`).filter(Boolean);
+    const paged = pageLines({ lines, pageSize: 200 });
     return { ok: true, answer: paged.text, meta: { threadId: tid } };
   }
 
-  // Output rtk_tower_info detail
+  // Output rtk_tower_info as detail
   if (plan.intent === "rtk_tower_info") {
     const r0 = rows[0] || {};
     const out = [];
@@ -377,17 +446,15 @@ export async function handleChat({
     return { ok: true, answer: out.join("\n"), meta: { threadId: tid } };
   }
 
-  // Output list_fields
-  if (plan.intent === "list_fields") {
-    const lines = rows.map(r => `• ${(r.field || r.label || r.name || "").toString().trim()}`).filter(Boolean);
-    const paged = pageLines({ lines, pageSize: 25 });
-    if (paged.continuation) setContinuation(tid, paged.continuation);
-    return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
+  // Fallback generic formatting
+  const firstRow = rows[0] || {};
+  const keys = Object.keys(firstRow || {});
+  if (rows.length === 1 && keys.length === 1) {
+    return { ok: true, answer: String(firstRow[keys[0]]), meta: { threadId: tid } };
   }
 
-  // Default bullets
   const lines = [];
-  for (const r of rows.slice(0, 80)) {
+  for (const r of rows.slice(0, 25)) {
     const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
     if (any) lines.push(`• ${any}`);
   }
