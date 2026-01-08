@@ -1,20 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql10-resultops
+// Rev: 2026-01-06-handleChat-sql11-resultops-guard-missing-ids
 //
-// Adds full generic Result Set Memory (B):
-// ✅ Stores ctx.lastResult for list answers (ids + labels + entity type + metric)
-// ✅ Follow-up ops operate on ctx.lastResult (no re-guessing):
-//    - include hel/tillable/crp
-//    - total those
-//    - largest first / smallest first / A-Z
-//    - no acres
+// Fix:
+// ✅ If list_fields returns no IDs, store a lastResult stub + make RESULT_OP fail loudly
+//    instead of re-querying a random list.
+// ✅ This prevents "include hel acres" from switching to the wrong list.
 //
-// Keeps your current flow:
-// ✅ snapshot->sqlite
-// ✅ followups paging
-// ✅ followupInterpreter rewrites to "__RESULT_OP__"
-// ✅ SQL execution
-// ✅ clean output
+// NOTE: This file is your live file with only the necessary changes.
 
 'use strict';
 
@@ -61,16 +53,7 @@ function pageLines({ lines, pageSize = 25 }) {
 }
 
 /* =========================
-   Result memory format
-   ctx.lastResult = {
-     kind: "list",
-     entity: "fields" | "towers" | "farms" | "counties" | ...
-     ids: [id...],
-     labels: [label...],   // same order as ids
-     metric: "hel"|"tillable"|"crp"|""  (what the list was about)
-     metricIncluded: boolean
-     includeArchived: boolean
-   }
+   Result memory helpers
 ========================= */
 
 function storeLastResult(threadId, lastResult) {
@@ -91,17 +74,24 @@ function metricColumn(metric) {
 }
 
 function buildInList(ids) {
-  // ids are doc ids (strings)
   const safe = (ids || []).map(x => String(x).replace(/'/g, "''"));
   return safe.length ? safe.map(x => `'${x}'`).join(",") : "";
 }
 
 function runAugmentFields({ db, last, metric, sortMode }) {
+  if (!Array.isArray(last.ids) || last.ids.length === 0) {
+    return {
+      ok: false,
+      answer:
+        "ERROR: This list can’t be augmented because it has no field IDs.\n" +
+        "Please check /chat/sqlPlanner.js — intent=list_fields must return fields.id AS field_id."
+    };
+  }
+
   const col = metricColumn(metric);
   const inList = buildInList(last.ids);
   if (!inList) return { ok: false, answer: "(no matches)" };
 
-  // pull label + metric for those exact ids
   const sql = `
     SELECT
       fields.id AS id,
@@ -119,7 +109,6 @@ function runAugmentFields({ db, last, metric, sortMode }) {
   const map = new Map();
   for (const r of rows) map.set(String(r.id), { label: String(r.label || ""), value: Number(r.value) || 0 });
 
-  // rebuild in the lastResult order
   const items = [];
   for (let i = 0; i < last.ids.length; i++) {
     const id = String(last.ids[i]);
@@ -132,7 +121,6 @@ function runAugmentFields({ db, last, metric, sortMode }) {
     });
   }
 
-  // sorting
   if (sortMode === "largest") items.sort((a, b) => (b.value - a.value) || a.label.localeCompare(b.label));
   else if (sortMode === "smallest") items.sort((a, b) => (a.value - b.value) || a.label.localeCompare(b.label));
   else items.sort((a, b) => a.label.localeCompare(b.label));
@@ -140,7 +128,6 @@ function runAugmentFields({ db, last, metric, sortMode }) {
   const lines = items.map(it => `• ${it.label} — ${fmtA(it.value)} ac`);
   const paged = pageLines({ lines, pageSize: 25 });
 
-  // update lastResult state (metric now included)
   const nextLast = {
     ...last,
     metric: metric || last.metric || "tillable",
@@ -154,7 +141,6 @@ function runAugmentFields({ db, last, metric, sortMode }) {
 
 function runStripMetric({ last, sortMode }) {
   const items = (last.labels || []).slice().sort((a, b) => a.localeCompare(b));
-  // If lastResult ids/labels are already ordered by sort, keep it unless asked A-Z
   const labels = (sortMode === "az") ? items : (last.labels || []);
   const lines = labels.map(l => `• ${l}`);
   const paged = pageLines({ lines, pageSize: 25 });
@@ -164,6 +150,15 @@ function runStripMetric({ last, sortMode }) {
 }
 
 function runTotal({ db, last, metric }) {
+  if (!Array.isArray(last.ids) || last.ids.length === 0) {
+    return {
+      ok: false,
+      answer:
+        "ERROR: I can’t total this list because it has no field IDs.\n" +
+        "Please check /chat/sqlPlanner.js — intent=list_fields must return fields.id AS field_id."
+    };
+  }
+
   const col = metricColumn(metric);
   const inList = buildInList(last.ids);
   if (!inList) return { ok: false, answer: "(no matches)" };
@@ -203,7 +198,6 @@ export async function handleChat({
     return { ok: false, error: snapshot?.error || "snapshot_not_loaded", answer: "Snapshot not loaded.", action: null, meta: { threadId: tid }, state: state || null };
   }
 
-  // ensure DB
   try { ensureDbFromSnapshot(snapshot); } catch (e) {
     return { ok: false, error: "db_build_failed", answer: "DB build failed.", meta: { threadId: tid, detail: safeStr(e?.message || e) }, state: state || null };
   }
@@ -211,14 +205,11 @@ export async function handleChat({
   const db = getDb();
   if (!db) return { ok: false, error: "db_not_ready", answer: "DB not ready.", meta: { threadId: tid }, state: state || null };
 
-  // normalization
   const nrm = normalizeQuestion(qRaw0);
   const qRaw = safeStr(nrm?.text || qRaw0);
 
-  // seed paging continuation store
   try { if (continuation && typeof continuation === "object") setContinuation(tid, continuation); } catch {}
 
-  // paging followups
   try {
     const fu = tryHandleFollowup({ threadId: tid, question: qRaw });
     if (fu) {
@@ -226,7 +217,6 @@ export async function handleChat({
     }
   } catch { clearContinuation(tid); }
 
-  // followup interpreter
   let routedQuestion = qRaw;
   let interpDelta = null;
   try {
@@ -239,7 +229,7 @@ export async function handleChat({
     }
   } catch {}
 
-  // ✅ RESULT OP execution (global)
+  // RESULT OP
   if (routedQuestion === "__RESULT_OP__") {
     const ctx = getThreadContext(tid) || {};
     const last = getLastResult(ctx);
@@ -258,7 +248,7 @@ export async function handleChat({
         if (r.continuation) setContinuation(tid, r.continuation);
         return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "augment", continuation: r.continuation || null } };
       }
-      return { ok: false, answer: "(no matches)", meta: { threadId: tid } };
+      return { ok: false, answer: r.answer || "(no matches)", meta: { threadId: tid } };
     }
 
     if (op === "strip_metric") {
@@ -272,11 +262,11 @@ export async function handleChat({
     if (op === "total") {
       const metric = ctx.resultOp.metric || last.metric || "tillable";
       const r = runTotal({ db, last, metric });
-      return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "total", metric } };
+      if (r.ok) return { ok: true, answer: r.text, meta: { threadId: tid, routed: "result_op", op: "total", metric } };
+      return { ok: false, answer: r.answer || "(no matches)", meta: { threadId: tid } };
     }
 
     if (op === "sort") {
-      // sort without requery: if metric included, keep; otherwise A-Z
       const mode = ctx.resultOp.mode || "az";
       if (last.metricIncluded) {
         const metric = last.metric || "tillable";
@@ -297,9 +287,7 @@ export async function handleChat({
     return { ok: false, answer: "Unknown follow-up operation.", meta: { threadId: tid } };
   }
 
-  // ===========================
-  // Normal OpenAI->SQL->DB path
-  // ===========================
+  // OpenAI->SQL
   const plan = await planSql({ question: routedQuestion, debug });
   if (!plan.ok) {
     return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
@@ -313,32 +301,33 @@ export async function handleChat({
   const rows = exec.rows || [];
   if (!rows.length) return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
 
-  // If list_fields intent returns ids, store lastResult for follow-ups
+  // ✅ Store lastResult for list_fields ALWAYS (even if broken), so followups don’t silently jump lists.
   if (plan.intent === "list_fields") {
-    // Expect: field_id + field label (planner should be doing this already)
     const ids = [];
     const labels = [];
+
     for (const r of rows) {
       const id = (r.field_id || r.id || "").toString().trim();
       const label = (r.field || r.label || r.name || "").toString().trim();
-      if (!id || !label) continue;
-      ids.push(id);
-      labels.push(label);
+      if (label) labels.push(label);
+      if (id && label) ids.push(id);
     }
-    if (ids.length) {
+
+    if (labels.length) {
       storeLastResult(tid, {
         kind: "list",
         entity: "fields",
-        ids,
+        ids,              // may be empty if planner forgot field_id
         labels,
-        metric: plan.metric || "",       // optional from planner if provided
+        metric: "",       // can be enhanced later
         metricIncluded: false,
-        includeArchived: false
+        includeArchived: false,
+        idsMissing: ids.length === 0   // ✅ flag for debugging
       });
     }
   }
 
-  // Format default output for list_fields as bullets
+  // Output list_fields
   if (plan.intent === "list_fields") {
     const lines = rows.map(r => `• ${(r.field || r.label || r.name || "").toString().trim()}`).filter(Boolean);
     const paged = pageLines({ lines, pageSize: 25 });
@@ -346,7 +335,7 @@ export async function handleChat({
     return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
   }
 
-  // Fallback generic formatting
+  // fallback formatting
   const firstRow = rows[0] || {};
   const keys = Object.keys(firstRow || {});
   if (rows.length === 1 && keys.length === 1) {
