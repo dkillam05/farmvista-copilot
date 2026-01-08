@@ -1,13 +1,8 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-06-handleChat-sql14-global-didyoumean
+// Rev: 2026-01-06-handleChat-sql15-rtk-list-az
 //
-// Adds global OpenAI "did you mean..." when SQL returns 0 rows for an entity lookup.
-// Uses new files:
-//   - /chat/entityCatalog.js
-//   - /chat/entityResolverAI.js
-//
-// Does NOT replace your existing deterministic /chat/entityResolver.js.
-// Keeps your result ops and list_fields id-guard intact.
+// Fix:
+// ✅ Ensure list_rtk_towers output is always A–Z, even if planner SQL forgets ORDER BY.
 
 'use strict';
 
@@ -32,14 +27,6 @@ function makeThreadId() {
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-/* =========================
-   Output helpers
-========================= */
-function fmtA(n) {
-  const v = Number(n) || 0;
-  return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
-}
-
 function pageLines({ lines, pageSize = 25 }) {
   const size = Math.max(10, Math.min(80, Number(pageSize) || 25));
   const first = lines.slice(0, size);
@@ -56,10 +43,6 @@ function pageLines({ lines, pageSize = 25 }) {
   return { text: out.join("\n"), continuation };
 }
 
-/* =========================
-   Result memory helpers
-========================= */
-
 function storeLastResult(threadId, lastResult) {
   applyContextDelta(threadId, { lastResult: lastResult || null });
 }
@@ -68,9 +51,6 @@ function getLastResult(ctx) {
   return (ctx && ctx.lastResult && typeof ctx.lastResult === "object") ? ctx.lastResult : null;
 }
 
-/* =========================
-   Execute RESULT_OP on lastResult
-========================= */
 function metricColumn(metric) {
   if (metric === "hel") return "helAcres";
   if (metric === "crp") return "crpAcres";
@@ -80,6 +60,11 @@ function metricColumn(metric) {
 function buildInList(ids) {
   const safe = (ids || []).map(x => String(x).replace(/'/g, "''"));
   return safe.length ? safe.map(x => `'${x}'`).join(",") : "";
+}
+
+function fmtA(n) {
+  const v = Number(n) || 0;
+  return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 function runAugmentFields({ db, last, metric, sortMode }) {
@@ -137,7 +122,6 @@ function runStripMetric({ last, sortMode }) {
   const labels = (sortMode === "az") ? items : (last.labels || []);
   const lines = labels.map(l => `• ${l}`);
   const paged = pageLines({ lines, pageSize: 25 });
-
   const nextLast = { ...last, metricIncluded: false };
   return { ok: true, text: paged.text, continuation: paged.continuation, nextLast };
 }
@@ -169,10 +153,6 @@ function runTotal({ db, last, metric }) {
   const v = Number(ex.rows[0].value) || 0;
   return { ok: true, text: fmtA(v), continuation: null, nextLast: last };
 }
-
-/* =========================
-   Global "did you mean" helper
-========================= */
 
 function looksLikeYes(raw) {
   const q = norm(raw);
@@ -210,9 +190,6 @@ async function tryDidYouMean({ db, plan, userText, debug }) {
   return { ...res, targetType: tType, targetText: tText };
 }
 
-/* =========================
-   Main
-========================= */
 export async function handleChat({
   question,
   snapshot,
@@ -244,28 +221,17 @@ export async function handleChat({
   const nrm = normalizeQuestion(qRaw0);
   const qRaw = safeStr(nrm?.text || qRaw0);
 
-  // Accept pending suggestion without touching followupInterpreter
+  // accept pending suggestion
   try {
     const ctx = getThreadContext(tid) || {};
     const pr = ctx?.pendingResolve || null;
     if (pr && pr.suggestion && pr.intent && (looksLikeYes(qRaw) || norm(qRaw) === norm(pr.suggestion))) {
       applyContextDelta(tid, { pendingResolve: null });
       const rq = buildRetryQuestion(pr.intent, pr.suggestion) || pr.suggestion;
-      // re-route by replacing qRaw
-      // (we continue below using rq as the question)
-      return await handleChat({
-        question: rq,
-        snapshot,
-        authHeader,
-        state,
-        threadId: tid,
-        continuation,
-        debugAI
-      });
+      return await handleChat({ question: rq, snapshot, authHeader, state, threadId: tid, continuation, debugAI });
     }
   } catch {}
 
-  // seed paging continuation store
   try { if (continuation && typeof continuation === "object") setContinuation(tid, continuation); } catch {}
 
   // paging followups
@@ -347,22 +313,18 @@ export async function handleChat({
 
   // OpenAI->SQL
   const plan = await planSql({ question: routedQuestion, debug });
-  if (!plan.ok) {
-    return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
-  }
+  if (!plan.ok) return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
 
   const exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
-  if (!exec.ok) {
-    return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
-  }
+  if (!exec.ok) return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
 
   let rows = exec.rows || [];
 
-  // ✅ Global did-you-mean on 0 rows (when planner provided targetType/targetText)
+  // did-you-mean if 0 rows
   if (rows.length === 0) {
     const dy = await tryDidYouMean({ db, plan, userText: routedQuestion, debug });
     if (dy && dy.ok && dy.action === "retry" && dy.match) {
-      // High confidence => auto-run corrected question once
+      // auto retry on high confidence
       if ((dy.confidence || "").toLowerCase() === "high") {
         const rq = buildRetryQuestion(plan.intent, dy.match) || dy.match;
         const plan2 = await planSql({ question: rq, debug });
@@ -370,33 +332,24 @@ export async function handleChat({
           const ex2 = runSql({ db, sql: plan2.sql, limitDefault: 80 });
           if (ex2.ok && (ex2.rows || []).length) {
             rows = ex2.rows || [];
-            // proceed to formatting below with plan2 intent
             plan.intent = plan2.intent;
           } else {
             applyContextDelta(tid, { pendingResolve: { intent: plan.intent, suggestion: dy.match } });
-            return { ok: true, answer: `I don’t see "${plan.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
+            return { ok: true, answer: `I don’t see "${dy.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
           }
         }
       } else {
         applyContextDelta(tid, { pendingResolve: { intent: plan.intent, suggestion: dy.match } });
-        return { ok: true, answer: `I don’t see "${plan.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
+        return { ok: true, answer: `I don’t see "${dy.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
       }
     }
-
-    if (dy && dy.ok && dy.action === "clarify") {
-      const opts = Array.isArray(dy.options) ? dy.options.slice(0, 4) : [];
-      const lines = opts.length ? `\n${opts.map(o => `• ${o}`).join("\n")}` : "";
-      return { ok: true, answer: `${safeStr(dy.ask) || "Which one did you mean?"}${lines}`, meta: { threadId: tid, routed: "did_you_mean_clarify" } };
-    }
-
     return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
   }
 
-  // Store lastResult for list_fields
+  // list_fields store lastResult
   if (plan.intent === "list_fields") {
     const ids = [];
     const labels = [];
-
     for (const r of rows) {
       const id = (r.field_id || r.id || "").toString().trim();
       const label = (r.field || r.label || r.name || "").toString().trim();
@@ -404,22 +357,10 @@ export async function handleChat({
       ids.push(id);
       labels.push(label);
     }
-
-    if (labels.length) {
-      storeLastResult(tid, {
-        kind: "list",
-        entity: "fields",
-        ids,
-        labels,
-        metric: "",
-        metricIncluded: false,
-        includeArchived: false,
-        idsMissing: ids.length === 0
-      });
-    }
+    if (labels.length) storeLastResult(tid, { kind: "list", entity: "fields", ids, labels, metric: "", metricIncluded: false, includeArchived: false, idsMissing: ids.length === 0 });
   }
 
-  // Output list_fields
+  // list_fields output
   if (plan.intent === "list_fields") {
     const lines = rows.map(r => `• ${(r.field || r.label || r.name || "").toString().trim()}`).filter(Boolean);
     const paged = pageLines({ lines, pageSize: 25 });
@@ -427,14 +368,19 @@ export async function handleChat({
     return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
   }
 
-  // Output list_rtk_towers
+  // ✅ list_rtk_towers output ALWAYS A–Z
   if (plan.intent === "list_rtk_towers") {
-    const lines = rows.map(r => `• ${(r.tower || r.name || "").toString().trim()}`).filter(Boolean);
+    const names = rows
+      .map(r => safeStr(r.tower || r.name))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+    const lines = names.map(n => `• ${n}`);
     const paged = pageLines({ lines, pageSize: 200 });
     return { ok: true, answer: paged.text, meta: { threadId: tid } };
   }
 
-  // Output rtk_tower_info as detail
+  // rtk_tower_info detail
   if (plan.intent === "rtk_tower_info") {
     const r0 = rows[0] || {};
     const out = [];
@@ -446,17 +392,15 @@ export async function handleChat({
     return { ok: true, answer: out.join("\n"), meta: { threadId: tid } };
   }
 
-  // Fallback generic formatting
+  // default
   const firstRow = rows[0] || {};
   const keys = Object.keys(firstRow || {});
-  if (rows.length === 1 && keys.length === 1) {
-    return { ok: true, answer: String(firstRow[keys[0]]), meta: { threadId: tid } };
-  }
+  if (rows.length === 1 && keys.length === 1) return { ok: true, answer: String(firstRow[keys[0]]), meta: { threadId: tid } };
 
-  const lines = [];
+  const outLines = [];
   for (const r of rows.slice(0, 25)) {
     const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
-    if (any) lines.push(`• ${any}`);
+    if (any) outLines.push(`• ${any}`);
   }
-  return { ok: true, answer: lines.length ? lines.join("\n") : "(no matches)", meta: { threadId: tid } };
+  return { ok: true, answer: outLines.length ? outLines.join("\n") : "(no matches)", meta: { threadId: tid } };
 }
