@@ -1,14 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-08-handleChat-sql16-fieldinfo-fullcard
+// Rev: 2026-01-08-handleChat-sql17-county-metrics
 //
 // Fix:
-// ✅ Add explicit handler for intent=field_info
-//    - Always prints full field card
-//    - Always includes RTK tower + frequency + network ID
-//    - If multiple matches (non-numeric name search), return A–Z pick list and ask user to reply with exact one
+// ✅ intent=list_counties now prints a deduped county list (De Witt vs DeWitt merged by planner SQL)
+// ✅ intent=group_metric now prints "Group — ### ac" (HEL/CRP/Tillable per county/farm)
+// ✅ group_metric output is paged and supports "total" followup via continuation acres lines
 //
 // Keeps:
-// ✅ Ensure list_rtk_towers output is always A–Z, even if planner SQL forgets ORDER BY.
+// ✅ field_info full card (RTK always included)
+// ✅ list_fields paging + lastResult store for augment/sort/total
+// ✅ list_rtk_towers output ALWAYS A–Z
+// ✅ rtk_tower_info output
 
 'use strict';
 
@@ -33,17 +35,18 @@ function makeThreadId() {
   catch { return "t_" + Math.random().toString(16).slice(2) + "_" + Date.now().toString(16); }
 }
 
-function pageLines({ lines, pageSize = 25 }) {
+function pageLines({ lines, pageSize = 25, title = "" }) {
   const size = Math.max(10, Math.min(80, Number(pageSize) || 25));
   const first = lines.slice(0, size);
   const remaining = lines.length - first.length;
 
   const out = [];
+  if (title) out.push(title);
   out.push(...first);
   if (remaining > 0) out.push(`…plus ${remaining} more.`);
 
   const continuation = (remaining > 0)
-    ? { kind: "page", title: "", lines, offset: size, pageSize: size }
+    ? { kind: "page", title, lines, offset: size, pageSize: size }
     : null;
 
   return { text: out.join("\n"), continuation };
@@ -173,7 +176,6 @@ function buildRetryQuestion(intent, match) {
   if (intent === "list_farms") return `List farms for ${m}`;
   if (intent === "list_counties") return `List counties for ${m}`;
   if (intent === "field_info") return `Field info for ${m}`;
-  if (intent === "field_rtk_info") return `RTK tower info for field ${m}`;
   return m;
 }
 
@@ -219,11 +221,9 @@ function formatFieldCard(r0) {
   const net = safeStr(r0?.networkId || "");
 
   const out = [];
-
   out.push(`Field: ${field || "(unknown)"}`);
   if (fieldNum) out.push(`Field # : ${fieldNum}`);
   if (fieldId) out.push(`Field ID: ${fieldId}`);
-
   if (farm) out.push(`Farm: ${farm}`);
 
   const loc = [county, state].filter(Boolean).join(", ");
@@ -239,8 +239,21 @@ function formatFieldCard(r0) {
   out.push(`Network ID: ${net || "(unknown)"}`);
 
   if (status) out.push(`Status: ${status}`);
-
   return out.join("\n");
+}
+
+function dedupeLines(lines) {
+  const out = [];
+  const seen = new Set();
+  for (const ln of (lines || [])) {
+    const s = safeStr(ln);
+    if (!s) continue;
+    const k = norm(s).replace(/\s+/g, " ");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
 }
 
 export async function handleChat({
@@ -377,7 +390,6 @@ export async function handleChat({
   if (rows.length === 0) {
     const dy = await tryDidYouMean({ db, plan, userText: routedQuestion, debug });
     if (dy && dy.ok && dy.action === "retry" && dy.match) {
-      // auto retry on high confidence
       if ((dy.confidence || "").toLowerCase() === "high") {
         const rq = buildRetryQuestion(plan.intent, dy.match) || dy.match;
         const plan2 = await planSql({ question: rq, debug });
@@ -421,6 +433,38 @@ export async function handleChat({
     return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
   }
 
+  // ✅ list_counties output (deduped)
+  if (plan.intent === "list_counties") {
+    const linesRaw = rows.map(r => {
+      const c = safeStr(r.county || r.name || "");
+      const s = safeStr(r.state || "");
+      return `• ${[c, s].filter(Boolean).join(", ")}`.trim();
+    }).filter(x => x && x !== "•");
+
+    const lines = dedupeLines(linesRaw);
+    const paged = pageLines({ lines, pageSize: 200 });
+    return { ok: true, answer: paged.text, meta: { threadId: tid } };
+  }
+
+  // ✅ group_metric output (HEL/CRP/Tillable per county/farm)
+  if (plan.intent === "group_metric") {
+    const linesRaw = rows.map(r => {
+      const g = safeStr(r.group || r.name || r.county || r.farm || "");
+      const v = Number(r.value);
+      const n = Number.isFinite(v) ? v : 0;
+      return `• ${g} — ${fmtA(n)} ac`;
+    }).filter(Boolean);
+
+    const lines = dedupeLines(linesRaw);
+    const title = ""; // keep blank; helps totals parser work cleanly
+    const paged = pageLines({ lines, pageSize: 50, title });
+
+    // seed continuation with FULL lines so followups.js "total" works
+    if (paged.continuation) setContinuation(tid, paged.continuation);
+
+    return { ok: true, answer: paged.text, meta: { threadId: tid, continuation: paged.continuation || null } };
+  }
+
   // ✅ list_rtk_towers output ALWAYS A–Z
   if (plan.intent === "list_rtk_towers") {
     const names = rows
@@ -445,19 +489,13 @@ export async function handleChat({
     return { ok: true, answer: out.join("\n"), meta: { threadId: tid } };
   }
 
-  // ✅ field_info: FULL FIELD CARD (RTK ALWAYS)
+  // field_info: FULL FIELD CARD (RTK ALWAYS)
   if (plan.intent === "field_info") {
-    // If planner returned multiple matches (non-numeric name search), show pick list A–Z
     if ((rows || []).length > 1) {
       const opts = rows
         .map(r => safeStr(r.field || r.name))
         .filter(Boolean)
         .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-
-      const ids = rows.map(r => safeStr(r.field_id || r.id)).filter(Boolean);
-      const labels = opts.slice();
-
-      if (labels.length) storeLastResult(tid, { kind: "list", entity: "fields", ids, labels, metric: "", metricIncluded: false, includeArchived: false, idsMissing: ids.length === 0 });
 
       const lines = opts.map(x => `• ${x}`);
       const paged = pageLines({ lines, pageSize: 25 });
@@ -470,7 +508,6 @@ export async function handleChat({
       return { ok: true, answer: msg, meta: { threadId: tid, intent: "field_info", ambiguous: true, continuation: paged.continuation || null } };
     }
 
-    // Single match: print full card
     const r0 = (rows || [])[0] || {};
     return { ok: true, answer: formatFieldCard(r0), meta: { threadId: tid, intent: "field_info" } };
   }
@@ -482,7 +519,7 @@ export async function handleChat({
 
   const outLines = [];
   for (const r of rows.slice(0, 25)) {
-    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? "").toString().trim();
+    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? r.group ?? "").toString().trim();
     if (any) outLines.push(`• ${any}`);
   }
   return { ok: true, answer: outLines.length ? outLines.join("\n") : "(no matches)", meta: { threadId: tid } };
