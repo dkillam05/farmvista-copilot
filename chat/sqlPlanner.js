@@ -1,19 +1,14 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-08-sqlPlanner10-fieldinfo+county-metrics
+// Rev: 2026-01-08-sqlPlanner11-groupName-not-group
 //
 // Fix:
-// ✅ Add strict intent contracts for:
-//    - field_info (full field card, ALWAYS includes RTK freq + network)
-//    - list_counties (DEDUPES "De Witt" vs "DeWitt" via county_norm/state_norm GROUP BY)
-//    - group_metric (HEL/CRP/Tillable per county or per farm, ordered A–Z)
-//
-// Critical behavior (per Dane):
-// ✅ If user asks "HEL acres in each county" / "HEL acres per county" => intent MUST be group_metric (NOT list_counties)
+// ✅ group_metric contract now uses alias: groupName (NOT "group" reserved word)
+// ✅ Reinforces county metric requests => intent=group_metric
 //
 // Keeps:
-// ✅ list_rtk_towers ORDER BY rtkTowers.name_norm ASC and returns rtkTowers.name AS tower
-// ✅ list_fields returns fields.id AS field_id, fields.name AS field, ordered by field_num/name_norm
-// ✅ force rtk_tower_info for info/details/network/frequency about a tower
+// ✅ field_info contract (full field card + RTK always)
+// ✅ list_counties contract (deduped by county_norm/state_norm)
+// ✅ list_fields, list_rtk_towers, rtk_tower_info strict contracts
 
 'use strict';
 
@@ -154,8 +149,8 @@ INTENT CONTRACTS (MUST MATCH):
 6) intent="group_metric"
    PURPOSE:
      Return a metric grouped by county or by farm.
-   SQL MUST return aliases EXACT:
-     group AS group,
+   SQL MUST return aliases EXACT (IMPORTANT: do NOT use reserved word "group"):
+     groupName AS groupName,
      value AS value
    REQUIRED:
    - Determine metric column:
@@ -164,13 +159,13 @@ INTENT CONTRACTS (MUST MATCH):
        Tillable/acres => SUM(fields.tillable)
    - Determine grouping:
        By county / per county / each county => GROUP BY fields.county_norm, fields.state_norm
-         group label must be:
+         groupName label must be:
            CASE WHEN TRIM(COALESCE(MIN(fields.state),''))<>'' THEN MIN(TRIM(fields.county)) || ', ' || MIN(TRIM(fields.state)) ELSE MIN(TRIM(fields.county)) END
-         ORDER BY LOWER(group) ASC
+         ORDER BY LOWER(groupName) ASC
        By farm / per farm / each farm => GROUP BY farms.name_norm
-         group label must be:
+         groupName label must be:
            MIN(farms.name)
-         ORDER BY LOWER(group) ASC
+         ORDER BY LOWER(groupName) ASC
    - Apply active-only filter unless include archived requested
    - LIMIT 200
 `.trim();
