@@ -2,20 +2,29 @@
 
 import { ensureDbFromSnapshot, getDb } from '../context/snapshot-db.js';
 import { runSql } from '../chat/sqlRunner.js';
+import { getThreadContext, applyContextDelta } from '../chat/conversationStore.js';
 
 /**
  * FarmVista Copilot Chat Handler (FULL FILE)
- * Rev: 2026-01-09-handleChat-tools-required1
+ * Rev: 2026-01-09-handleChat-global-lists1
  *
- * Fixes your current problem:
- * ✅ Forces OpenAI to ALWAYS call a tool (no more generic ChatGPT answers)
- * ✅ Tool executes deterministic SQL against the snapshot-built SQLite DB
- * ✅ Returns DB-backed answers (never asks “what do you mean by fields”)
+ * GLOBAL RULES (apply to ANY list output):
+ * ✅ Sort: numeric-prefix first if items start with numbers, else A–Z
+ * ✅ Page size: 100 items
+ * ✅ If more exist: append "…plus N more. (say \"show more\")"
+ * ✅ Followups operate on the LAST list shown:
+ *    - "show more" / "show all"
+ *    - "sort a-z" / "sort z-a"
+ *    - "sort high to low" / "sort low to high"
+ *    - "total" / "average"
  *
- * Notes:
- * - No OpenAI SDK (fetch only, Node 20)
- * - Always returns meta.aiUsed for UI debug
+ * OpenAI:
+ * ✅ tool_choice = "required" (never free-chat answers)
+ * ✅ OpenAI must call fv_query every request
  */
+
+const OPENAI_URL = 'https://api.openai.com/v1/responses';
+const PAGE_SIZE = 100;
 
 function safeStr(v) { return (v == null ? '' : String(v)).trim(); }
 function norm(s) { return safeStr(s).toLowerCase(); }
@@ -52,22 +61,157 @@ function metricCol(metric) {
   return 'tillable';
 }
 
-/**
- * Single canonical tool:
- * The model must call fv_query for EVERY message.
- * Your code executes and formats results.
- */
+/* =========================================================
+   GLOBAL LIST ENGINE
+========================================================= */
+
+function stripBullet(line) {
+  const s = safeStr(line);
+  return s.startsWith('• ') ? s.slice(2).trim() : s;
+}
+
+function startsWithNumber(s) {
+  const t = stripBullet(s);
+  return /^\d+/.test(t);
+}
+
+function numPrefix(s) {
+  const t = stripBullet(s);
+  const m = t.match(/^(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+function alphaSort(a, b) {
+  return stripBullet(a).localeCompare(stripBullet(b), undefined, { sensitivity: 'base' });
+}
+
+function numericThenAlphaSort(a, b) {
+  const na = numPrefix(a);
+  const nb = numPrefix(b);
+  if (na != null && nb != null) return (na - nb) || alphaSort(a, b);
+  if (na != null) return -1;
+  if (nb != null) return 1;
+  return alphaSort(a, b);
+}
+
+function decideDefaultSort(items) {
+  if (!items || !items.length) return { mode: 'az', sorted: [] };
+  const n = Math.min(items.length, 25);
+  let numHits = 0;
+  for (let i = 0; i < n; i++) if (startsWithNumber(items[i])) numHits++;
+  const useNumeric = numHits >= Math.ceil(n * 0.6);
+  const sorted = items.slice().sort(useNumeric ? numericThenAlphaSort : alphaSort);
+  return { mode: useNumeric ? 'num' : 'az', sorted };
+}
+
+function parseNumericValueFromLine(line) {
+  const s = stripBullet(line);
+
+  // prefer number before "ac" or "acres"
+  let m = s.match(/(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:acres?\b|ac\b)/i);
+  if (m) {
+    const n = Number(String(m[1]).replace(/,/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // next: number after "—" (common "Thing — 123")
+  m = s.match(/—\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/);
+  if (m) {
+    const n = Number(String(m[1]).replace(/,/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // fallback: last number in the string
+  const all = s.match(/(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)/g);
+  if (all && all.length) {
+    const n = Number(String(all[all.length - 1]).replace(/,/g, ''));
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return null;
+}
+
+function paginate(items, offset) {
+  const off = Math.max(0, Number(offset) || 0);
+  const slice = items.slice(off, off + PAGE_SIZE);
+  const remaining = Math.max(0, items.length - (off + slice.length));
+  return { slice, remaining, nextOffset: off + slice.length };
+}
+
+function storeLastList(threadId, items, offset, sortMode) {
+  applyContextDelta(threadId, {
+    lastList: {
+      items: items.slice(),
+      offset: Number(offset) || 0,
+      sortMode: safeStr(sortMode || 'az'),
+      pageSize: PAGE_SIZE
+    }
+  });
+}
+
+function getLastList(threadId) {
+  const ctx = getThreadContext(threadId) || {};
+  const ll = ctx.lastList;
+  if (!ll || !Array.isArray(ll.items)) return null;
+  return {
+    items: ll.items.slice(),
+    offset: Number(ll.offset) || 0,
+    sortMode: safeStr(ll.sortMode || 'az')
+  };
+}
+
+function renderPage(items, offset, sortMode) {
+  const { slice, remaining, nextOffset } = paginate(items, offset);
+  const lines = slice.map(x => x.startsWith('• ') ? x : `• ${x}`);
+  let text = lines.join('\n');
+  if (remaining > 0) text += `\n…plus ${remaining} more. (say "show more")`;
+  return { text: text || '(no matches)', nextOffset, remaining, sortMode };
+}
+
+function applySort(items, mode) {
+  const m = norm(mode);
+  if (m === 'z-a') return items.slice().sort((a, b) => alphaSort(b, a));
+  if (m === 'a-z') return items.slice().sort(alphaSort);
+  if (m === 'num') return items.slice().sort(numericThenAlphaSort);
+  // default
+  return items.slice().sort(alphaSort);
+}
+
+function sortByValue(items, dir) {
+  const d = norm(dir);
+  const rows = items.map(x => ({ raw: x, val: parseNumericValueFromLine(x) }));
+  rows.sort((a, b) => {
+    const av = (a.val == null ? -Infinity : a.val);
+    const bv = (b.val == null ? -Infinity : b.val);
+    if (d === 'desc') return (bv - av) || alphaSort(a.raw, b.raw);
+    return (av - bv) || alphaSort(a.raw, b.raw);
+  });
+  return rows.map(r => r.raw);
+}
+
+function computeTotal(items) {
+  const nums = items.map(parseNumericValueFromLine).filter(v => v != null);
+  if (!nums.length) return null;
+  return nums.reduce((a, b) => a + b, 0);
+}
+
+function computeAverage(items) {
+  const nums = items.map(parseNumericValueFromLine).filter(v => v != null);
+  if (!nums.length) return null;
+  return nums.reduce((a, b) => a + b, 0) / nums.length;
+}
+
+/* =========================================================
+   TOOLING: fv_query
+========================================================= */
+
 const TOOLS = [
   {
     type: 'function',
     name: 'fv_query',
     description:
-      'Query FarmVista snapshot SQLite for fields/farms/counties/rtk information. ' +
-      'Use this for ALL user questions. Prefer exact DB-backed answers. ' +
-      'If user asks "list all fields" set action="list_fields". ' +
-      'If user asks "fields in <county>" set action="list_fields" + county. ' +
-      'If user asks "<metric> by county" set action="group_metric" + groupBy="county" + metric. ' +
-      'If user asks "which fields in <county> have <metric>" set action="drilldown_metric" + county + metric + metricGt=0.',
+      'Query FarmVista snapshot SQLite for data. MUST be used for EVERY request. ' +
+      'Return lists and results from DB. Do NOT ask user what a "field" means.',
     parameters: {
       type: 'object',
       properties: {
@@ -104,6 +248,14 @@ function extractToolCall(respJson) {
   for (const item of out) {
     if (item && item.type === 'function_call' && item.name === 'fv_query') return item;
   }
+  // fallback shape (some responses variants)
+  for (const item of out || []) {
+    const content = item?.content;
+    if (!Array.isArray(content)) continue;
+    for (const c of content) {
+      if (c && c.type === 'tool_call' && c.name === 'fv_query') return c;
+    }
+  }
   return null;
 }
 
@@ -127,7 +279,7 @@ function formatFieldInfoRow(r) {
 
 function runTool(db, args) {
   const action = norm(args.action);
-  const limit = Math.max(1, Math.min(5000, Number(args.limit) || 200));
+  const limit = Math.max(1, Math.min(5000, Number(args.limit) || 5000));
 
   // LIST COUNTIES
   if (action === 'list_counties') {
@@ -142,28 +294,26 @@ function runTool(db, args) {
       ORDER BY LOWER(county) ASC, LOWER(state) ASC
       LIMIT ${limit}
     `.trim();
-    return { kind: 'lines', sql, exec: runSql({ db, sql, limitDefault: limit }),
-      toLines: (rows) => rows.map(r => `• ${[safeStr(r.county), safeStr(r.state)].filter(Boolean).join(', ')}`) };
+    const ex = runSql({ db, sql, limitDefault: limit });
+    return { kind: 'list', ex, items: ex.ok ? ex.rows.map(r => `${safeStr(r.county)}, ${safeStr(r.state)}`.replace(/,\s*$/, '').trim()) : [] };
   }
 
-  // LIST ALL FIELDS (optionally filtered by county)
+  // LIST FIELDS (optionally filtered by county)
   if (action === 'list_fields') {
     const county = safeStr(args.county);
-    const where = [
-      activeOnlyWhere()
-    ];
+    const where = [activeOnlyWhere()];
     if (county) where.push(buildCountyWhere(county));
 
     const sql = `
-      SELECT fields.id AS field_id, fields.name AS field
+      SELECT fields.name AS field
       FROM fields
       WHERE ${where.join(' AND ')}
       ORDER BY COALESCE(fields.field_num, 999999) ASC, fields.name_norm ASC
       LIMIT ${limit}
     `.trim();
 
-    return { kind: 'lines', sql, exec: runSql({ db, sql, limitDefault: limit }),
-      toLines: (rows) => rows.map(r => `• ${safeStr(r.field)}`) };
+    const ex = runSql({ db, sql, limitDefault: limit });
+    return { kind: 'list', ex, items: ex.ok ? ex.rows.map(r => safeStr(r.field)).filter(Boolean) : [] };
   }
 
   // GROUP METRIC BY COUNTY OR FARM
@@ -202,8 +352,11 @@ function runTool(db, args) {
       `.trim();
     }
 
-    return { kind: 'lines', sql, exec: runSql({ db, sql, limitDefault: limit }),
-      toLines: (rows) => rows.map(r => `• ${safeStr(r.groupName)} — ${fmtA(r.value)} ac`) };
+    const ex = runSql({ db, sql, limitDefault: limit });
+    const items = ex.ok
+      ? ex.rows.map(r => `${safeStr(r.groupName)} — ${fmtA(r.value)} ac`)
+      : [];
+    return { kind: 'list', ex, items };
   }
 
   // DRILLDOWN: FIELDS IN COUNTY WITH METRIC > X
@@ -212,27 +365,33 @@ function runTool(db, args) {
     const col = metricCol(metric);
     const gt = (args.metricGt != null) ? Number(args.metricGt) : 0;
     const county = safeStr(args.county);
-    const where = [activeOnlyWhere(), `COALESCE(fields.${col},0) > ${Number.isFinite(gt) ? gt : 0}`];
+
+    const where = [
+      activeOnlyWhere(),
+      `COALESCE(fields.${col},0) > ${Number.isFinite(gt) ? gt : 0}`
+    ];
     if (county) where.push(buildCountyWhere(county));
 
     const sql = `
-      SELECT fields.id AS field_id, fields.name AS field, COALESCE(fields.${col},0) AS value
+      SELECT fields.name AS field, COALESCE(fields.${col},0) AS value
       FROM fields
       WHERE ${where.join(' AND ')}
       ORDER BY value DESC, fields.name_norm ASC
       LIMIT ${limit}
     `.trim();
 
-    return { kind: 'lines', sql, exec: runSql({ db, sql, limitDefault: limit }),
-      toLines: (rows) => rows.map(r => `• ${safeStr(r.field)} — ${fmtA(r.value)} ac`) };
+    const ex = runSql({ db, sql, limitDefault: limit });
+    const items = ex.ok
+      ? ex.rows.map(r => `${safeStr(r.field)} — ${fmtA(r.value)} ac`)
+      : [];
+    return { kind: 'list', ex, items };
   }
 
-  // FIELD INFO (full card, includes RTK)
+  // FIELD INFO (full card)
   if (action === 'field_info') {
     const f = safeStr(args.field);
-    if (!f) {
-      return { kind: 'text', text: '(no matches)' };
-    }
+    if (!f) return { kind: 'text', text: '(no matches)' };
+
     const tok = escSql(norm(f));
     const sql = `
       SELECT
@@ -258,11 +417,10 @@ function runTool(db, args) {
     `.trim();
 
     const ex = runSql({ db, sql, limitDefault: 5 });
-    if (!ex.ok) return { kind: 'text', text: '(no matches)', sql, error: ex.error, detail: ex.detail };
+    if (!ex.ok || !(ex.rows || []).length) return { kind: 'text', text: '(no matches)' };
     const rows = ex.rows || [];
-    if (!rows.length) return { kind: 'text', text: '(no matches)', sql };
-    if (rows.length === 1) return { kind: 'text', text: formatFieldInfoRow(rows[0]), sql };
-    return { kind: 'lines', sql, lines: rows.map(r => `• ${safeStr(r.field)}`) };
+    if (rows.length === 1) return { kind: 'text', text: formatFieldInfoRow(rows[0]) };
+    return { kind: 'list', ex, items: rows.map(r => safeStr(r.field)).filter(Boolean) };
   }
 
   // LIST RTK TOWERS
@@ -274,14 +432,15 @@ function runTool(db, args) {
       ORDER BY rtkTowers.name_norm ASC
       LIMIT ${limit}
     `.trim();
-    return { kind: 'lines', sql, exec: runSql({ db, sql, limitDefault: limit }),
-      toLines: (rows) => rows.map(r => `• ${safeStr(r.tower)}`) };
+    const ex = runSql({ db, sql, limitDefault: limit });
+    return { kind: 'list', ex, items: ex.ok ? ex.rows.map(r => safeStr(r.tower)).filter(Boolean) : [] };
   }
 
   // RTK INFO
   if (action === 'rtk_info') {
     const t = safeStr(args.rtkTower || args.tower);
     if (!t) return { kind: 'text', text: '(no matches)' };
+
     const tok = escSql(norm(t));
     const sql = `
       SELECT
@@ -293,20 +452,22 @@ function runTool(db, args) {
       ORDER BY rtkTowers.name_norm ASC
       LIMIT 5
     `.trim();
+
     const ex = runSql({ db, sql, limitDefault: 5 });
-    if (!ex.ok) return { kind: 'text', text: '(no matches)', sql, error: ex.error, detail: ex.detail };
-    const rows = ex.rows || [];
-    if (!rows.length) return { kind: 'text', text: '(no matches)', sql };
-    const r0 = rows[0];
+    if (!ex.ok || !(ex.rows || []).length) return { kind: 'text', text: '(no matches)' };
+    const r0 = ex.rows[0];
     return {
       kind: 'text',
-      sql,
       text: `RTK tower: ${safeStr(r0.tower)}\nFrequency: ${safeStr(r0.frequencyMHz)} MHz\nNetwork ID: ${safeStr(r0.networkId)}`
     };
   }
 
   return { kind: 'text', text: '(no matches)' };
 }
+
+/* =========================================================
+   MAIN
+========================================================= */
 
 export async function handleChat({
   question,
@@ -334,6 +495,50 @@ export async function handleChat({
     return { ok: false, answer: 'DB not ready.', meta: { aiUsed: false } };
   }
 
+  // GLOBAL FOLLOWUPS ON LAST LIST
+  const last = threadId ? getThreadContext(threadId) : null;
+  const lastList = (last && last.lastList && Array.isArray(last.lastList.items)) ? last.lastList : null;
+  const qn = norm(question);
+
+  if (lastList) {
+    let items = lastList.items.slice();
+    let offset = Number(lastList.offset) || 0;
+
+    if (qn === 'show more' || qn === 'more' || qn === 'next') {
+      const out = renderPage(items, offset, lastList.sortMode || 'az');
+      storeLastList(threadId, items, out.nextOffset, lastList.sortMode || 'az');
+      return { ok: true, answer: out.text, meta: { aiUsed: false, followup: true, op: 'show_more' } };
+    }
+
+    if (qn === 'show all' || qn === 'all') {
+      storeLastList(threadId, items, items.length, lastList.sortMode || 'az');
+      return { ok: true, answer: items.map(x => x.startsWith('• ') ? x : `• ${x}`).join('\n') || '(no matches)', meta: { aiUsed: false, followup: true, op: 'show_all' } };
+    }
+
+    if (qn.includes('sort') || qn.includes('a-z') || qn.includes('z-a') || qn.includes('high to low') || qn.includes('low to high')) {
+      if (qn.includes('high to low')) items = sortByValue(items, 'desc');
+      else if (qn.includes('low to high')) items = sortByValue(items, 'asc');
+      else if (qn.includes('z-a')) items = applySort(items, 'z-a');
+      else items = applySort(items, 'a-z');
+
+      const out = renderPage(items, 0, 'custom');
+      storeLastList(threadId, items, out.nextOffset, 'custom');
+      return { ok: true, answer: out.text, meta: { aiUsed: false, followup: true, op: 'sort' } };
+    }
+
+    if (qn.includes('total')) {
+      const t = computeTotal(items);
+      if (t == null) return { ok: true, answer: 'Total: (no numeric values found in last list)', meta: { aiUsed: false, followup: true, op: 'total' } };
+      return { ok: true, answer: `Total: ${fmtA(t)}`, meta: { aiUsed: false, followup: true, op: 'total' } };
+    }
+
+    if (qn.includes('average') || qn.includes('avg')) {
+      const a = computeAverage(items);
+      if (a == null) return { ok: true, answer: 'Average: (no numeric values found in last list)', meta: { aiUsed: false, followup: true, op: 'average' } };
+      return { ok: true, answer: `Average: ${fmtA(a)}`, meta: { aiUsed: false, followup: true, op: 'average' } };
+    }
+  }
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     return { ok: false, answer: 'OPENAI_API_KEY not set.', meta: { aiUsed: false } };
@@ -342,8 +547,7 @@ export async function handleChat({
   const t0 = Date.now();
 
   try {
-    // FORCE TOOL USE
-    const res = await fetch('https://api.openai.com/v1/responses', {
+    const res = await fetch(OPENAI_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
@@ -359,10 +563,8 @@ export async function handleChat({
             content:
               'You are FarmVista Copilot. You MUST call the fv_query tool for EVERY request. ' +
               'Never ask the user for clarification about what a "field" is. ' +
-              'Assume "field" refers to farm fields in the snapshot database. ' +
-              'If user asks for a list, choose list_fields. If user mentions a county, set county. ' +
-              'If user asks for HEL/CRP/tillable per county, use group_metric. ' +
-              'If user asks which fields have HEL in a county, use drilldown_metric with metricGt=0.'
+              'Assume "field" refers to FarmVista farm fields in the snapshot database. ' +
+              'When returning a list, do NOT try to format/paginate/sort—just choose the correct action and arguments.'
           },
           { role: 'user', content: question }
         ]
@@ -389,7 +591,6 @@ export async function handleChat({
     const call = extractToolCall(json);
 
     if (!call) {
-      // With tool_choice=required this should not happen
       return {
         ok: false,
         answer: 'Internal error: OpenAI did not call a tool.',
@@ -402,48 +603,10 @@ export async function handleChat({
 
     const toolResult = runTool(db, args);
 
-    // Execute if needed
-    if (toolResult.kind === 'lines' && toolResult.exec) {
-      const ex = toolResult.exec;
-      if (!ex.ok) {
-        return {
-          ok: false,
-          answer: debugAI
-            ? `SQL failed: ${safeStr(ex.error)}${ex.detail ? `: ${safeStr(ex.detail)}` : ''}\nSQL:\n${safeStr(ex.sql)}`
-            : 'Query failed.',
-          meta: { aiUsed: true, model: 'gpt-4.1-mini', ms: Date.now() - t0, threadId }
-        };
-      }
-
-      const rows = ex.rows || [];
-      const lines = toolResult.toLines ? toolResult.toLines(rows) : rows.map(r => `• ${JSON.stringify(r)}`);
-      const text = (lines && lines.length) ? lines.join('\n') : '(no matches)';
-
-      return {
-        ok: true,
-        answer: text,
-        meta: {
-          aiUsed: true,
-          model: 'gpt-4.1-mini',
-          ms: Date.now() - t0,
-          threadId,
-          tool: 'fv_query',
-          action: safeStr(args.action),
-          debugSql: debugAI ? safeStr(ex.sql) : undefined
-        }
-      };
-    }
-
-    if (toolResult.kind === 'lines' && Array.isArray(toolResult.lines)) {
-      const text = toolResult.lines.length ? toolResult.lines.join('\n') : '(no matches)';
-      return {
-        ok: true,
-        answer: text,
-        meta: { aiUsed: true, model: 'gpt-4.1-mini', ms: Date.now() - t0, threadId, tool: 'fv_query', action: safeStr(args.action) }
-      };
-    }
-
+    // TEXT response (not list)
     if (toolResult.kind === 'text') {
+      // clear lastList on non-list outputs
+      if (threadId) applyContextDelta(threadId, { lastList: null });
       return {
         ok: true,
         answer: safeStr(toolResult.text) || '(no matches)',
@@ -453,12 +616,51 @@ export async function handleChat({
           ms: Date.now() - t0,
           threadId,
           tool: 'fv_query',
-          action: safeStr(args.action),
-          debugSql: debugAI ? safeStr(toolResult.sql || '') : undefined
+          action: safeStr(args.action)
         }
       };
     }
 
+    // LIST response (GLOBAL rules apply)
+    if (toolResult.kind === 'list') {
+      const ex = toolResult.ex;
+      if (ex && ex.ok === false) {
+        return {
+          ok: false,
+          answer: debugAI
+            ? `SQL failed: ${safeStr(ex.error)}${ex.detail ? `: ${safeStr(ex.detail)}` : ''}\nSQL:\n${safeStr(ex.sql)}`
+            : 'Query failed.',
+          meta: { aiUsed: true, model: 'gpt-4.1-mini', ms: Date.now() - t0, threadId }
+        };
+      }
+
+      const rawItems = Array.isArray(toolResult.items) ? toolResult.items.map(safeStr).filter(Boolean) : [];
+      const decided = decideDefaultSort(rawItems);
+      const sortedItems = decided.sorted;
+
+      // store lastList for global followups
+      if (threadId) storeLastList(threadId, sortedItems, 0, decided.mode);
+
+      const out = renderPage(sortedItems, 0, decided.mode);
+
+      return {
+        ok: true,
+        answer: out.text,
+        meta: {
+          aiUsed: true,
+          model: 'gpt-4.1-mini',
+          ms: Date.now() - t0,
+          threadId,
+          tool: 'fv_query',
+          action: safeStr(args.action),
+          listCount: sortedItems.length,
+          sortMode: decided.mode
+        }
+      };
+    }
+
+    // fallback
+    if (threadId) applyContextDelta(threadId, { lastList: null });
     return {
       ok: true,
       answer: '(no matches)',
