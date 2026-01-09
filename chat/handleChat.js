@@ -1,22 +1,21 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-08-handleChat-sql19b-deterministic-fields-farms-rtk
+// Rev: 2026-01-08-handleChat-sql19c-deterministic-drilldown-county-like
 //
-// MAKE IT RIGHT (per Dane):
+// Fix (per Dane, real-world Morgan bug):
+// ✅ Drilldown "fields in Morgan County with HEL" can no longer return (no matches) when
+//    "HEL acres by county" shows Morgan has HEL.
+// ✅ We now match county in drilldown using BOTH:
+//    - county_key equality AND
+//    - county_norm LIKE '%token%' fallback
+//
+// Keeps:
 // ✅ Deterministic routing for FARMS/FIELDS/COUNTIES/RTK (no LLM SQL for these)
-// ✅ Stores "focus" context after every relevant answer
-// ✅ Drilldown works:
-//    - "What field in Morgan county has HEL?" => ONLY fields with helAcres > 0
-//    - After "Morgan, IL — 55 ac", followup "what field is it?" => drills down
+// ✅ Stores focus context
+// ✅ Result ops (__RESULT_OP__) + paging
+// ✅ Fallback planner retained for non-core questions
 //
-// ✅ Keeps existing:
-//    - paging followups (/chat/followups.js)
-//    - result ops on last field list (augment/sort/total) via __RESULT_OP__
-//    - did-you-mean fallback via entityResolverAI (used when fallback planner has 0 rows)
-//
-// ✅ Still keeps OpenAI SQL planner as fallback ONLY for non-core questions
-//
-// CRITICAL FIX (so it actually runs):
-// ✅ Removed duplicate function declarations (no "Identifier has already been declared")
+// CRITICAL:
+// ✅ No duplicate function declarations (module loads)
 
 'use strict';
 
@@ -27,7 +26,7 @@ import { interpretFollowup } from "./followupInterpreter.js";
 import { normalizeQuestion } from "./normalize.js";
 
 import { ensureDbFromSnapshot, getDb } from "../context/snapshot-db.js";
-import { planSql } from "./sqlPlanner.js";   // kept for fallback only
+import { planSql } from "./sqlPlanner.js";   // fallback only
 import { runSql } from "./sqlRunner.js";
 
 import { getCandidates } from "./entityCatalog.js";
@@ -101,7 +100,6 @@ function isFiniteNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// better SQL error reporting (kept)
 function formatSqlExecError(exec, planSqlText, debug) {
   const err = safeStr(exec?.error || "sql_failed");
   const detail = safeStr(exec?.detail || "");
@@ -139,7 +137,6 @@ function escSqlStr(s) {
 }
 
 function countyKeyFromNorm(countyNorm) {
-  // merge "de witt" and "dewitt"
   return (countyNorm || "").toString().toLowerCase().replace(/\s+/g, "");
 }
 
@@ -330,10 +327,28 @@ function listFieldsInCounty({ db, countyRow }) {
   return runSql({ db, sql, limitDefault: 2000 });
 }
 
-function listFieldsMetricInCounty({ db, countyRow, metric }) {
+/**
+ * ✅ FIXED: drilldown county filter is now robust.
+ * Matches county by:
+ *  - exact county_key equality OR
+ *  - county_norm LIKE '%token%' fallback
+ */
+function listFieldsMetricInCounty({ db, countyRow, metric, countyTextForLike = "" }) {
   const col = metricColumn(metric);
+
   const countyKey = escSqlStr(safeStr(countyRow?.county_key));
   const stateNorm = escSqlStr(safeStr(countyRow?.state_norm || "").toLowerCase());
+
+  const tokenRaw = safeStr(countyTextForLike || countyRow?.county || "");
+  const token = escSqlStr(tokenRaw.toLowerCase());
+
+  const countyWhere = `
+    (
+      REPLACE(fields.county_norm,' ','') = '${countyKey}'
+      OR fields.county_norm LIKE '%${token}%'
+      OR REPLACE(fields.county_norm,' ','') LIKE '%${escSqlStr(countyKeyFromNorm(tokenRaw))}%'
+    )
+  `.trim();
 
   const sql = `
     SELECT
@@ -342,7 +357,7 @@ function listFieldsMetricInCounty({ db, countyRow, metric }) {
       COALESCE(fields.${col},0) AS value
     FROM fields
     WHERE ${activeOnlyWhere("fields")}
-      AND REPLACE(fields.county_norm,' ','') = '${countyKey}'
+      AND ${countyWhere}
       ${stateNorm ? `AND fields.state_norm = '${stateNorm}'` : ""}
       AND COALESCE(fields.${col},0) > 0
     ORDER BY value DESC, fields.name_norm ASC
@@ -355,9 +370,11 @@ function listFieldsMetricInCounty({ db, countyRow, metric }) {
 function fieldInfoByNumberOrName({ db, qText }) {
   const raw = safeStr(qText);
   const num = extractFieldNumber(raw);
+
   if (num) {
     const n = parseInt(num, 10);
     const nStr = escSqlStr(num);
+
     const sql = `
       SELECT
         fields.id AS field_id,
@@ -385,6 +402,7 @@ function fieldInfoByNumberOrName({ db, qText }) {
       ORDER BY fields.field_num ASC, fields.name_norm ASC
       LIMIT 5
     `.trim();
+
     return runSql({ db, sql, limitDefault: 5 });
   }
 
@@ -739,17 +757,19 @@ export async function handleChat({
   const ctxNow = getThreadContext(tid) || {};
   const focus = ctxNow.focus || null;
 
-  // DRILLDOWN FOLLOWUP: "what field is it?" after a county drill/group focus
+  // Drilldown followup
   if (wantsDrilldownFollowup(routedQuestion) && focus && focus.module === "fields" && focus.entity?.type === "county" && focus.metric) {
-    const countyRow = resolveCountyRow({ db, countyText: focus.entity.label || focus.entity.name || "" });
+    const countyLabel = safeStr(focus.entity.label || focus.entity.name || "");
+    const countyText = countyLabel.replace(/,\s*[A-Z]{2}\b/i, "").trim();
+    const countyRow = resolveCountyRow({ db, countyText });
     if (countyRow) {
-      const ex = listFieldsMetricInCounty({ db, countyRow, metric: focus.metric });
+      const ex = listFieldsMetricInCounty({ db, countyRow, metric: focus.metric, countyTextForLike: countyText });
       if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
 
       const rows = ex.rows || [];
       const lines = rows.map(r => `• ${safeStr(r.field)} — ${fmtA(Number(r.value) || 0)} ac`).filter(Boolean);
-      const paged = pageLines({ lines, pageSize: 50 });
-      if (paged.continuation) setContinuation(tid, paged.continuation);
+      const out = pageLines({ lines, pageSize: 50 });
+      if (out.continuation) setContinuation(tid, out.continuation);
 
       storeLastResult(tid, {
         kind: "list",
@@ -769,11 +789,11 @@ export async function handleChat({
         }
       });
 
-      return { ok: true, answer: paged.text || "(no matches)", meta: { threadId: tid, routed: "det_drilldown_fields_metric", continuation: paged.continuation || null } };
+      return { ok: true, answer: out.text || "(no matches)", meta: { threadId: tid, routed: "det_drilldown_fields_metric", continuation: out.continuation || null } };
     }
   }
 
-  // LIST COUNTIES
+  // List counties
   if (wantsListCounties(routedQuestion)) {
     const ex = listCounties({ db });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
@@ -789,7 +809,7 @@ export async function handleChat({
     return { ok: true, answer: out.text, meta: { threadId: tid, routed: "det_list_counties" } };
   }
 
-  // GROUP METRIC BY COUNTY / FARM
+  // Group metric
   const metricQ = parseMetricFromText(routedQuestion);
   if (metricQ && (wantsGroupByCounty(routedQuestion) || wantsGroupByFarm(routedQuestion))) {
     const by = wantsGroupByFarm(routedQuestion) ? "farm" : "county";
@@ -805,14 +825,14 @@ export async function handleChat({
     return { ok: true, answer: out.text, meta: { threadId: tid, routed: by === "county" ? "det_group_metric_county" : "det_group_metric_farm", continuation: out.continuation || null } };
   }
 
-  // DRILLDOWN: fields in <county> with <metric> > 0
+  // Drilldown direct question: "What field in Morgan county has HEL?"
   if (wantsFieldsMetricInCounty(routedQuestion)) {
     const countyText = extractCountyPhrase(routedQuestion);
     const m = parseMetricFromText(routedQuestion);
     const countyRow = resolveCountyRow({ db, countyText });
     if (!countyRow) return { ok: true, answer: "(no matches)", meta: { threadId: tid, routed: "det_drilldown_no_county" } };
 
-    const ex = listFieldsMetricInCounty({ db, countyRow, metric: m });
+    const ex = listFieldsMetricInCounty({ db, countyRow, metric: m, countyTextForLike: countyText });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
 
     const rows = ex.rows || [];
@@ -841,7 +861,7 @@ export async function handleChat({
     return { ok: true, answer: out.text || "(no matches)", meta: { threadId: tid, routed: "det_list_fields_metric_in_county", continuation: out.continuation || null } };
   }
 
-  // LIST FIELDS IN COUNTY (generic)
+  // List fields in county
   if (wantsFieldsInCounty(routedQuestion)) {
     const countyText = extractCountyPhrase(routedQuestion);
     const countyRow = resolveCountyRow({ db, countyText });
@@ -872,7 +892,7 @@ export async function handleChat({
     return { ok: true, answer: out.text, meta: { threadId: tid, routed: "det_list_fields_in_county", continuation: out.continuation || null } };
   }
 
-  // FIELD INFO (always includes RTK)
+  // Field info
   if (wantsFieldInfo(routedQuestion) || extractFieldNumber(routedQuestion)) {
     const ex = fieldInfoByNumberOrName({ db, qText: routedQuestion });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
@@ -895,7 +915,7 @@ export async function handleChat({
     return { ok: true, answer: formatFieldCard(r0), meta: { threadId: tid, routed: "det_field_info" } };
   }
 
-  // RTK tower list/info (deterministic)
+  // RTK list/info
   if (wantsRtkTowerList(routedQuestion)) {
     const ex = listRtkTowers({ db });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
