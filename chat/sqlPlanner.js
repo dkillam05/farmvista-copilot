@@ -1,13 +1,17 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-08-sqlPlanner11-groupName-not-group
+// Rev: 2026-01-08-sqlPlanner12-drilldown-fields-metric
 //
-// Fix:
-// ✅ group_metric contract now uses alias: groupName (NOT "group" reserved word)
-// ✅ Reinforces county metric requests => intent=group_metric
+// Fix (foundation, not band-aid):
+// ✅ Adds DRILLDOWN intent: list_fields_metric
+//    - "What field in Morgan County has HEL?" => returns only fields where helAcres > 0
+//    - Also supports CRP and Tillable
+//
+// ✅ Improves county dedupe (De Witt vs DeWitt) using county_key = REPLACE(county_norm,' ','')
 //
 // Keeps:
-// ✅ field_info contract (full field card + RTK always)
-// ✅ list_counties contract (deduped by county_norm/state_norm)
+// ✅ group_metric contract uses groupName (NOT reserved "group")
+// ✅ field_info contract (full field card, RTK always)
+// ✅ list_counties contract (deduped)
 // ✅ list_fields, list_rtk_towers, rtk_tower_info strict contracts
 
 'use strict';
@@ -29,7 +33,7 @@ You are FarmVista Copilot SQL planner.
 
 Return ONLY valid JSON:
 {
-  "intent": "<one of: rtk_tower_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | group_metric | count | sum>",
+  "intent": "<one of: rtk_tower_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | group_metric | list_fields_metric | count | sum>",
   "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)",
   "targetType": "<optional: tower|farm|county|field>",
   "targetText": "<optional: the exact string user typed for the target>"
@@ -76,6 +80,11 @@ If the user asks for a metric PER COUNTY / BY COUNTY / IN EACH COUNTY, and menti
 - tillable
 - acres
 intent MUST be "group_metric" (NOT list_counties).
+
+CRITICAL DRILLDOWN RULE (NO EXCEPTIONS):
+If the user asks for FIELDS in a SPECIFIC COUNTY (or "what field ... in Morgan county") AND mentions:
+- hel OR crp OR tillable OR acres
+intent MUST be "list_fields_metric" (NOT group_metric, NOT list_fields).
 
 FIELD NUMBER:
 If user says "field 0832" or "field number 710":
@@ -140,7 +149,8 @@ INTENT CONTRACTS (MUST MATCH):
      county AS county,
      state AS state
    REQUIRED:
-   - Use GROUP BY fields.county_norm, fields.state_norm
+   - Define county_key = REPLACE(fields.county_norm,' ','')
+   - GROUP BY county_key, fields.state_norm
    - Display county/state from MIN(TRIM(fields.county)) / MIN(TRIM(fields.state))
    - Filter out blanks
    - ORDER BY LOWER(county) ASC, LOWER(state) ASC
@@ -149,7 +159,7 @@ INTENT CONTRACTS (MUST MATCH):
 6) intent="group_metric"
    PURPOSE:
      Return a metric grouped by county or by farm.
-   SQL MUST return aliases EXACT (IMPORTANT: do NOT use reserved word "group"):
+   SQL MUST return aliases EXACT:
      groupName AS groupName,
      value AS value
    REQUIRED:
@@ -158,16 +168,51 @@ INTENT CONTRACTS (MUST MATCH):
        CRP => SUM(fields.crpAcres)
        Tillable/acres => SUM(fields.tillable)
    - Determine grouping:
-       By county / per county / each county => GROUP BY fields.county_norm, fields.state_norm
+       By county / per county / each county:
+         use county_key = REPLACE(fields.county_norm,' ','')
+         GROUP BY county_key, fields.state_norm
          groupName label must be:
            CASE WHEN TRIM(COALESCE(MIN(fields.state),''))<>'' THEN MIN(TRIM(fields.county)) || ', ' || MIN(TRIM(fields.state)) ELSE MIN(TRIM(fields.county)) END
          ORDER BY LOWER(groupName) ASC
-       By farm / per farm / each farm => GROUP BY farms.name_norm
-         groupName label must be:
-           MIN(farms.name)
+       By farm / per farm / each farm:
+         GROUP BY farms.name_norm
+         groupName label must be MIN(farms.name)
          ORDER BY LOWER(groupName) ASC
    - Apply active-only filter unless include archived requested
    - LIMIT 200
+
+7) intent="list_fields_metric"   (DRILLDOWN)
+   PURPOSE:
+     List fields that contribute to a metric within a specific county (or farm).
+     Example: "What field in Morgan county has HEL?" => list fields in Morgan where helAcres > 0.
+
+   SQL MUST return aliases EXACT:
+     fields.id AS field_id,
+     fields.name AS field,
+     value AS value
+   Where value is one of:
+     fields.helAcres (HEL)
+     fields.crpAcres (CRP)
+     fields.tillable (Tillable)
+
+   REQUIRED:
+   - Apply active-only fields filter unless include archived requested
+   - Metric filter:
+       HEL => fields.helAcres > 0
+       CRP => fields.crpAcres > 0
+       Tillable/acres => fields.tillable > 0
+   - If question specifies a county (most common):
+       filter by fields.county_norm LIKE '%token%' for the county token(s)
+       ORDER BY value DESC, fields.name_norm ASC
+       LIMIT 200
+   - If question specifies a farm instead:
+       JOIN farms and filter by farms.name_norm LIKE '%token%'
+       ORDER BY value DESC, fields.name_norm ASC
+       LIMIT 200
+
+   ALSO set:
+     targetType="county" (or "farm" if farm drilldown)
+     targetText="<the county/farm text user typed>"
 `.trim();
 
   const body = {
