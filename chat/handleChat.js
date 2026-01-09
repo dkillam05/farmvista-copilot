@@ -1,12 +1,15 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-08-handleChat-sql17-county-metrics
+// Rev: 2026-01-08-handleChat-sql17a-county-metrics-sqlerr
 //
-// Fix:
+// Fix (adds only — no trimming):
+// ✅ SQL errors now include SQLite detail; if debugAI:true, also includes SQL text
+// ✅ group_metric output reads r.groupName first (safe), then falls back to r.group/r.county/r.farm/r.name
+//
+// Keeps:
 // ✅ intent=list_counties now prints a deduped county list (De Witt vs DeWitt merged by planner SQL)
 // ✅ intent=group_metric now prints "Group — ### ac" (HEL/CRP/Tillable per county/farm)
 // ✅ group_metric output is paged and supports "total" followup via continuation acres lines
 //
-// Keeps:
 // ✅ field_info full card (RTK always included)
 // ✅ list_fields paging + lastResult store for augment/sort/total
 // ✅ list_rtk_towers output ALWAYS A–Z
@@ -74,6 +77,17 @@ function buildInList(ids) {
 function fmtA(n) {
   const v = Number(n) || 0;
   return v.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+// NEW: better SQL error reporting (additive)
+function formatSqlExecError(exec, planSqlText, debug) {
+  const err = safeStr(exec?.error || "sql_failed");
+  const detail = safeStr(exec?.detail || "");
+  const sql = safeStr(exec?.sql || planSqlText || "");
+  const lines = [];
+  lines.push(`SQL failed: ${err}${detail ? `: ${detail}` : ""}`);
+  if (debug && sql) lines.push(`SQL:\n${sql}`);
+  return lines.join("\n");
 }
 
 function runAugmentFields({ db, last, metric, sortMode }) {
@@ -382,7 +396,15 @@ export async function handleChat({
   if (!plan.ok) return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
 
   const exec = runSql({ db, sql: plan.sql, limitDefault: 80 });
-  if (!exec.ok) return { ok: false, answer: `SQL failed: ${exec.error}`, meta: { threadId: tid, detail: exec.detail || "" } };
+
+  // CHANGED: better SQL error reporting (additive)
+  if (!exec.ok) {
+    return {
+      ok: false,
+      answer: formatSqlExecError(exec, plan.sql, debug),
+      meta: { threadId: tid, detail: exec.detail || "", sql: debug ? (exec.sql || plan.sql || "") : "" }
+    };
+  }
 
   let rows = exec.rows || [];
 
@@ -449,7 +471,8 @@ export async function handleChat({
   // ✅ group_metric output (HEL/CRP/Tillable per county/farm)
   if (plan.intent === "group_metric") {
     const linesRaw = rows.map(r => {
-      const g = safeStr(r.group || r.name || r.county || r.farm || "");
+      // CHANGED: accept groupName first (safe), then fallbacks
+      const g = safeStr(r.groupName || r.group || r.name || r.county || r.farm || "");
       const v = Number(r.value);
       const n = Number.isFinite(v) ? v : 0;
       return `• ${g} — ${fmtA(n)} ac`;
@@ -519,7 +542,7 @@ export async function handleChat({
 
   const outLines = [];
   for (const r of rows.slice(0, 25)) {
-    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? r.group ?? "").toString().trim();
+    const any = (r.label ?? r.name ?? r.field ?? r.farm ?? r.county ?? r.tower ?? r.groupName ?? r.group ?? "").toString().trim();
     if (any) outLines.push(`• ${any}`);
   }
   return { ok: true, answer: outLines.length ? outLines.join("\n") : "(no matches)", meta: { threadId: tid } };
