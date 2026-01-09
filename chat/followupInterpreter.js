@@ -1,18 +1,14 @@
 // /chat/followupInterpreter.js  (FULL FILE)
-// Rev: 2026-01-06-followupInterpreter12-resultops-global
+// Rev: 2026-01-08-followupInterpreter13-drilldown
 //
-// Global follow-up interpreter (deterministic).
-// Paging ("more", "show all") is handled by /chat/followups.js.
+// Fix (foundation):
+// ✅ Adds deterministic drilldown followup:
+//    If last context indicates metric-by-county and user asks "what field is it? / which field(s)?",
+//    rewrite to "List fields in <County> County with <Metric> acres"
+//    (Planner will route to intent=list_fields_metric)
 //
-// Adds (B - full generic):
-// ✅ If ctx.lastResult exists, interpret common followups as a RESULT OP:
-//    - "include hel acres" / "include tillable acres" / "include acres"
-//    - "total those acres" / "sum those" / "total them"
-//    - "largest first" / "smallest first" / "A-Z"
-//    - "no acres" / "remove acres"
-// These do NOT re-query from scratch; they operate on the previous result set.
-//
-// Keeps your existing long followup rules intact.
+// Keeps:
+// ✅ Existing result ops + list followups intact.
 
 'use strict';
 
@@ -140,6 +136,32 @@ function buildTowerFieldsQuestion(towerName, withTillable) {
 }
 
 /* ===========================
+   NEW: Drilldown followups
+=========================== */
+
+function wantsFieldsDrilldown(q) {
+  const s = norm(q);
+  if (!s) return false;
+  // very common followups after a summary like "Morgan, IL — 55 ac"
+  if (s === "what field is it" || s === "what field is that" || s === "which field is it") return true;
+  if (s.includes("what field")) return true;
+  if (s.includes("which field")) return true;
+  if (s.includes("which fields")) return true;
+  if (s.includes("what fields")) return true;
+  if (s.includes("tell me the field")) return true;
+  if (s.includes("tell me what field")) return true;
+  return false;
+}
+
+function metricLabel(metric) {
+  const m = (metric || "").toString().toLowerCase();
+  if (m === "hel") return "HEL";
+  if (m === "crp") return "CRP";
+  if (m === "tillable") return "tillable";
+  return "";
+}
+
+/* ===========================
    NEW: Result Ops (global)
 =========================== */
 
@@ -178,20 +200,14 @@ function requestedMetric(q) {
 
 function wantsIncludeMetric(q) {
   const s = norm(q);
-  // “include X acres” / “with X”
   if (s.includes("include") || s.includes("including") || s.includes("with")) {
     const m = requestedMetric(s);
     if (m) return m;
   }
-  // “include acres” (default to lastResult.metric or tillable)
   if (s.includes("include acres") || s.includes("including acres") || s.includes("with acres")) return "tillable";
   return "";
 }
 
-/**
- * Special internal rewrite marker:
- * - handleChat will detect rewriteQuestion === "__RESULT_OP__" and run op on ctx.lastResult.
- */
 function resultOp(rewrite, delta) {
   return { rewriteQuestion: "__RESULT_OP__", contextDelta: { resultOp: { ...(delta || {}) }, _resultOpFor: rewrite || "" } };
 }
@@ -236,31 +252,44 @@ export function interpretFollowup({ question, ctx }) {
   const lastEntity = c.lastEntity || null;
   const lastScope = c.lastScope || {};
 
+  // ✅ DRILLDOWN: if last answer was metric-by-county and user asks "what field is it?"
+  // This is the missing "conversation glue".
+  if (
+    wantsFieldsDrilldown(q) &&
+    lastEntity &&
+    lastEntity.type === "county" &&
+    (lastIntent === "group_metric" || lastBy === "county") &&
+    (lastMetric === "hel" || lastMetric === "crp" || lastMetric === "tillable")
+  ) {
+    const countyName = (lastEntity.name || "").toString().trim().replace(/,\s*[A-Z]{2}\b/i, "").trim();
+    const ml = metricLabel(lastMetric) || lastMetric.toUpperCase();
+    const rq = `List fields in ${countyName} County with ${ml} acres`;
+    return {
+      rewriteQuestion: rq,
+      contextDelta: { lastIntent: "drilldown_fields_metric", lastBy: "county", lastMetric: lastMetric || null }
+    };
+  }
+
   // ✅ RESULT OPS FIRST: if we have a lastResult, interpret common “operate on this list” commands
   if (hasLastResult(c)) {
-    // include archived / active only changes result scope (future-safe)
     if (wantsIncludeArchived(q) || wantsActiveOnly(q)) {
       return resultOp("scope", { op: "scope", includeArchived: wantsIncludeArchived(q) ? true : false });
     }
 
-    // include metric column
     const m = wantsIncludeMetric(q);
     if (m) {
       return resultOp("augment", { op: "augment", metric: m });
     }
 
-    // remove metric column
     if (wantsNoAcres(q)) {
       return resultOp("strip_metric", { op: "strip_metric" });
     }
 
-    // totals
     if (wantsTotalFollowup(q)) {
       const mm = requestedMetric(q) || c.lastResult.metric || "tillable";
       return resultOp("total", { op: "total", metric: mm });
     }
 
-    // sort mode
     if (wantsSortLargest(q)) return resultOp("sort", { op: "sort", mode: "largest" });
     if (wantsSortSmallest(q)) return resultOp("sort", { op: "sort", mode: "smallest" });
     if (wantsSortAZ(q)) return resultOp("sort", { op: "sort", mode: "az" });
