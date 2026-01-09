@@ -1,9 +1,18 @@
 // /chat/conversationStore.js  (FULL FILE)
-// Rev: 2026-01-03-conversationStore1
+// Rev: 2026-01-09-conversationStore2-aliases
 //
 // Global per-thread conversation context (12h TTL).
 // Stores one context object per threadId.
 // This is deterministic memory (NOT AI).
+//
+// Adds (non-breaking):
+// ✅ Aliases for simpler callers:
+//    - getThread()  -> getThreadContext()
+//    - setThread()  -> setThreadContext()
+//    - clearThread()-> clearThreadContext()
+//
+// Keeps:
+// ✅ deepClone / deepMerge / applyContextDelta semantics unchanged
 
 'use strict';
 
@@ -75,4 +84,20 @@ export function clearThreadContext(threadId) {
   const id = (threadId || "").toString().trim();
   if (!id) return;
   STORE.delete(id);
+}
+
+/* =========================================================
+   Compatibility aliases (non-breaking)
+========================================================= */
+
+export function getThread(threadId) {
+  return getThreadContext(threadId);
+}
+
+export function setThread(threadId, data) {
+  return setThreadContext(threadId, data);
+}
+
+export function clearThread(threadId) {
+  return clearThreadContext(threadId);
 }
