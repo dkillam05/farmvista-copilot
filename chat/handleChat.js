@@ -31,6 +31,7 @@ import { runSql } from "./sqlRunner.js";
 
 import { getCandidates } from "./entityCatalog.js";
 import { resolveEntityWithOpenAI } from "./entityResolverAI.js";
+import { resolveEntity, resolveAny } from "./entityResolver.js";
 
 /* ===========================
    Small utils
