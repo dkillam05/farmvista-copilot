@@ -1,28 +1,22 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-08-handleChat-sql19-deterministic-fields-farms-rtk
+// Rev: 2026-01-08-handleChat-sql19b-deterministic-fields-farms-rtk
 //
 // MAKE IT RIGHT (per Dane):
 // ✅ Deterministic routing for FARMS/FIELDS/COUNTIES/RTK (no LLM SQL for these)
-// ✅ Stores "focus" context after every relevant answer:
-//    - focus.module ("fields" | "rtk" | "farms")
-//    - focus.entity (county/farm/tower/field)
-//    - focus.metric ("hel" | "crp" | "tillable")
-//    - focus.operation ("list" | "group" | "detail" | "drilldown")
-//
+// ✅ Stores "focus" context after every relevant answer
 // ✅ Drilldown works:
-//    - "What field in Morgan county has HEL?" => returns ONLY fields with helAcres > 0
+//    - "What field in Morgan county has HEL?" => ONLY fields with helAcres > 0
 //    - After "Morgan, IL — 55 ac", followup "what field is it?" => drills down
 //
-// ✅ Still keeps existing:
+// ✅ Keeps existing:
 //    - paging followups (/chat/followups.js)
 //    - result ops on last field list (augment/sort/total) via __RESULT_OP__
-//    - did-you-mean fallback via entityResolverAI (used when deterministic route has no matches)
+//    - did-you-mean fallback via entityResolverAI (used when fallback planner has 0 rows)
 //
 // ✅ Still keeps OpenAI SQL planner as fallback ONLY for non-core questions
 //
-// Notes:
-// - This file is intentionally LONGER (adds code; does not trim existing behaviors).
-// - All SQL is templates; OpenAI does NOT generate SQL for farms/fields/rtk anymore.
+// CRITICAL FIX (so it actually runs):
+// ✅ Removed duplicate function declarations (no "Identifier has already been declared")
 
 'use strict';
 
@@ -107,7 +101,7 @@ function isFiniteNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// NEW: better SQL error reporting (kept from your previous rev)
+// better SQL error reporting (kept)
 function formatSqlExecError(exec, planSqlText, debug) {
   const err = safeStr(exec?.error || "sql_failed");
   const detail = safeStr(exec?.detail || "");
@@ -116,6 +110,20 @@ function formatSqlExecError(exec, planSqlText, debug) {
   lines.push(`SQL failed: ${err}${detail ? `: ${detail}` : ""}`);
   if (debug && sql) lines.push(`SQL:\n${sql}`);
   return lines.join("\n");
+}
+
+function dedupeLines(lines) {
+  const out = [];
+  const seen = new Set();
+  for (const ln of (lines || [])) {
+    const s = safeStr(ln);
+    if (!s) continue;
+    const k = norm(s).replace(/\s+/g, " ");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
 }
 
 /* ===========================
@@ -137,8 +145,7 @@ function countyKeyFromNorm(countyNorm) {
 
 function parseMetricFromText(q) {
   const s = norm(q);
-  if (s.includes(" hel")) return "hel";
-  if (s.includes("hel ")) return "hel";
+  if (s.includes("hel")) return "hel";
   if (s.includes("crp")) return "crp";
   if (s.includes("tillable")) return "tillable";
   if (s.includes("acres")) return "tillable";
@@ -157,7 +164,7 @@ function wantsGroupByFarm(q) {
 
 function wantsListCounties(q) {
   const s = norm(q);
-  return s.includes("list") && s.includes("count") && s.includes("counties");
+  return (s.includes("list") || s.includes("show") || s.includes("give me")) && s.includes("count") && s.includes("counties");
 }
 
 function wantsRtkTowerList(q) {
@@ -168,12 +175,10 @@ function wantsRtkTowerList(q) {
 function wantsRtkTowerInfo(q) {
   const s = norm(q);
   if (!(s.includes("rtk") && s.includes("tower"))) return false;
-  // if asking freq/network/info, it's info not list
   return s.includes("frequency") || s.includes("mhz") || s.includes("network") || s.includes("info") || s.includes("information") || s.includes("details");
 }
 
 function extractCountyPhrase(q) {
-  // Find "<name> county" (best effort)
   const m = safeStr(q).match(/\b([A-Za-z][A-Za-z\s.'-]{1,40})\s+county\b/i);
   return m ? safeStr(m[1]) : "";
 }
@@ -229,7 +234,6 @@ function resolveCountyRow({ db, countyText }) {
   const ct = safeStr(countyText);
   if (!ct) return null;
 
-  // try county_norm LIKE token; also merge spaces via county_key
   const token = escSqlStr(ct.toLowerCase());
   const tokenKey = escSqlStr(countyKeyFromNorm(ct));
 
@@ -251,8 +255,6 @@ function resolveCountyRow({ db, countyText }) {
   if (!ex.ok) return null;
   const rows = ex.rows || [];
   if (!rows.length) return null;
-
-  // If multiple, pick first alphabetically (deterministic). For counties that’s acceptable.
   return rows[0];
 }
 
@@ -310,9 +312,8 @@ function groupMetricByFarm({ db, metric }) {
 }
 
 function listFieldsInCounty({ db, countyRow }) {
-  const county = escSqlStr(safeStr(countyRow?.county));
-  const stateNorm = escSqlStr(safeStr(countyRow?.state_norm || "").toLowerCase());
   const countyKey = escSqlStr(safeStr(countyRow?.county_key));
+  const stateNorm = escSqlStr(safeStr(countyRow?.state_norm || "").toLowerCase());
 
   const sql = `
     SELECT
@@ -387,7 +388,6 @@ function fieldInfoByNumberOrName({ db, qText }) {
     return runSql({ db, sql, limitDefault: 5 });
   }
 
-  // name search (no number): token LIKE, alphabetic, LIMIT 10
   const tokens = raw.toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/).map(s => s.trim()).filter(Boolean);
   const keyTokens = tokens.filter(t => t.length >= 2).slice(0, 6);
   if (!keyTokens.length) return { ok: true, rows: [] };
@@ -483,7 +483,6 @@ function formatFieldCard(r0) {
   out.push(`HEL: ${helN != null ? fmtA(helN) : "0"} ac`);
   out.push(`CRP: ${crpN != null ? fmtA(crpN) : "0"} ac`);
 
-  // RTK ALWAYS
   out.push(`RTK tower: ${rtkTower || "(none)"}`);
   out.push(`Frequency: ${freq ? `${freq} MHz` : "(unknown)"}`);
   out.push(`Network ID: ${net || "(unknown)"}`);
@@ -492,22 +491,8 @@ function formatFieldCard(r0) {
   return out.join("\n");
 }
 
-function dedupeLines(lines) {
-  const out = [];
-  const seen = new Set();
-  for (const ln of (lines || [])) {
-    const s = safeStr(ln);
-    if (!s) continue;
-    const k = norm(s).replace(/\s+/g, " ");
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(s);
-  }
-  return out;
-}
-
 /* ===========================
-   did-you-mean (kept)
+   did-you-mean (fallback planner only)
 =========================== */
 async function tryDidYouMean({ db, plan, userText, debug }) {
   const tType = safeStr(plan?.targetType || "");
@@ -678,7 +663,7 @@ export async function handleChat({
     }
   } catch { clearContinuation(tid); }
 
-  // followup interpreter (may rewrite to __RESULT_OP__ or to a clearer question)
+  // followup interpreter
   let routedQuestion = qRaw;
   try {
     const ctx0 = getThreadContext(tid) || {};
@@ -749,30 +734,32 @@ export async function handleChat({
 
   /* =========================================================
      ✅ DETERMINISTIC CORE ROUTING (FIELDS/FARMS/RTK)
-     This runs BEFORE OpenAI planning.
   ========================================================= */
 
-  // pull focus
   const ctxNow = getThreadContext(tid) || {};
   const focus = ctxNow.focus || null;
 
-  // DRILLDOWN FOLLOWUP: "what field is it?" after a county metric group
+  // DRILLDOWN FOLLOWUP: "what field is it?" after a county drill/group focus
   if (wantsDrilldownFollowup(routedQuestion) && focus && focus.module === "fields" && focus.entity?.type === "county" && focus.metric) {
     const countyRow = resolveCountyRow({ db, countyText: focus.entity.label || focus.entity.name || "" });
     if (countyRow) {
       const ex = listFieldsMetricInCounty({ db, countyRow, metric: focus.metric });
-      if (!ex.ok) {
-        return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
-      }
+      if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
+
       const rows = ex.rows || [];
       const lines = rows.map(r => `• ${safeStr(r.field)} — ${fmtA(Number(r.value) || 0)} ac`).filter(Boolean);
       const paged = pageLines({ lines, pageSize: 50 });
       if (paged.continuation) setContinuation(tid, paged.continuation);
 
-      // store lastResult for totals paging (not used for resultOps here, but good)
-      storeLastResult(tid, { kind: "list", entity: "fields", ids: rows.map(x => safeStr(x.field_id)).filter(Boolean), labels: rows.map(x => safeStr(x.field)).filter(Boolean), metric: focus.metric, metricIncluded: true });
+      storeLastResult(tid, {
+        kind: "list",
+        entity: "fields",
+        ids: rows.map(x => safeStr(x.field_id)).filter(Boolean),
+        labels: rows.map(x => safeStr(x.field)).filter(Boolean),
+        metric: focus.metric,
+        metricIncluded: true
+      });
 
-      // keep focus
       applyContextDelta(tid, {
         focus: {
           module: "fields",
@@ -786,7 +773,7 @@ export async function handleChat({
     }
   }
 
-  // LIST COUNTIES (deduped)
+  // LIST COUNTIES
   if (wantsListCounties(routedQuestion)) {
     const ex = listCounties({ db });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
@@ -797,9 +784,9 @@ export async function handleChat({
       return `• ${[c, s].filter(Boolean).join(", ")}`.trim();
     }).filter(x => x && x !== "•");
 
-    const paged = pageLines({ lines: dedupeLines(lines), pageSize: 400 });
+    const out = pageLines({ lines: dedupeLines(lines), pageSize: 400 });
     applyContextDelta(tid, { focus: { module: "fields", entity: { type: "counties", key: "all", label: "All counties" }, metric: "", operation: "list" } });
-    return { ok: true, answer: paged.text, meta: { threadId: tid, routed: "det_list_counties" } };
+    return { ok: true, answer: out.text, meta: { threadId: tid, routed: "det_list_counties" } };
   }
 
   // GROUP METRIC BY COUNTY / FARM
@@ -811,20 +798,11 @@ export async function handleChat({
 
     const rows = ex.rows || [];
     const lines = rows.map(r => `• ${safeStr(r.groupName)} — ${fmtA(Number(r.value) || 0)} ac`).filter(Boolean);
-    const paged = pageLines({ lines, pageSize: 80 });
-    if (paged.continuation) setContinuation(tid, paged.continuation);
+    const out = pageLines({ lines, pageSize: 120 });
+    if (out.continuation) setContinuation(tid, out.continuation);
 
-    // Store focus for followup drilldowns when by county
-    applyContextDelta(tid, {
-      focus: {
-        module: "fields",
-        entity: { type: by, key: "all", label: by === "county" ? "All counties" : "All farms" },
-        metric: metricQ,
-        operation: "group"
-      }
-    });
-
-    return { ok: true, answer: paged.text, meta: { threadId: tid, routed: by === "county" ? "det_group_metric_county" : "det_group_metric_farm", continuation: paged.continuation || null } };
+    applyContextDelta(tid, { focus: { module: "fields", entity: { type: by, key: "all", label: by === "county" ? "All counties" : "All farms" }, metric: metricQ, operation: "group" } });
+    return { ok: true, answer: out.text, meta: { threadId: tid, routed: by === "county" ? "det_group_metric_county" : "det_group_metric_farm", continuation: out.continuation || null } };
   }
 
   // DRILLDOWN: fields in <county> with <metric> > 0
@@ -832,21 +810,25 @@ export async function handleChat({
     const countyText = extractCountyPhrase(routedQuestion);
     const m = parseMetricFromText(routedQuestion);
     const countyRow = resolveCountyRow({ db, countyText });
-    if (!countyRow) {
-      return { ok: true, answer: "(no matches)", meta: { threadId: tid, routed: "det_drilldown_no_county" } };
-    }
+    if (!countyRow) return { ok: true, answer: "(no matches)", meta: { threadId: tid, routed: "det_drilldown_no_county" } };
+
     const ex = listFieldsMetricInCounty({ db, countyRow, metric: m });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
 
     const rows = ex.rows || [];
     const lines = rows.map(r => `• ${safeStr(r.field)} — ${fmtA(Number(r.value) || 0)} ac`).filter(Boolean);
-    const paged = pageLines({ lines, pageSize: 50 });
-    if (paged.continuation) setContinuation(tid, paged.continuation);
+    const out = pageLines({ lines, pageSize: 50 });
+    if (out.continuation) setContinuation(tid, out.continuation);
 
-    // Store lastResult to allow "total those acres" and paging followups
-    storeLastResult(tid, { kind: "list", entity: "fields", ids: rows.map(x => safeStr(x.field_id)).filter(Boolean), labels: rows.map(x => safeStr(x.field)).filter(Boolean), metric: m, metricIncluded: true });
+    storeLastResult(tid, {
+      kind: "list",
+      entity: "fields",
+      ids: rows.map(x => safeStr(x.field_id)).filter(Boolean),
+      labels: rows.map(x => safeStr(x.field)).filter(Boolean),
+      metric: m,
+      metricIncluded: true
+    });
 
-    // Store focus for followup "what field is it" etc.
     applyContextDelta(tid, {
       focus: {
         module: "fields",
@@ -856,14 +838,14 @@ export async function handleChat({
       }
     });
 
-    return { ok: true, answer: paged.text || "(no matches)", meta: { threadId: tid, routed: "det_list_fields_metric_in_county", continuation: paged.continuation || null } };
+    return { ok: true, answer: out.text || "(no matches)", meta: { threadId: tid, routed: "det_list_fields_metric_in_county", continuation: out.continuation || null } };
   }
 
   // LIST FIELDS IN COUNTY (generic)
   if (wantsFieldsInCounty(routedQuestion)) {
     const countyText = extractCountyPhrase(routedQuestion);
     const countyRow = resolveCountyRow({ db, countyText });
-    if (!countyRow) return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
+    if (!countyRow) return { ok: true, answer: "(no matches)", meta: { threadId: tid, routed: "det_list_fields_no_county" } };
 
     const ex = listFieldsInCounty({ db, countyRow });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
@@ -875,12 +857,19 @@ export async function handleChat({
     storeLastResult(tid, { kind: "list", entity: "fields", ids, labels, metric: "", metricIncluded: false });
 
     const lines = labels.map(l => `• ${l}`);
-    const paged = pageLines({ lines, pageSize: 50 });
-    if (paged.continuation) setContinuation(tid, paged.continuation);
+    const out = pageLines({ lines, pageSize: 50 });
+    if (out.continuation) setContinuation(tid, out.continuation);
 
-    applyContextDelta(tid, { focus: { module: "fields", entity: { type: "county", key: safeStr(countyRow.county_key), label: `${safeStr(countyRow.county)}, ${safeStr(countyRow.state || "IL")}`.replace(/\s*,\s*$/, "") }, metric: "", operation: "list" } });
+    applyContextDelta(tid, {
+      focus: {
+        module: "fields",
+        entity: { type: "county", key: safeStr(countyRow.county_key), label: `${safeStr(countyRow.county)}, ${safeStr(countyRow.state || "IL")}`.replace(/\s*,\s*$/, "") },
+        metric: "",
+        operation: "list"
+      }
+    });
 
-    return { ok: true, answer: paged.text, meta: { threadId: tid, routed: "det_list_fields_in_county", continuation: paged.continuation || null } };
+    return { ok: true, answer: out.text, meta: { threadId: tid, routed: "det_list_fields_in_county", continuation: out.continuation || null } };
   }
 
   // FIELD INFO (always includes RTK)
@@ -892,14 +881,13 @@ export async function handleChat({
     if (!rows.length) return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
 
     if (rows.length > 1 && !extractFieldNumber(routedQuestion)) {
-      // ambiguous name search -> list choices A–Z
       const opts = rows.map(r => safeStr(r.field)).filter(Boolean);
       const lines = opts.map(o => `• ${o}`);
-      const paged = pageLines({ lines, pageSize: 25 });
-      if (paged.continuation) setContinuation(tid, paged.continuation);
+      const out = pageLines({ lines, pageSize: 25 });
+      if (out.continuation) setContinuation(tid, out.continuation);
 
       applyContextDelta(tid, { pendingResolve: { intent: "field_info", suggestion: opts[0] } });
-      return { ok: true, answer: `I found multiple fields. Reply with the exact one:\n${paged.text}`, meta: { threadId: tid, routed: "det_field_info_ambiguous" } };
+      return { ok: true, answer: `I found multiple fields. Reply with the exact one:\n${out.text}`, meta: { threadId: tid, routed: "det_field_info_ambiguous" } };
     }
 
     const r0 = rows[0] || {};
@@ -907,19 +895,17 @@ export async function handleChat({
     return { ok: true, answer: formatFieldCard(r0), meta: { threadId: tid, routed: "det_field_info" } };
   }
 
-  // RTK tower list/info (basic deterministic)
+  // RTK tower list/info (deterministic)
   if (wantsRtkTowerList(routedQuestion)) {
     const ex = listRtkTowers({ db });
     if (!ex.ok) return { ok: false, answer: formatSqlExecError(ex, ex.sql || "", debug), meta: { threadId: tid } };
     const names = (ex.rows || []).map(r => safeStr(r.tower)).filter(Boolean);
-    const lines = names.map(n => `• ${n}`);
-    const paged = pageLines({ lines, pageSize: 200 });
+    const out = pageLines({ lines: names.map(n => `• ${n}`), pageSize: 200 });
     applyContextDelta(tid, { focus: { module: "rtk", entity: { type: "tower", key: "all", label: "All RTK towers" }, metric: "", operation: "list" } });
-    return { ok: true, answer: paged.text, meta: { threadId: tid, routed: "det_list_rtk_towers" } };
+    return { ok: true, answer: out.text, meta: { threadId: tid, routed: "det_list_rtk_towers" } };
   }
 
   if (wantsRtkTowerInfo(routedQuestion)) {
-    // naive extract: "for <tower>" or last words after "rtk tower"
     let towerText = "";
     const m = safeStr(routedQuestion).match(/rtk\s+tower\s+(info|information|details)?\s*(for\s+)?(.+)$/i);
     if (m && m[3]) towerText = safeStr(m[3]);
@@ -942,7 +928,6 @@ export async function handleChat({
 
   /* =========================================================
      FALLBACK: OpenAI planner for everything else
-     (kept, but not used for fields/farms/rtk core anymore)
   ========================================================= */
   const plan = await planSql({ question: routedQuestion, debug });
   if (!plan.ok) return { ok: false, answer: `Planner failed: ${plan?.meta?.error || "unknown"}`, meta: { threadId: tid } };
@@ -958,7 +943,6 @@ export async function handleChat({
 
   let rows = exec.rows || [];
 
-  // did-you-mean if 0 rows
   if (rows.length === 0) {
     const dy = await tryDidYouMean({ db, plan, userText: routedQuestion, debug });
     if (dy && dy.ok && dy.action === "retry" && dy.match) {
@@ -969,7 +953,6 @@ export async function handleChat({
           const ex2 = runSql({ db, sql: plan2.sql, limitDefault: 80 });
           if (ex2.ok && (ex2.rows || []).length) {
             rows = ex2.rows || [];
-            plan.intent = plan2.intent;
           } else {
             applyContextDelta(tid, { pendingResolve: { intent: plan.intent, suggestion: dy.match } });
             return { ok: true, answer: `I don’t see "${dy.targetText}". Did you mean **${dy.match}**? (reply "yes")`, meta: { threadId: tid, routed: "did_you_mean" } };
@@ -983,7 +966,6 @@ export async function handleChat({
     return { ok: true, answer: "(no matches)", meta: { threadId: tid } };
   }
 
-  // fallback default formatting
   const firstRow = rows[0] || {};
   const keys = Object.keys(firstRow || {});
   if (rows.length === 1 && keys.length === 1) return { ok: true, answer: String(firstRow[keys[0]]), meta: { threadId: tid } };
