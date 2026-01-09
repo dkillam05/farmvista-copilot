@@ -1,18 +1,19 @@
 // /chat/sqlPlanner.js  (FULL FILE)
-// Rev: 2026-01-08-sqlPlanner9-fieldinfo-contract
+// Rev: 2026-01-08-sqlPlanner10-fieldinfo+county-metrics
 //
 // Fix:
-// ✅ Add strict intent contract for field_info (full field card + RTK details ALWAYS)
-// ✅ Field number lookups: fields.field_num OR name prefix
-// ✅ Field name (non-numeric) lookups: alphabetical ORDER BY fields.name_norm ASC, LIMIT 10 (to detect ambiguity)
-// ✅ Remove need for field_rtk_info (field_info always includes RTK details)
+// ✅ Add strict intent contracts for:
+//    - field_info (full field card, ALWAYS includes RTK freq + network)
+//    - list_counties (DEDUPES "De Witt" vs "DeWitt" via county_norm/state_norm GROUP BY)
+//    - group_metric (HEL/CRP/Tillable per county or per farm, ordered A–Z)
+//
+// Critical behavior (per Dane):
+// ✅ If user asks "HEL acres in each county" / "HEL acres per county" => intent MUST be group_metric (NOT list_counties)
 //
 // Keeps:
-// ✅ list_rtk_towers MUST include ORDER BY rtkTowers.name_norm ASC
-// ✅ list_rtk_towers MUST return rtkTowers.name AS tower
-// ✅ list_fields returns field_id+field
-// ✅ force rtk_tower_info for info/details/network/frequency
-// ✅ targetType/targetText hints
+// ✅ list_rtk_towers ORDER BY rtkTowers.name_norm ASC and returns rtkTowers.name AS tower
+// ✅ list_fields returns fields.id AS field_id, fields.name AS field, ordered by field_num/name_norm
+// ✅ force rtk_tower_info for info/details/network/frequency about a tower
 
 'use strict';
 
@@ -33,7 +34,7 @@ You are FarmVista Copilot SQL planner.
 
 Return ONLY valid JSON:
 {
-  "intent": "<one of: rtk_tower_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | count | sum | group_metric>",
+  "intent": "<one of: rtk_tower_info | field_info | list_fields | list_farms | list_counties | list_rtk_towers | group_metric | count | sum>",
   "sql": "SELECT ... (SQLite dialect, SELECT-only, NO semicolon)",
   "targetType": "<optional: tower|farm|county|field>",
   "targetText": "<optional: the exact string user typed for the target>"
@@ -70,8 +71,16 @@ If the user asks for ANY of:
 - info / information / details
 - frequency / mhz
 - network id / network
-about an RTK tower,
+about an RTK tower (by tower name),
 intent MUST be "rtk_tower_info" (NOT list_rtk_towers).
+
+CRITICAL COUNTY METRIC RULE (NO EXCEPTIONS):
+If the user asks for a metric PER COUNTY / BY COUNTY / IN EACH COUNTY, and mentions any of:
+- hel
+- crp
+- tillable
+- acres
+intent MUST be "group_metric" (NOT list_counties).
 
 FIELD NUMBER:
 If user says "field 0832" or "field number 710":
@@ -123,17 +132,47 @@ INTENT CONTRACTS (MUST MATCH):
    REQUIRED:
    - Use LEFT JOIN farms and LEFT JOIN rtkTowers.
    - Apply active-only fields filter unless user explicitly requests archived/inactive.
-   - If user provides a numeric field number:
-       WHERE (fields.field_num = <num> OR fields.name_norm LIKE '<num>%' OR fields.name LIKE '<num>-%')
-       ORDER BY fields.field_num ASC, fields.name_norm ASC
-       LIMIT 1
-   - If user provides a NON-numeric name query (field has no number / user didn’t give number):
-       WHERE fields.name_norm LIKE '%token%' (AND each meaningful token)
-       ORDER BY fields.name_norm ASC
-       LIMIT 10  (to detect ambiguity; handleChat will ask user to pick if multiple)
+   - Numeric field number => LIMIT 1 and ORDER BY fields.field_num ASC, fields.name_norm ASC
+   - Non-numeric name query => ORDER BY fields.name_norm ASC and LIMIT 10
    ALSO set:
      targetType="field"
      targetText="<string the user typed for the field target>"
+
+5) intent="list_counties"   (DEDUPED)
+   PURPOSE:
+     List all counties we farm in (active fields by default), deduping "De Witt" vs "DeWitt".
+   SQL MUST return aliases EXACT:
+     county AS county,
+     state AS state
+   REQUIRED:
+   - Use GROUP BY fields.county_norm, fields.state_norm
+   - Display county/state from MIN(TRIM(fields.county)) / MIN(TRIM(fields.state))
+   - Filter out blanks
+   - ORDER BY LOWER(county) ASC, LOWER(state) ASC
+   - LIMIT 300
+
+6) intent="group_metric"
+   PURPOSE:
+     Return a metric grouped by county or by farm.
+   SQL MUST return aliases EXACT:
+     group AS group,
+     value AS value
+   REQUIRED:
+   - Determine metric column:
+       HEL => SUM(fields.helAcres)
+       CRP => SUM(fields.crpAcres)
+       Tillable/acres => SUM(fields.tillable)
+   - Determine grouping:
+       By county / per county / each county => GROUP BY fields.county_norm, fields.state_norm
+         group label must be:
+           CASE WHEN TRIM(COALESCE(MIN(fields.state),''))<>'' THEN MIN(TRIM(fields.county)) || ', ' || MIN(TRIM(fields.state)) ELSE MIN(TRIM(fields.county)) END
+         ORDER BY LOWER(group) ASC
+       By farm / per farm / each farm => GROUP BY farms.name_norm
+         group label must be:
+           MIN(farms.name)
+         ORDER BY LOWER(group) ASC
+   - Apply active-only filter unless include archived requested
+   - LIMIT 200
 `.trim();
 
   const body = {
