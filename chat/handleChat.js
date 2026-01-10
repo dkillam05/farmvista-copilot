@@ -1,10 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-10-handleChat-sqlFirst1
+// Rev: 2026-01-10-handleChat-sqlFirst2-responses-toolsfix
 //
-// RULE: Never guess about DB facts.
-// The model MUST call db_query for anything about farms/fields/towers/equipment/counts/assignments.
+// Fix:
+// ✅ OpenAI Responses API tool schema: tools[] must have top-level {type,name,description,parameters}
+// ✅ Tool call items are type "function_call" with "call_id", not "tool_call" with "id"
+// ✅ Tool outputs are type "function_call_output" with "call_id"
 //
-// Uses OpenAI Responses API via fetch (Node 20+).
+// Rule: Never guess about DB facts. MUST call db_query for DB questions.
 
 'use strict';
 
@@ -15,9 +17,7 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString();
 
-function safeStr(v) {
-  return (v == null ? "" : String(v));
-}
+function safeStr(v) { return (v == null ? "" : String(v)); }
 
 function jsonTryParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -44,18 +44,12 @@ async function openaiResponsesCreate(payload) {
   return data;
 }
 
-function extractToolCalls(responseJson) {
-  // Responses API: output is array of items; tool calls have type === "tool_call"
-  const out = [];
+function extractFunctionCalls(responseJson) {
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
-  for (const it of items) {
-    if (it?.type === "tool_call") out.push(it);
-  }
-  return out;
+  return items.filter(it => it && it.type === "function_call");
 }
 
 function outputText(responseJson) {
-  // Most convenient: output_text
   return safeStr(responseJson?.output_text || "");
 }
 
@@ -98,51 +92,58 @@ export async function handleChatHttp(req, res) {
       return res.status(400).json({ ok: false, error: "missing_text" });
     }
 
+    // Responses API tool schema: name is TOP-LEVEL (not nested)
+    // https://platform.openai.com/docs/guides/function-calling :contentReference[oaicite:1]{index=1}
     const tools = [
       {
         type: "function",
-        function: {
-          name: "db_query",
-          description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database.",
-          parameters: {
-            type: "object",
-            properties: {
-              sql: { type: "string" },
-              params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
-              limit: { type: "number" }
-            },
-            required: ["sql"]
-          }
+        name: "db_query",
+        description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database.",
+        parameters: {
+          type: "object",
+          properties: {
+            sql: { type: "string" },
+            params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
+            limit: { type: "number" }
+          },
+          required: ["sql"]
         }
       }
     ];
 
     const system = buildSystemPrompt(dbStatus);
+    const userContent = threadId ? `threadId=${threadId}\n\n${userText}` : userText;
 
-    // 1) Initial OpenAI call
+    // Keep a running input list like the docs show
+    const input_list = [
+      { role: "system", content: system },
+      { role: "user", content: userContent }
+    ];
+
+    // 1) Initial model call
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
-      input: [
-        { role: "system", content: system },
-        // threadId is optional – we pass it in content to help the model keep continuity if you later add storage
-        { role: "user", content: threadId ? `threadId=${threadId}\n\n${userText}` : userText }
-      ],
       tools,
-      // keep it deterministic
+      input: input_list,
       temperature: 0.2
     });
 
+    // Append model output items to the running input
+    if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
+
     // 2) Tool-call loop
     for (let i = 0; i < 8; i++) {
-      const toolCalls = extractToolCalls(rsp);
-      if (!toolCalls.length) break;
+      const calls = extractFunctionCalls(rsp);
+      if (!calls.length) break;
 
-      const toolOutputs = [];
+      let any = false;
 
-      for (const tc of toolCalls) {
-        if (tc?.name !== "db_query") continue;
+      for (const call of calls) {
+        if (call?.name !== "db_query") continue;
 
-        const args = jsonTryParse(tc.arguments) || {};
+        any = true;
+
+        const args = jsonTryParse(call.arguments) || {};
         const sql = safeStr(args.sql || "");
         const params = Array.isArray(args.params) ? args.params : [];
         const limit = Number.isFinite(args.limit) ? args.limit : 200;
@@ -154,30 +155,28 @@ export async function handleChatHttp(req, res) {
           result = { ok: false, error: e?.message || String(e) };
         }
 
-        toolOutputs.push({
-          type: "tool_output",
-          tool_call_id: tc.id,
+        // Provide function call output back to model
+        input_list.push({
+          type: "function_call_output",
+          call_id: call.call_id,
           output: JSON.stringify(result)
         });
       }
 
+      if (!any) break;
+
       rsp = await openaiResponsesCreate({
         model: OPENAI_MODEL,
-        input: [
-          { role: "system", content: system },
-          { role: "user", content: threadId ? `threadId=${threadId}\n\n${userText}` : userText },
-          // Provide prior model output + tool outputs back to continue reasoning
-          ...(Array.isArray(rsp.output) ? rsp.output : []),
-          ...toolOutputs
-        ],
         tools,
+        input: input_list,
         temperature: 0.2
       });
+
+      if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
     }
 
     const text = outputText(rsp).trim() || "No answer.";
 
-    // Debug footer metadata
     const meta = {
       usedOpenAI: true,
       model: OPENAI_MODEL,
