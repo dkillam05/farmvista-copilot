@@ -1,9 +1,12 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-10-snapshotBuild-firestore2sqlite2-fillTowerName
+// Rev: 2026-01-10-snapshotBuild-firestore2sqlite3-fillFarmName-mapTillable-frequencyMHz
 //
 // Builds SQLite snapshot from Firestore and uploads to GCS.
-// Change:
-// ✅ Populate fields.rtkTowerName by joining rtkTowerId -> rtkTowers.name during build
+// Changes from your current file:
+// ✅ Populate fields.farmName by joining farmId -> farms.name during build (so "by farm" works)
+// ✅ Map acresTillable from Firestore field.tillable (your real key), with fallbacks
+// ✅ Map RTK frequency from frequencyMHz into the "frequency" column (keeps existing fallbacks)
+// ✅ Keep your existing towerId -> rtkTowerName join fill
 
 'use strict';
 
@@ -169,12 +172,19 @@ export async function buildSnapshotToSqlite() {
     data: JSON.stringify(d)
   }));
 
+  // ✅ Build farmId -> farmName map (for join fill into fields.farmName)
+  const farmNameById = new Map();
+  for (const f of farms) {
+    if (f?.id) farmNameById.set(f.id, f.name || "");
+  }
+
   // RTK towers
   const rtkTowers = await fetchAllDocs(firestore, "rtkTowers", (id, d) => ({
     id,
     name: norm(d.name || d.towerName || ""),
-    networkId: norm(d.networkId || d.netId || ""),
-    frequency: norm(d.frequency || d.freq || ""),
+    networkId: norm(d.networkId ?? d.netId ?? ""),
+    // ✅ Your data uses frequencyMHz; store it into "frequency" too
+    frequency: norm(d.frequency ?? d.freq ?? d.frequencyMHz ?? ""),
     provider: norm(d.provider || d.networkProvider || ""),
     data: JSON.stringify(d)
   }));
@@ -185,22 +195,30 @@ export async function buildSnapshotToSqlite() {
     if (t?.id) towerNameById.set(t.id, t.name || "");
   }
 
-  // Fields (fill rtkTowerName from tower map if missing)
+  // Fields (fill rtkTowerName + farmName from maps; map acresTillable from "tillable")
   const fields = await fetchAllDocs(firestore, "fields", (id, d) => {
     const rtkTowerId = norm(d.rtkTowerId || d.rtkId || "");
-    const existingName = norm(d.rtkTowerName || d.rtkName || "");
-    const joinedName = existingName || (rtkTowerId ? (towerNameById.get(rtkTowerId) || "") : "");
+    const existingTowerName = norm(d.rtkTowerName || d.rtkName || "");
+    const joinedTowerName = existingTowerName || (rtkTowerId ? (towerNameById.get(rtkTowerId) || "") : "");
+
+    const farmId = norm(d.farmId || "");
+    const existingFarmName = norm(d.farmName || "");
+    const joinedFarmName = existingFarmName || (farmId ? (farmNameById.get(farmId) || "") : "");
+
+    // ✅ Your real key is "tillable"
+    const acresTillable =
+      numOrNull(d.tillable ?? d.acresTillable ?? d.tillableAcres ?? d.acres ?? null);
 
     return {
       id,
       name: norm(d.name || d.fieldName || ""),
-      farmId: norm(d.farmId || ""),
-      farmName: norm(d.farmName || ""),
+      farmId,
+      farmName: joinedFarmName,
       rtkTowerId,
-      rtkTowerName: joinedName,
+      rtkTowerName: joinedTowerName,
       county: norm(d.county || ""),
       state: norm(d.state || ""),
-      acresTillable: numOrNull(d.acresTillable ?? d.tillableAcres ?? d.acres ?? null),
+      acresTillable,
       archived: boolOrNull(d.archived ?? d.isArchived ?? d.inactive ?? null),
       data: JSON.stringify(d)
     };
