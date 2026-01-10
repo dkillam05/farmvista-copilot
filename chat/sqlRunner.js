@@ -1,58 +1,88 @@
 // /chat/sqlRunner.js  (FULL FILE)
-// Rev: 2026-01-06-sqlRunner1
+// Rev: 2026-01-10-sqlRunner-guardrails1
 //
-// Executes SELECT-only SQL against better-sqlite3 DB.
-// Enforces safety:
-// - SELECT only
-// - no semicolons
-// - no PRAGMA/ATTACH/INSERT/UPDATE/DELETE/DROP
-// - ensures a LIMIT exists (adds LIMIT 80 if missing)
+// Read-only SQL runner with hard guardrails:
+// ✅ SELECT only
+// ✅ no multi-statement
+// ✅ blocks PRAGMA/ATTACH/INSERT/UPDATE/etc
+// ✅ enforces a LIMIT if missing
+// ✅ returns rows + rowCount
 
 'use strict';
 
-function safeStr(v) { return (v == null ? "" : String(v)).trim(); }
+import { getDb } from "../context/snapshot-db.js";
 
-function isSelectOnly(sql) {
-  const s = safeStr(sql).toLowerCase();
-  if (!s) return false;
+function bad(msg) {
+  const e = new Error(msg);
+  e.code = "sql_guardrail";
+  return e;
+}
 
-  if (s.includes(";")) return false;
+function normalizeSql(sql) {
+  return (sql || "").toString().trim();
+}
 
-  // must start with SELECT or WITH ... SELECT
-  if (!(s.startsWith("select") || s.startsWith("with"))) return false;
+function isSafeSelect(sqlLower) {
+  if (!sqlLower.startsWith("select")) return false;
 
-  // block dangerous keywords
-  const bad = ["pragma", "attach", "detach", "insert", "update", "delete", "drop", "alter", "create", "replace", "vacuum"];
-  for (const k of bad) {
-    if (s.includes(k + " ")) return false;
+  // Block known risky statements/keywords (even if buried)
+  const blocked = [
+    "pragma",
+    "attach",
+    "detach",
+    "insert",
+    "update",
+    "delete",
+    "drop",
+    "alter",
+    "create",
+    "replace",
+    "vacuum",
+    "reindex",
+    "analyze",
+    "load_extension"
+  ];
+
+  for (const b of blocked) {
+    if (sqlLower.includes(b)) return false;
   }
 
   return true;
 }
 
-function ensureLimit(sql, n = 80) {
-  const s = safeStr(sql);
-  if (!s) return s;
-  const low = s.toLowerCase();
-  if (low.includes(" limit ")) return s;
-  return `${s} LIMIT ${Math.max(1, Math.min(200, Number(n) || 80))}`;
+function hasLimit(sqlLower) {
+  // simplistic but effective
+  return /\blimit\b\s+\d+/i.test(sqlLower);
 }
 
-export function runSql({ db, sql, limitDefault = 80 }) {
-  if (!db) return { ok: false, error: "db_not_ready", rows: [] };
+function enforceLimit(sql, limit) {
+  const s = normalizeSql(sql);
+  const low = s.toLowerCase();
+  if (hasLimit(low)) return s;
+  return `${s}\nLIMIT ${Math.max(1, Math.min(Number(limit || 200), 1000))}`;
+}
 
-  const raw = safeStr(sql);
-  if (!raw) return { ok: false, error: "missing_sql", rows: [] };
+export function runSql({ sql, params = [], limit = 200 }) {
+  const raw = normalizeSql(sql);
+  if (!raw) throw bad("Empty SQL");
 
-  if (!isSelectOnly(raw)) return { ok: false, error: "sql_not_allowed", rows: [] };
+  if (raw.includes(";")) throw bad("Multi-statement SQL is not allowed");
 
-  const finalSql = ensureLimit(raw, limitDefault);
+  const low = raw.toLowerCase();
+  if (!isSafeSelect(low)) throw bad("Only safe SELECT queries are allowed");
 
-  try {
-    const stmt = db.prepare(finalSql);
-    const rows = stmt.all();
-    return { ok: true, sql: finalSql, rows: Array.isArray(rows) ? rows : [] };
-  } catch (e) {
-    return { ok: false, error: "sql_exec_failed", detail: safeStr(e?.message || e), sql: finalSql, rows: [] };
-  }
+  const finalSql = enforceLimit(raw, limit);
+
+  const db = getDb();
+  const stmt = db.prepare(finalSql);
+
+  let rows;
+  if (Array.isArray(params) && params.length) rows = stmt.all(params);
+  else rows = stmt.all();
+
+  return {
+    sql: finalSql,
+    rowCount: rows.length,
+    rows
+  };
 }
