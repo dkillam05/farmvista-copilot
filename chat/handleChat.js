@@ -1,15 +1,23 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-10-handleChat-sqlFirst3-textparse-toolchoice-required
+// Rev: 2026-01-10-handleChat-sqlFirst4-resolvers3
 //
-// Fix:
-// ✅ tool_choice:"required" so model MUST call at least one tool when tools are provided
-// ✅ robust text extraction from Responses API output items (message -> content -> output_text)
-// ✅ keeps SQL-first rule and function_call loop
+// Adds:
+// ✅ resolve_field, resolve_farm, resolve_rtk_tower tools (typos/slang)
+// ✅ SQL-first still enforced (db_query)
+// ✅ tool_choice required for the first pass
+// ✅ tool loop executes db_query + resolver tools
+//
+// Workflow encouraged:
+// resolve_* -> db_query by id -> answer OR "did you mean"
 
 'use strict';
 
 import { ensureDbReady, getDbStatus } from "../context/snapshot-db.js";
 import { runSql } from "./sqlRunner.js";
+
+import { resolveFieldTool, resolveField } from "./resolve-fields.js";
+import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
+import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString();
@@ -47,8 +55,6 @@ function extractFunctionCalls(responseJson) {
   return items.filter(it => it && it.type === "function_call");
 }
 
-// Some responses return empty output_text, but include a message item with content parts.
-// We pull assistant text out of response.output[].message.content[].output_text.text
 function extractAssistantText(responseJson) {
   const direct = safeStr(responseJson?.output_text || "").trim();
   if (direct) return direct;
@@ -58,7 +64,6 @@ function extractAssistantText(responseJson) {
 
   for (const it of items) {
     if (!it) continue;
-
     if (it.type === "message") {
       const content = Array.isArray(it.content) ? it.content : [];
       for (const c of content) {
@@ -80,11 +85,18 @@ function buildSystemPrompt(dbStatus) {
   const loadedAt = dbStatus?.snapshot?.loadedAt || null;
 
   return `
-You are FarmVista Copilot (SQL-first).
+You are FarmVista Copilot (SQL-first + fuzzy resolvers).
+
+MANDATORY WORKFLOW:
+- If user mentions a FIELD by name (even partial/typo/slang), call resolve_field(query) first.
+- If user mentions a FARM by name, call resolve_farm(query) first.
+- If user mentions an RTK TOWER by name, call resolve_rtk_tower(query) first.
+- After you get a match id, do db_query using the id to fetch final facts.
+- If resolver returns candidates but no match, respond with "Did you mean:" and list candidates.
 
 CRITICAL RULES:
-1) If the user asks about ANY factual data that would live in the FarmVista database (farms, fields, RTK towers, equipment, assignments, counts, IDs, network IDs, frequencies, locations, etc.), you MUST call db_query first. Do not guess.
-2) If db_query returns 0 rows, say "Not found in the current snapshot" and then run a second db_query to fetch closest matches using LIKE on name fields.
+1) For any factual question about the database, do not guess: use tools.
+2) Prefer resolving names -> ids via resolve_* tools, then query by id.
 3) Keep answers short and specific.
 
 DATABASE SNAPSHOT CONTEXT:
@@ -92,10 +104,10 @@ DATABASE SNAPSHOT CONTEXT:
 - loadedAt: ${loadedAt || "unknown"}
 - counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
-SQL HINTS (use these tables/columns):
-- farms: id, name
-- fields: id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, archived
-- rtkTowers: id, name, networkId, frequency, provider
+TABLES:
+- farms(id, name)
+- fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, archived)
+- rtkTowers(id, name, networkId, frequency, provider)
 `.trim();
 }
 
@@ -125,19 +137,21 @@ export async function handleChatHttp(req, res) {
           },
           required: ["sql"]
         }
-      }
+      },
+      resolveFieldTool,
+      resolveFarmTool,
+      resolveRtkTowerTool
     ];
 
     const system = buildSystemPrompt(dbStatus);
     const userContent = threadId ? `threadId=${threadId}\n\n${userText}` : userText;
 
-    // Running input list
     const input_list = [
       { role: "system", content: system },
       { role: "user", content: userContent }
     ];
 
-    // 1) Initial call — force at least one tool call when tools exist
+    // 1) First call — force at least one tool call
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -149,38 +163,51 @@ export async function handleChatHttp(req, res) {
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
     // 2) Tool-call loop
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
 
       let didAny = false;
 
       for (const call of calls) {
-        if (call?.name !== "db_query") continue;
-        didAny = true;
-
+        const name = safeStr(call?.name);
         const args = jsonTryParse(call.arguments) || {};
-        const sql = safeStr(args.sql || "");
-        const params = Array.isArray(args.params) ? args.params : [];
-        const limit = Number.isFinite(args.limit) ? args.limit : 200;
+        let result = null;
 
-        let result;
-        try {
-          result = runSql({ sql, params, limit });
-        } catch (e) {
-          result = { ok: false, error: e?.message || String(e) };
+        if (name === "db_query") {
+          didAny = true;
+          const sql = safeStr(args.sql || "");
+          const params = Array.isArray(args.params) ? args.params : [];
+          const limit = Number.isFinite(args.limit) ? args.limit : 200;
+
+          try {
+            result = runSql({ sql, params, limit });
+          } catch (e) {
+            result = { ok: false, error: e?.message || String(e) };
+          }
+        } else if (name === "resolve_field") {
+          didAny = true;
+          result = resolveField(safeStr(args.query || ""));
+        } else if (name === "resolve_farm") {
+          didAny = true;
+          result = resolveFarm(safeStr(args.query || ""));
+        } else if (name === "resolve_rtk_tower") {
+          didAny = true;
+          result = resolveRtkTower(safeStr(args.query || ""));
+        } else {
+          continue;
         }
 
         input_list.push({
           type: "function_call_output",
           call_id: call.call_id,
-          output: JSON.stringify(result)
+          output: JSON.stringify(result ?? { ok: false, error: "no_result" })
         });
       }
 
       if (!didAny) break;
 
-      // After tools, let the model respond normally (don’t require more tool calls)
+      // After tool outputs, let the model respond (auto)
       rsp = await openaiResponsesCreate({
         model: OPENAI_MODEL,
         tools,
