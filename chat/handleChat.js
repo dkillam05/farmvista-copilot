@@ -1,10 +1,11 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-10-handleChat-sqlFirst5-resolver-enforcement
+// Rev: 2026-01-10-handleChat-sqlFirst6-no-threadId-in-prompt-disambig-memory
 //
-// Fixes based on live tests:
-// ✅ If user says "tower", prefer field/tower resolvers (avoid mistakenly resolving as farm)
-// ✅ If resolve_* returns candidates, MUST respond with "Did you mean" list (never "could not find")
-// ✅ Keeps SQL-first, tool_choice required, text extraction
+// Fixes:
+// ✅ NEVER inject threadId into the user's natural-language prompt
+// ✅ Server-side disambiguation memory per threadId (yes/no followups work)
+// ✅ If resolver returns candidates (no match), backend returns "Did you mean" directly (deterministic)
+// ✅ Keeps SQL-first + resolver tools + Responses API function calling
 
 'use strict';
 
@@ -19,7 +20,11 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString();
 
+// In-memory disambiguation cache (good enough for now; Cloud Run instances may have separate memory)
+const PENDING = new Map(); // threadId -> { kind, query, candidates:[{id,name,score}], createdAt, originalQuestion }
+
 function safeStr(v) { return (v == null ? "" : String(v)); }
+function norm(s) { return safeStr(s).trim().toLowerCase(); }
 
 function jsonTryParse(s) {
   try { return JSON.parse(s); } catch { return null; }
@@ -83,8 +88,6 @@ function buildSystemPrompt(dbStatus, userText) {
   const u = (userText || "").toLowerCase();
   const mentionsTower = u.includes("tower");
   const mentionsFarm = u.includes("farm");
-
-  // Intent hint: if they say "tower" and NOT "farm", treat named entity as field/tower, not farm
   const intentHint = (mentionsTower && !mentionsFarm)
     ? "USER INTENT HINT: This question is about RTK towers/assignments. Do NOT assume the name refers to a farm."
     : "";
@@ -92,19 +95,16 @@ function buildSystemPrompt(dbStatus, userText) {
   return `
 You are FarmVista Copilot (SQL-first + fuzzy resolvers).
 
-MANDATORY RULES:
+MANDATORY WORKFLOW:
 - If user mentions a FIELD name (even partial/typo), call resolve_field(query) first.
 - If user mentions an RTK TOWER name (even partial/typo), call resolve_rtk_tower(query) first.
-- Only use resolve_farm(query) when the user clearly indicates they mean a FARM (e.g., says 'farm' or asks for farms list).
-- After you get a match id, use db_query by ID to fetch facts.
+- Only use resolve_farm(query) when the user clearly indicates they mean a FARM.
+- After you get a match id, use db_query by ID (or JOIN by id) to fetch final facts.
 
-DID-YOU-MEAN RULE (HARD):
-- If any resolve_* tool returns candidates (and match is null), you MUST respond with:
-  "Did you mean:" + candidate list (5–12 items) and ask which one.
-- Never respond "I could not find ..." if candidates were provided.
-
-SQL-FIRST RULE (HARD):
-- For all database facts, do not guess. Use tools.
+CRITICAL RULES:
+1) For any database fact, do not guess. Use tools.
+2) Prefer resolving names -> ids via resolve_* tools, then query by id.
+3) Keep answers short and specific.
 
 ${intentHint}
 
@@ -120,17 +120,69 @@ TABLES:
 `.trim();
 }
 
+function formatDidYouMean(kind, query, candidates) {
+  const lines = [];
+  lines.push(`Did you mean (${kind}):`);
+  for (const c of (candidates || []).slice(0, 8)) {
+    lines.push(`- ${c.name}`);
+  }
+  lines.push(``);
+  lines.push(`Reply with the exact name, or say "yes" to pick the first one.`);
+  return lines.join("\n");
+}
+
+function isYesLike(s) {
+  const v = norm(s);
+  return ["yes", "y", "yep", "yeah", "correct", "right", "that", "that one", "yes i did"].includes(v);
+}
+
+function isNoLike(s) {
+  const v = norm(s);
+  return ["no", "n", "nope", "nah"].includes(v);
+}
+
+function prunePending() {
+  const now = Date.now();
+  for (const [k, v] of PENDING.entries()) {
+    if (!v?.createdAt || (now - v.createdAt) > (10 * 60 * 1000)) { // 10 min TTL
+      PENDING.delete(k);
+    }
+  }
+}
+
 export async function handleChatHttp(req, res) {
   try {
+    prunePending();
+
     await ensureDbReady({ force: false });
     const dbStatus = await getDbStatus();
 
     const body = req.body || {};
-    const userText = safeStr(body.text || body.message || body.q || "").trim();
+    let userText = safeStr(body.text || body.message || body.q || "").trim();
     const debugAI = !!body.debugAI;
     const threadId = safeStr(body.threadId || "").trim();
 
     if (!userText) return res.status(400).json({ ok: false, error: "missing_text" });
+
+    // Handle follow-up "yes/no" for disambiguation without needing full conversation history
+    if (threadId && PENDING.has(threadId)) {
+      const pend = PENDING.get(threadId);
+      if (isYesLike(userText)) {
+        const top = pend?.candidates?.[0] || null;
+        if (top && pend.originalQuestion) {
+          // Replace the user's "yes" with a clarified question containing the confirmed entity
+          userText = `${pend.originalQuestion}\n\nUser confirmed: ${top.name} (id=${top.id}). Proceed using that id.`;
+          PENDING.delete(threadId);
+        }
+      } else if (isNoLike(userText)) {
+        PENDING.delete(threadId);
+        return res.json({
+          ok: true,
+          text: "Okay — tell me the exact field/farm/tower name you meant.",
+          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+        });
+      }
+    }
 
     const tools = [
       {
@@ -153,13 +205,14 @@ export async function handleChatHttp(req, res) {
     ];
 
     const system = buildSystemPrompt(dbStatus, userText);
-    const userContent = threadId ? `threadId=${threadId}\n\n${userText}` : userText;
 
+    // IMPORTANT: do NOT inject threadId into the prompt content.
     const input_list = [
       { role: "system", content: system },
-      { role: "user", content: userContent }
+      { role: "user", content: userText }
     ];
 
+    // First model call — force at least one tool call
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -170,6 +223,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
+    // Tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -186,6 +240,7 @@ export async function handleChatHttp(req, res) {
           const sql = safeStr(args.sql || "");
           const params = Array.isArray(args.params) ? args.params : [];
           const limit = Number.isFinite(args.limit) ? args.limit : 200;
+
           try {
             result = runSql({ sql, params, limit });
           } catch (e) {
@@ -194,12 +249,64 @@ export async function handleChatHttp(req, res) {
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
+
+          // If ambiguous, return deterministic "did you mean" immediately + store pending
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (threadId) {
+              PENDING.set(threadId, {
+                kind: "field",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                createdAt: Date.now(),
+                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("field", safeStr(args.query || ""), result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
         } else if (name === "resolve_farm") {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
+
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (threadId) {
+              PENDING.set(threadId, {
+                kind: "farm",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                createdAt: Date.now(),
+                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("farm", safeStr(args.query || ""), result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
         } else if (name === "resolve_rtk_tower") {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
+
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (threadId) {
+              PENDING.set(threadId, {
+                kind: "rtk tower",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                createdAt: Date.now(),
+                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("rtk tower", safeStr(args.query || ""), result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
         } else {
           continue;
         }
