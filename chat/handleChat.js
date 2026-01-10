@@ -1,14 +1,10 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-10-handleChat-sqlFirst4-resolvers3
+// Rev: 2026-01-10-handleChat-sqlFirst5-resolver-enforcement
 //
-// Adds:
-// ✅ resolve_field, resolve_farm, resolve_rtk_tower tools (typos/slang)
-// ✅ SQL-first still enforced (db_query)
-// ✅ tool_choice required for the first pass
-// ✅ tool loop executes db_query + resolver tools
-//
-// Workflow encouraged:
-// resolve_* -> db_query by id -> answer OR "did you mean"
+// Fixes based on live tests:
+// ✅ If user says "tower", prefer field/tower resolvers (avoid mistakenly resolving as farm)
+// ✅ If resolve_* returns candidates, MUST respond with "Did you mean" list (never "could not find")
+// ✅ Keeps SQL-first, tool_choice required, text extraction
 
 'use strict';
 
@@ -79,25 +75,38 @@ function extractAssistantText(responseJson) {
   return parts.join("\n").trim();
 }
 
-function buildSystemPrompt(dbStatus) {
+function buildSystemPrompt(dbStatus, userText) {
   const counts = dbStatus?.counts || {};
   const snapshotId = dbStatus?.snapshot?.id || "unknown";
   const loadedAt = dbStatus?.snapshot?.loadedAt || null;
 
+  const u = (userText || "").toLowerCase();
+  const mentionsTower = u.includes("tower");
+  const mentionsFarm = u.includes("farm");
+
+  // Intent hint: if they say "tower" and NOT "farm", treat named entity as field/tower, not farm
+  const intentHint = (mentionsTower && !mentionsFarm)
+    ? "USER INTENT HINT: This question is about RTK towers/assignments. Do NOT assume the name refers to a farm."
+    : "";
+
   return `
 You are FarmVista Copilot (SQL-first + fuzzy resolvers).
 
-MANDATORY WORKFLOW:
-- If user mentions a FIELD by name (even partial/typo/slang), call resolve_field(query) first.
-- If user mentions a FARM by name, call resolve_farm(query) first.
-- If user mentions an RTK TOWER by name, call resolve_rtk_tower(query) first.
-- After you get a match id, do db_query using the id to fetch final facts.
-- If resolver returns candidates but no match, respond with "Did you mean:" and list candidates.
+MANDATORY RULES:
+- If user mentions a FIELD name (even partial/typo), call resolve_field(query) first.
+- If user mentions an RTK TOWER name (even partial/typo), call resolve_rtk_tower(query) first.
+- Only use resolve_farm(query) when the user clearly indicates they mean a FARM (e.g., says 'farm' or asks for farms list).
+- After you get a match id, use db_query by ID to fetch facts.
 
-CRITICAL RULES:
-1) For any factual question about the database, do not guess: use tools.
-2) Prefer resolving names -> ids via resolve_* tools, then query by id.
-3) Keep answers short and specific.
+DID-YOU-MEAN RULE (HARD):
+- If any resolve_* tool returns candidates (and match is null), you MUST respond with:
+  "Did you mean:" + candidate list (5–12 items) and ask which one.
+- Never respond "I could not find ..." if candidates were provided.
+
+SQL-FIRST RULE (HARD):
+- For all database facts, do not guess. Use tools.
+
+${intentHint}
 
 DATABASE SNAPSHOT CONTEXT:
 - snapshotId: ${snapshotId}
@@ -143,7 +152,7 @@ export async function handleChatHttp(req, res) {
       resolveRtkTowerTool
     ];
 
-    const system = buildSystemPrompt(dbStatus);
+    const system = buildSystemPrompt(dbStatus, userText);
     const userContent = threadId ? `threadId=${threadId}\n\n${userText}` : userText;
 
     const input_list = [
@@ -151,7 +160,6 @@ export async function handleChatHttp(req, res) {
       { role: "user", content: userContent }
     ];
 
-    // 1) First call — force at least one tool call
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -162,7 +170,6 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // 2) Tool-call loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -179,7 +186,6 @@ export async function handleChatHttp(req, res) {
           const sql = safeStr(args.sql || "");
           const params = Array.isArray(args.params) ? args.params : [];
           const limit = Number.isFinite(args.limit) ? args.limit : 200;
-
           try {
             result = runSql({ sql, params, limit });
           } catch (e) {
@@ -207,7 +213,6 @@ export async function handleChatHttp(req, res) {
 
       if (!didAny) break;
 
-      // After tool outputs, let the model respond (auto)
       rsp = await openaiResponsesCreate({
         model: OPENAI_MODEL,
         tools,
