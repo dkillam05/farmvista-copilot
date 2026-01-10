@@ -1,318 +1,260 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-03-snapshot-build3-more-collections
+// Rev: 2026-01-10-snapshotBuild-firestore2sqlite1
 //
-// Snapshot Builder (EXPORTER)
-// --------------------------
-// Builds a single, current snapshot from Firestore and overwrites ONE fixed GCS object.
+// Builds a fresh SQLite snapshot from Firestore and uploads to GCS.
+// Intended to run daily via Cloud Scheduler -> Cloud Run -> POST /snapshot/build
 //
-// Writes:
-//   gs://<bucket>/<objectPath>   (default: copilot/snapshot.json)
+// Collections expected (minimum):
+// - farms
+// - fields
+// - rtkTowers
 //
-// Env vars (recommended):
-//   SNAPSHOT_BUCKET="dowsonfarms-illinois.firebasestorage.app"   (your actual bucket)
-//   SNAPSHOT_OBJECT="copilot/snapshot.json"
-//   SNAPSHOT_TMP_OBJECT="copilot/snapshot.tmp.json"
-//   SNAPSHOT_COLLECTIONS="..."   (optional override; if not set, uses DEFAULT_COLLECTIONS below)
-//   SNAPSHOT_LIMIT_PER_COLLECTION="0"   (0 = no limit; otherwise max docs read per collection)
+// Output to GCS:
+// bucket: FV_GCS_BUCKET
+// object: FV_GCS_OBJECT  (default copilot-snapshots/live.sqlite)
 //
-// NOTE:
-// - Adding collections here just makes the data available in snapshot.json.
-// - Nothing will use it until you build data modules + handlers.
+// Requires IAM:
+// - Cloud Run service account can read Firestore
+// - and write to the GCS bucket
 
 'use strict';
 
+import fs from "fs";
+import path from "path";
+import os from "os";
+
+import { Storage } from "@google-cloud/storage";
+import Database from "better-sqlite3";
 import admin from "firebase-admin";
-import "firebase-admin/storage";   // ✅ ensure Storage is registered (Cloud Run-safe)
+import { FieldPath } from "firebase-admin/firestore";
 
-// ✅ Default collections baked into code (used when SNAPSHOT_COLLECTIONS is not set)
-const DEFAULT_COLLECTIONS = [
-  "farms",
-  "fields",
-  "rtkTowers",
+const storage = new Storage();
 
-  // Requested additions:
-  "aerial_applications",
-  "binMovements",
-  "binSites",
-  "boundary_requests",
-  "combine_grain_loss",
-  "combine_yield",
-  "combine_yield_calibration",
-  "employees",
-  "equipment",
-  "fieldMaintenance",
-  "fieldTrials",
-  "field_crop_plans_v2",
-  "grain_bag_events",
-  "inventoryGrainBagMovements",
-  "productsChemical",
-  "productsFertilizer",
-  "productsGrainBags",
-  "productsSeed",
-  "starfireMoves",
-  "vehicleRegistrations"
-];
+const GCS_BUCKET = (process.env.FV_GCS_BUCKET || "dowsonfarms-illinois.firebasestorage.app").toString();
+const GCS_OBJECT = (process.env.FV_GCS_OBJECT || "copilot-snapshots/live.sqlite").toString();
 
-// Lazy-init Admin SDK (works in Cloud Run / Functions with ADC)
-function ensureAdmin() {
-  if (admin.apps && admin.apps.length) return;
+const PROJECT_ID = (process.env.FIREBASE_PROJECT_ID || process.env.GCLOUD_PROJECT || "").toString() || undefined;
 
-  const storageBucket =
-    (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim() ||
-    (process.env.SNAPSHOT_BUCKET || "").toString().trim() ||
-    undefined;
-
-  admin.initializeApp(storageBucket ? { storageBucket } : undefined);
+function ensureFirebase() {
+  if (admin.apps?.length) return;
+  admin.initializeApp(PROJECT_ID ? { projectId: PROJECT_ID } : {});
 }
 
-/* ---------------------------
-   JSON-safe Firestore types
----------------------------- */
-
-function isTimestampLike(v) {
-  return v && typeof v === "object" && typeof v.toDate === "function" &&
-    (typeof v.seconds === "number" || typeof v._seconds === "number");
+function norm(s) {
+  return (s || "").toString().trim();
 }
 
-function isGeoPointLike(v) {
-  return v && typeof v === "object" &&
-    typeof v.latitude === "number" && typeof v.longitude === "number";
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function isDocumentRefLike(v) {
-  return v && typeof v === "object" && typeof v.path === "string" && typeof v.id === "string";
+function boolOrNull(v) {
+  if (v === true) return 1;
+  if (v === false) return 0;
+  return null;
 }
 
-function toJsonSafe(value) {
-  if (value == null) return value;
+async function fetchAllDocs(db, collectionName, pickFn) {
+  const col = db.collection(collectionName);
 
-  const t = typeof value;
-  if (t === "string" || t === "number" || t === "boolean") return value;
-
-  if (Array.isArray(value)) return value.map(toJsonSafe);
-
-  if (isTimestampLike(value)) {
-    let sec = value.seconds;
-    let nsec = value.nanoseconds;
-    if (typeof sec !== "number") sec = value._seconds;
-    if (typeof nsec !== "number") nsec = value._nanoseconds;
-
-    let iso = null;
-    try { iso = value.toDate().toISOString(); } catch { iso = null; }
-
-    return { __type: "timestamp", seconds: sec ?? null, nanoseconds: nsec ?? null, iso };
-  }
-
-  if (isGeoPointLike(value)) {
-    return { __type: "geopoint", latitude: value.latitude, longitude: value.longitude };
-  }
-
-  if (isDocumentRefLike(value)) {
-    return { __type: "docref", path: value.path, id: value.id };
-  }
-
-  if (t === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = toJsonSafe(v);
-    return out;
-  }
-
-  try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
-}
-
-/* ---------------------------
-   Build snapshot object
----------------------------- */
-
-function getEnvCsv(name) {
-  const raw = (process.env[name] || "").toString().trim();
-  if (!raw) return null;
-  return raw.split(",").map(s => s.trim()).filter(Boolean);
-}
-
-function getEnvInt(name, fallback) {
-  const raw = (process.env[name] || "").toString().trim();
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function uniqKeepOrder(arr) {
   const out = [];
-  const seen = new Set();
-  for (const v of (arr || [])) {
-    const s = (v || "").toString().trim();
-    if (!s) continue;
-    if (seen.has(s)) continue;
-    seen.add(s);
-    out.push(s);
+  let last = null;
+
+  // Page by doc ID (stable)
+  while (true) {
+    let q = col.orderBy(FieldPath.documentId()).limit(1000);
+    if (last) q = q.startAfter(last);
+
+    const snap = await q.get();
+    if (snap.empty) break;
+
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      out.push(pickFn(doc.id, data));
+    }
+
+    last = snap.docs[snap.docs.length - 1];
+    if (snap.size < 1000) break;
   }
+
   return out;
 }
 
-export async function buildSnapshotObject() {
-  ensureAdmin();
+function createSchema(sqlite) {
+  // Farms
+  sqlite.exec(`
+    PRAGMA journal_mode=WAL;
+    PRAGMA synchronous=NORMAL;
 
-  const db = admin.firestore();
+    DROP TABLE IF EXISTS farms;
+    DROP TABLE IF EXISTS rtkTowers;
+    DROP TABLE IF EXISTS fields;
 
-  const override = getEnvCsv("SNAPSHOT_COLLECTIONS");
-  const collections = uniqKeepOrder(override && override.length ? override : DEFAULT_COLLECTIONS);
+    CREATE TABLE farms (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      data TEXT
+    );
 
-  const limitPer = getEnvInt("SNAPSHOT_LIMIT_PER_COLLECTION", 0); // 0 = unlimited
+    CREATE TABLE rtkTowers (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      networkId TEXT,
+      frequency TEXT,
+      provider TEXT,
+      data TEXT
+    );
 
-  const root = {
-    meta: {
-      builtAt: new Date().toISOString(),
-      source: "firestore",
-      collections,
-      note: "Overwritten in-place. Use builtAt to understand freshness."
-    },
-    data: {
-      __collections__: {}
+    CREATE TABLE fields (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      farmId TEXT,
+      farmName TEXT,
+      rtkTowerId TEXT,
+      rtkTowerName TEXT,
+      county TEXT,
+      state TEXT,
+      acresTillable REAL,
+      archived INTEGER,
+      data TEXT
+    );
+
+    CREATE INDEX idx_farms_name ON farms(name);
+    CREATE INDEX idx_rtk_name ON rtkTowers(name);
+    CREATE INDEX idx_fields_name ON fields(name);
+    CREATE INDEX idx_fields_farmId ON fields(farmId);
+    CREATE INDEX idx_fields_rtkTowerId ON fields(rtkTowerId);
+  `);
+}
+
+function insertRows(sqlite, table, rows) {
+  if (!rows.length) return 0;
+
+  const cols = Object.keys(rows[0]);
+  const placeholders = cols.map(() => "?").join(",");
+  const stmt = sqlite.prepare(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`);
+
+  const tx = sqlite.transaction((batch) => {
+    for (const r of batch) {
+      stmt.run(cols.map((c) => r[c]));
     }
+  });
+
+  tx(rows);
+  return rows.length;
+}
+
+async function uploadToGcs(localPath, snapshotId) {
+  const bucket = storage.bucket(GCS_BUCKET);
+  const file = bucket.file(GCS_OBJECT);
+
+  await bucket.upload(localPath, {
+    destination: GCS_OBJECT,
+    resumable: true,
+    metadata: {
+      contentType: "application/x-sqlite3",
+      metadata: {
+        snapshotId: snapshotId
+      }
+    }
+  });
+
+  const [meta] = await file.getMetadata();
+  return {
+    bucket: GCS_BUCKET,
+    object: GCS_OBJECT,
+    generation: meta?.generation || null,
+    updated: meta?.updated || null,
+    snapshotId
+  };
+}
+
+export async function buildSnapshotToSqlite() {
+  ensureFirebase();
+  const firestore = admin.firestore();
+
+  const snapshotId = `live@${new Date().toISOString()}`;
+
+  // Create temp db
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fv-sqlite-"));
+  const localPath = path.join(tmpDir, "live.sqlite");
+
+  const sqlite = new Database(localPath);
+  createSchema(sqlite);
+
+  // Load collections
+  const farms = await fetchAllDocs(firestore, "farms", (id, d) => ({
+    id,
+    name: norm(d.name || d.farmName || ""),
+    data: JSON.stringify(d)
+  }));
+
+  const rtkTowers = await fetchAllDocs(firestore, "rtkTowers", (id, d) => ({
+    id,
+    name: norm(d.name || d.towerName || ""),
+    networkId: norm(d.networkId || d.netId || ""),
+    frequency: norm(d.frequency || d.freq || ""),
+    provider: norm(d.provider || d.networkProvider || ""),
+    data: JSON.stringify(d)
+  }));
+
+  const fields = await fetchAllDocs(firestore, "fields", (id, d) => ({
+    id,
+    name: norm(d.name || d.fieldName || ""),
+    farmId: norm(d.farmId || ""),
+    farmName: norm(d.farmName || ""),
+    rtkTowerId: norm(d.rtkTowerId || d.rtkId || ""),
+    rtkTowerName: norm(d.rtkTowerName || d.rtkName || ""),
+    county: norm(d.county || ""),
+    state: norm(d.state || ""),
+    acresTillable: numOrNull(d.acresTillable ?? d.tillableAcres ?? d.acres ?? null),
+    archived: boolOrNull(d.archived ?? d.isArchived ?? d.inactive ?? null),
+    data: JSON.stringify(d)
+  }));
+
+  // Insert
+  insertRows(sqlite, "farms", farms);
+  insertRows(sqlite, "rtkTowers", rtkTowers);
+  insertRows(sqlite, "fields", fields);
+
+  // Quick counts
+  const counts = {
+    farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
+    rtkTowers: sqlite.prepare("SELECT COUNT(1) AS n FROM rtkTowers").get().n,
+    fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n
   };
 
-  const counts = {};
-  const errors = {}; // per-collection errors (won’t fail whole snapshot)
+  sqlite.close();
 
-  for (const colName of collections) {
-    try {
-      const colRef = db.collection(colName);
-      const q = limitPer > 0 ? colRef.limit(limitPer) : colRef;
-      const snap = await q.get();
+  const remote = await uploadToGcs(localPath, snapshotId);
 
-      const map = {};
-      snap.forEach(docSnap => {
-        map[docSnap.id] = toJsonSafe(docSnap.data() || {});
-      });
-
-      root.data.__collections__[colName] = map;
-      counts[colName] = Object.keys(map).length;
-    } catch (e) {
-      // Don’t fail the entire build if one collection is missing or blocked.
-      // Record error and keep going.
-      root.data.__collections__[colName] = {};
-      counts[colName] = 0;
-      errors[colName] = (e?.message || String(e)).slice(0, 400);
-    }
-  }
-
-  if (Object.keys(errors).length) {
-    root.meta.collectionErrors = errors;
-  }
-
-  return { snapshot: root, counts };
+  return {
+    ok: true,
+    snapshotId,
+    counts,
+    localPath,
+    gcs: remote
+  };
 }
-
-/* ---------------------------
-   Write snapshot to GCS
----------------------------- */
-
-function guessDefaultBucket() {
-  const projectId = (process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "").toString().trim();
-  return projectId ? `${projectId}.appspot.com` : "";
-}
-
-function getBucketName() {
-  const snapBucket = (process.env.SNAPSHOT_BUCKET || "").toString().trim();
-  const fbBucket = (process.env.FIREBASE_STORAGE_BUCKET || "").toString().trim();
-
-  if (snapBucket) return snapBucket;
-  if (fbBucket) return fbBucket;
-
-  const opt = admin.app().options || {};
-  if (opt.storageBucket) return String(opt.storageBucket);
-
-  return guessDefaultBucket();
-}
-
-export async function writeSnapshotToGcs({ snapshot, counts }) {
-  ensureAdmin();
-
-  const bucketName = getBucketName();
-
-  if (!bucketName) {
-    return {
-      ok: false,
-      error: "missing_bucket",
-      detail: "Set SNAPSHOT_BUCKET (recommended) or FIREBASE_STORAGE_BUCKET."
-    };
-  }
-
-  const objectPath = (process.env.SNAPSHOT_OBJECT || "copilot/snapshot.json").toString().trim();
-  const tmpPath = (process.env.SNAPSHOT_TMP_OBJECT || "copilot/snapshot.tmp.json").toString().trim();
-
-  const bucket = admin.storage().bucket(bucketName);
-  const body = JSON.stringify(snapshot);
-
-  try {
-    // 1) write tmp
-    const tmpFile = bucket.file(tmpPath);
-    await tmpFile.save(body, {
-      resumable: false,
-      contentType: "application/json",
-      metadata: { cacheControl: "no-store, max-age=0" }
-    });
-
-    // 2) copy tmp -> final (overwrite)
-    const finalFile = bucket.file(objectPath);
-    await tmpFile.copy(finalFile);
-
-    // 3) delete tmp (best effort)
-    try { await tmpFile.delete({ ignoreNotFound: true }); } catch {}
-
-    return {
-      ok: true,
-      bucket: bucketName,
-      objectPath,
-      builtAt: snapshot?.meta?.builtAt || null,
-      counts: counts || {}
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      error: "gcs_write_failed",
-      detail: (e?.message || String(e)).slice(0, 500),
-      bucket: bucketName,
-      objectPath,
-      tmpPath
-    };
-  }
-}
-
-/* ---------------------------
-   HTTP handler
----------------------------- */
 
 export async function buildSnapshotHttp(req, res) {
   try {
-    const { snapshot, counts } = await buildSnapshotObject();
-    const w = await writeSnapshotToGcs({ snapshot, counts });
-
-    if (!w.ok) {
-      return res.status(500).json({
-        ok: false,
-        error: w.error || "snapshot_write_failed",
-        detail: w.detail || null,
-        bucket: w.bucket || null,
-        objectPath: w.objectPath || null,
-        tmpPath: w.tmpPath || null
-      });
+    // Optional simple auth
+    const want = (process.env.FV_BUILD_TOKEN || "").toString().trim();
+    if (want) {
+      const got = (req.get("x-build-token") || "").toString().trim();
+      if (got !== want) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+      }
     }
 
-    return res.status(200).json({
-      ok: true,
-      builtAt: w.builtAt,
-      bucket: w.bucket,
-      objectPath: w.objectPath,
-      counts: w.counts,
-      collections: snapshot?.meta?.collections || [],
-      collectionErrors: snapshot?.meta?.collectionErrors || null
-    });
+    const result = await buildSnapshotToSqlite();
+    res.json(result);
   } catch (e) {
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
-      error: "snapshot_build_failed",
-      detail: (e?.message || String(e)).slice(0, 500)
+      error: e?.message || String(e)
     });
   }
 }
