@@ -1,21 +1,9 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-10-snapshotBuild-firestore2sqlite1
+// Rev: 2026-01-10-snapshotBuild-firestore2sqlite2-fillTowerName
 //
-// Builds a fresh SQLite snapshot from Firestore and uploads to GCS.
-// Intended to run daily via Cloud Scheduler -> Cloud Run -> POST /snapshot/build
-//
-// Collections expected (minimum):
-// - farms
-// - fields
-// - rtkTowers
-//
-// Output to GCS:
-// bucket: FV_GCS_BUCKET
-// object: FV_GCS_OBJECT  (default copilot-snapshots/live.sqlite)
-//
-// Requires IAM:
-// - Cloud Run service account can read Firestore
-// - and write to the GCS bucket
+// Builds SQLite snapshot from Firestore and uploads to GCS.
+// Change:
+// ✅ Populate fields.rtkTowerName by joining rtkTowerId -> rtkTowers.name during build
 
 'use strict';
 
@@ -40,9 +28,7 @@ function ensureFirebase() {
   admin.initializeApp(PROJECT_ID ? { projectId: PROJECT_ID } : {});
 }
 
-function norm(s) {
-  return (s || "").toString().trim();
-}
+function norm(s) { return (s || "").toString().trim(); }
 
 function numOrNull(v) {
   const n = Number(v);
@@ -61,7 +47,6 @@ async function fetchAllDocs(db, collectionName, pickFn) {
   const out = [];
   let last = null;
 
-  // Page by doc ID (stable)
   while (true) {
     let q = col.orderBy(FieldPath.documentId()).limit(1000);
     if (last) q = q.startAfter(last);
@@ -82,7 +67,6 @@ async function fetchAllDocs(db, collectionName, pickFn) {
 }
 
 function createSchema(sqlite) {
-  // Farms
   sqlite.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
@@ -136,9 +120,7 @@ function insertRows(sqlite, table, rows) {
   const stmt = sqlite.prepare(`INSERT INTO ${table} (${cols.join(",")}) VALUES (${placeholders})`);
 
   const tx = sqlite.transaction((batch) => {
-    for (const r of batch) {
-      stmt.run(cols.map((c) => r[c]));
-    }
+    for (const r of batch) stmt.run(cols.map((c) => r[c]));
   });
 
   tx(rows);
@@ -154,9 +136,7 @@ async function uploadToGcs(localPath, snapshotId) {
     resumable: true,
     metadata: {
       contentType: "application/x-sqlite3",
-      metadata: {
-        snapshotId: snapshotId
-      }
+      metadata: { snapshotId }
     }
   });
 
@@ -176,20 +156,20 @@ export async function buildSnapshotToSqlite() {
 
   const snapshotId = `live@${new Date().toISOString()}`;
 
-  // Create temp db
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fv-sqlite-"));
   const localPath = path.join(tmpDir, "live.sqlite");
 
   const sqlite = new Database(localPath);
   createSchema(sqlite);
 
-  // Load collections
+  // Farms
   const farms = await fetchAllDocs(firestore, "farms", (id, d) => ({
     id,
     name: norm(d.name || d.farmName || ""),
     data: JSON.stringify(d)
   }));
 
+  // RTK towers
   const rtkTowers = await fetchAllDocs(firestore, "rtkTowers", (id, d) => ({
     id,
     name: norm(d.name || d.towerName || ""),
@@ -199,26 +179,37 @@ export async function buildSnapshotToSqlite() {
     data: JSON.stringify(d)
   }));
 
-  const fields = await fetchAllDocs(firestore, "fields", (id, d) => ({
-    id,
-    name: norm(d.name || d.fieldName || ""),
-    farmId: norm(d.farmId || ""),
-    farmName: norm(d.farmName || ""),
-    rtkTowerId: norm(d.rtkTowerId || d.rtkId || ""),
-    rtkTowerName: norm(d.rtkTowerName || d.rtkName || ""),
-    county: norm(d.county || ""),
-    state: norm(d.state || ""),
-    acresTillable: numOrNull(d.acresTillable ?? d.tillableAcres ?? d.acres ?? null),
-    archived: boolOrNull(d.archived ?? d.isArchived ?? d.inactive ?? null),
-    data: JSON.stringify(d)
-  }));
+  // Build towerId -> towerName map for join fill
+  const towerNameById = new Map();
+  for (const t of rtkTowers) {
+    if (t?.id) towerNameById.set(t.id, t.name || "");
+  }
 
-  // Insert
+  // Fields (fill rtkTowerName from tower map if missing)
+  const fields = await fetchAllDocs(firestore, "fields", (id, d) => {
+    const rtkTowerId = norm(d.rtkTowerId || d.rtkId || "");
+    const existingName = norm(d.rtkTowerName || d.rtkName || "");
+    const joinedName = existingName || (rtkTowerId ? (towerNameById.get(rtkTowerId) || "") : "");
+
+    return {
+      id,
+      name: norm(d.name || d.fieldName || ""),
+      farmId: norm(d.farmId || ""),
+      farmName: norm(d.farmName || ""),
+      rtkTowerId,
+      rtkTowerName: joinedName,
+      county: norm(d.county || ""),
+      state: norm(d.state || ""),
+      acresTillable: numOrNull(d.acresTillable ?? d.tillableAcres ?? d.acres ?? null),
+      archived: boolOrNull(d.archived ?? d.isArchived ?? d.inactive ?? null),
+      data: JSON.stringify(d)
+    };
+  });
+
   insertRows(sqlite, "farms", farms);
   insertRows(sqlite, "rtkTowers", rtkTowers);
   insertRows(sqlite, "fields", fields);
 
-  // Quick counts
   const counts = {
     farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
     rtkTowers: sqlite.prepare("SELECT COUNT(1) AS n FROM rtkTowers").get().n,
@@ -229,32 +220,20 @@ export async function buildSnapshotToSqlite() {
 
   const remote = await uploadToGcs(localPath, snapshotId);
 
-  return {
-    ok: true,
-    snapshotId,
-    counts,
-    localPath,
-    gcs: remote
-  };
+  return { ok: true, snapshotId, counts, localPath, gcs: remote };
 }
 
 export async function buildSnapshotHttp(req, res) {
   try {
-    // Optional simple auth
     const want = (process.env.FV_BUILD_TOKEN || "").toString().trim();
     if (want) {
       const got = (req.get("x-build-token") || "").toString().trim();
-      if (got !== want) {
-        return res.status(401).json({ ok: false, error: "unauthorized" });
-      }
+      if (got !== want) return res.status(401).json({ ok: false, error: "unauthorized" });
     }
 
     const result = await buildSnapshotToSqlite();
     res.json(result);
   } catch (e) {
-    res.status(500).json({
-      ok: false,
-      error: e?.message || String(e)
-    });
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
