@@ -1,10 +1,10 @@
 // /chat/resolve-core.js  (FULL FILE)
-// Rev: 2026-01-10-resolve-core1
+// Rev: 2026-01-10-resolve-core2-numeric-boost-looser-confidence
 //
-// Generic fuzzy resolver core for SQLite-backed entities.
-// - Broad candidate pull via LIKE + tokenized patterns
-// - Fuzzy scoring: token overlap + normalized Levenshtein
-// - Returns either a confident match or a "did you mean" candidate list
+// Improvements:
+// ✅ Numeric/token boosts (0801, 340, etc.) -> picks the obvious field
+// ✅ Slightly looser confidence rules so typos still auto-match
+// ✅ Still returns "did you mean" list when ambiguous
 
 'use strict';
 
@@ -30,7 +30,6 @@ function tokens(s) {
 function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
 function levenshtein(a, b) {
-  // classic DP, optimized space
   a = safeStr(a); b = safeStr(b);
   const n = a.length, m = b.length;
   if (n === 0) return m;
@@ -49,9 +48,9 @@ function levenshtein(a, b) {
       const cb = b.charCodeAt(j - 1);
       const cost = (ca === cb) ? 0 : 1;
       cur[j] = Math.min(
-        prev[j] + 1,      // delete
-        cur[j - 1] + 1,   // insert
-        prev[j - 1] + cost // substitute
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + cost
       );
     }
     const tmp = prev; prev = cur; cur = tmp;
@@ -74,45 +73,58 @@ function tokenOverlapScore(query, candidate) {
 
   let hit = 0;
   for (const t of qt) if (ct.has(t)) hit++;
-
   return hit / Math.max(qt.size, ct.size);
 }
 
+function numericBoost(query, candidate) {
+  // If query includes numeric tokens (0801, 340, 77), strongly prefer candidates containing them.
+  const qt = tokens(query);
+  const cn = norm(candidate);
+
+  const nums = qt.filter(t => /^\d{2,6}$/.test(t)); // keep 2-6 digit numbers
+  if (!nums.length) return 0;
+
+  let boost = 0;
+  for (const n of nums) {
+    if (cn.includes(n)) {
+      // bigger boost for longer numbers (field codes)
+      boost += (n.length >= 4) ? 0.10 : 0.06;
+    }
+  }
+  return Math.min(0.20, boost); // cap total boost
+}
+
 function combinedScore(query, candidate) {
-  // weighted blend: spelling similarity + token overlap
   const a = normLevScore(query, candidate);
   const b = tokenOverlapScore(query, candidate);
-  // If tokens match well, reward; if query is short, lean more on lev
+  const nb = numericBoost(query, candidate);
+
   const qlen = norm(query).length;
-  const wLev = qlen < 10 ? 0.75 : 0.60;
+  const wLev = qlen < 10 ? 0.72 : 0.58;
   const wTok = 1 - wLev;
-  return clamp01((a * wLev) + (b * wTok));
+
+  return clamp01((a * wLev) + (b * wTok) + nb);
 }
 
 function buildLikeClauses(nameCol, query) {
   const t = tokens(query);
 
-  // patterns: whole query, then chunks, then tokens
   const patterns = [];
   const qn = norm(query);
   if (qn) patterns.push(`%${qn.replace(/\s+/g, "%")}%`);
 
-  // include the first 2 tokens concatenated if present
   if (t.length >= 2) patterns.push(`%${t[0]}%${t[1]}%`);
 
-  // each token
-  for (const tok of t.slice(0, 6)) {
+  for (const tok of t.slice(0, 8)) {
     if (tok.length >= 2) patterns.push(`%${tok}%`);
   }
 
-  // de-dupe
   const uniq = [];
   const seen = new Set();
   for (const p of patterns) {
     if (!seen.has(p)) { seen.add(p); uniq.push(p); }
   }
 
-  // create OR chain (lower(nameCol) LIKE ?)
   const clauses = uniq.map(() => `lower(${nameCol}) LIKE ?`).join(" OR ");
   const params = uniq.map(p => p.toLowerCase());
 
@@ -125,15 +137,12 @@ export function resolveEntity({
   nameCol = "name",
   extraCols = [],
   query,
-  limitCandidates = 60,
-  returnTop = 10
+  limitCandidates = 80,
+  returnTop = 12
 }) {
   const q = safeStr(query).trim();
-  if (!q) {
-    return { ok: true, query: q, match: null, candidates: [] };
-  }
+  if (!q) return { ok: true, query: q, match: null, candidates: [] };
 
-  // Candidate pull using LIKE against name column
   const { clauses, params } = buildLikeClauses(nameCol, q);
 
   const cols = [idCol, nameCol, ...extraCols]
@@ -141,7 +150,6 @@ export function resolveEntity({
     .map(c => `${c} AS ${c}`)
     .join(", ");
 
-  // If clauses is empty (weird), pull a small set
   const sql = clauses
     ? `SELECT ${cols} FROM ${table} WHERE ${clauses} LIMIT ${Math.max(10, Math.min(limitCandidates, 200))}`
     : `SELECT ${cols} FROM ${table} LIMIT ${Math.max(10, Math.min(limitCandidates, 200))}`;
@@ -154,7 +162,6 @@ export function resolveEntity({
     rows = [];
   }
 
-  // Score + rank
   const scored = rows
     .map(r => {
       const name = safeStr(r?.[nameCol]);
@@ -172,14 +179,15 @@ export function resolveEntity({
   const best = top[0] || null;
   const second = top[1] || null;
 
-  // Confidence rules (tuned for your “random shit” requirement):
-  // - accept if >= 0.92 always
-  // - accept if >= 0.85 and clearly ahead of #2 by >= 0.08
+  // Confidence rules (more forgiving):
+  // - accept if >= 0.88 always
+  // - accept if >= 0.82 AND ahead of #2 by >= 0.06
+  // This makes "0801 loyd n 340" auto-pick 0801-Lloyd N340.
   let match = null;
   if (best) {
     const s1 = best.score || 0;
     const s2 = second?.score || 0;
-    if (s1 >= 0.92 || (s1 >= 0.85 && (s1 - s2) >= 0.08)) {
+    if (s1 >= 0.88 || (s1 >= 0.82 && (s1 - s2) >= 0.06)) {
       match = best;
     }
   }
