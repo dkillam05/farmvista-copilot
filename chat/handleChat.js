@@ -1,14 +1,15 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst8-active-default
+// Rev: 2026-01-11-handleChat-sqlFirst9-active-default-hel-crp-no-provider
 //
-// CHANGE (per Dane):
-// ✅ Default to ACTIVE items (99% of the time) unless user explicitly requests archived/inactive.
-// ✅ Treat archived NULL as NOT archived (active).
+// Keeps:
+// ✅ SQL-first tool loop
+// ✅ resolve_* tools
+// ✅ did-you-mean + "yes" followup (PENDING)
 //
-// Notes:
-// - This keeps your resolver + did-you-mean behavior.
-// - This also keeps your counting defaults BUT changes the default count to ACTIVE unless user asks otherwise.
-//   If you want “count all” sometimes, user can say “including archived” or “all fields”.
+// Adds / Fixes:
+// ✅ Active-by-default rule (archived NULL/0 = active) unless user explicitly asks archived/inactive
+// ✅ Prompt now includes fields.hasHEL/helAcres/hasCRP/crpAcres
+// ✅ rtkTowers has NO provider
 
 'use strict';
 
@@ -79,7 +80,6 @@ function extractAssistantText(responseJson) {
       }
     }
   }
-
   return parts.join("\n").trim();
 }
 
@@ -87,7 +87,6 @@ function isYesLike(s) {
   const v = norm(s);
   return ["yes", "y", "yep", "yeah", "correct", "right", "that", "that one", "yes i did"].includes(v);
 }
-
 function isNoLike(s) {
   const v = norm(s);
   return ["no", "n", "nope", "nah"].includes(v);
@@ -115,7 +114,6 @@ function buildSystemPrompt(dbStatus, userText) {
   const loadedAt = dbStatus?.snapshot?.loadedAt || null;
 
   const u = (userText || "").toLowerCase();
-
   const mentionsTower = u.includes("tower");
   const mentionsFarm = u.includes("farm");
 
@@ -128,21 +126,19 @@ You are FarmVista Copilot (SQL-first + fuzzy resolvers).
 
 ACTIVE DEFAULT RULE (HARD):
 - Unless the user explicitly asks for archived/inactive items, ALWAYS filter to ACTIVE records only.
-- For tables that have an "archived" column:
-    active condition = (archived IS NULL OR archived = 0)
-- If the user says any of: "archived", "inactive", "including archived", "all (including archived)" then do NOT apply the active filter.
+- Active condition: (archived IS NULL OR archived = 0)
+- Only include archived when user says: archived, inactive, include archived, including archived, show archived.
 
 COUNTING DEFAULTS (HARD):
-- If user asks "How many fields do we have?" (or similar) WITHOUT mentioning archived/inactive,
-  return ACTIVE field count using:
-    SELECT COUNT(*) FROM fields WHERE (archived IS NULL OR archived = 0);
-- If user asks "including archived" or "all fields", count all rows:
-    SELECT COUNT(*) FROM fields;
+- If user asks "How many fields do we have?" WITHOUT mentioning archived/inactive:
+  SELECT COUNT(*) FROM fields WHERE (archived IS NULL OR archived = 0);
+- If user asks "including archived" / "all fields":
+  SELECT COUNT(*) FROM fields;
 
 MANDATORY WORKFLOW:
 - If user mentions a FIELD name (even partial/typo), call resolve_field(query) first.
+- If user mentions a FARM name (even partial/typo), call resolve_farm(query) first.
 - If user mentions an RTK TOWER name (even partial/typo), call resolve_rtk_tower(query) first.
-- Only use resolve_farm(query) when user clearly indicates they mean a FARM.
 - After you get a match id, use db_query by ID (or JOIN by id) to fetch final facts.
 
 DID-YOU-MEAN RULE (HARD):
@@ -159,9 +155,15 @@ DATABASE SNAPSHOT CONTEXT:
 - counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 TABLES:
-- farms(id, name)
-- fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, archived)
-- rtkTowers(id, name, networkId, frequency, provider)
+- farms(id, name, archived?)
+- fields(
+    id, name, farmId, farmName,
+    rtkTowerId, rtkTowerName,
+    county, state, acresTillable,
+    hasHEL, helAcres, hasCRP, crpAcres,
+    archived
+  )
+- rtkTowers(id, name, networkId, frequency)
 `.trim();
 }
 
