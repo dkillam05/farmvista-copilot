@@ -1,5 +1,5 @@
 // /chat/resolve-fields.js  (FULL FILE)
-// Rev: 2026-01-10-resolve-fields1
+// Rev: 2026-01-11-resolve-fields2
 //
 // Field resolver tool: resolve_field(query)
 // Returns best match or candidates ("did you mean")
@@ -28,7 +28,7 @@ export function resolveField(query) {
     nameCol: "name",
     extraCols: ["county", "state", "farmName"],
     query,
-    limitCandidates: 80,
+    limitCandidates: 120,
     returnTop: 12
   });
 }
