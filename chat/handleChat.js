@@ -1,10 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-10-handleChat-sqlFirst7-count-defaults-active-null-archived
+// Rev: 2026-01-11-handleChat-sqlFirst8-active-default
 //
-// Fix:
-// ✅ Default "how many fields do we have" = COUNT ALL rows in fields
-// ✅ Only filter active/non-archived if user explicitly asks
-// ✅ When filtering non-archived: archived IS NULL OR archived=0 (NULL means not archived)
+// CHANGE (per Dane):
+// ✅ Default to ACTIVE items (99% of the time) unless user explicitly requests archived/inactive.
+// ✅ Treat archived NULL as NOT archived (active).
+//
+// Notes:
+// - This keeps your resolver + did-you-mean behavior.
+// - This also keeps your counting defaults BUT changes the default count to ACTIVE unless user asks otherwise.
+//   If you want “count all” sometimes, user can say “including archived” or “all fields”.
 
 'use strict';
 
@@ -16,8 +20,8 @@ import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
 import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
-const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString();
-const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString();
+const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
+const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
 // Pending disambiguation memory (keeps yes/no working)
 const PENDING = new Map(); // threadId -> { kind, query, candidates, createdAt, originalQuestion }
@@ -122,12 +126,18 @@ function buildSystemPrompt(dbStatus, userText) {
   return `
 You are FarmVista Copilot (SQL-first + fuzzy resolvers).
 
+ACTIVE DEFAULT RULE (HARD):
+- Unless the user explicitly asks for archived/inactive items, ALWAYS filter to ACTIVE records only.
+- For tables that have an "archived" column:
+    active condition = (archived IS NULL OR archived = 0)
+- If the user says any of: "archived", "inactive", "including archived", "all (including archived)" then do NOT apply the active filter.
+
 COUNTING DEFAULTS (HARD):
-- If user asks "How many fields do we have?" or "count fields" WITHOUT saying active/non-archived, COUNT ALL rows:
-  SELECT COUNT(*) FROM fields;
-- Only apply active/non-archived filters if user explicitly asks for active/non-archived.
-- IMPORTANT: fields.archived can be NULL. Treat NULL as NOT archived.
-  Non-archived condition: (archived IS NULL OR archived = 0)
+- If user asks "How many fields do we have?" (or similar) WITHOUT mentioning archived/inactive,
+  return ACTIVE field count using:
+    SELECT COUNT(*) FROM fields WHERE (archived IS NULL OR archived = 0);
+- If user asks "including archived" or "all fields", count all rows:
+    SELECT COUNT(*) FROM fields;
 
 MANDATORY WORKFLOW:
 - If user mentions a FIELD name (even partial/typo), call resolve_field(query) first.
