@@ -1,8 +1,11 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-11-snapshotBuild-firestore2sqlite6-farms-status-archived
+// Rev: 2026-01-11-snapshotBuild-firestore2sqlite7-add-binSites
 //
-// Changes:
-// ✅ farms.status + farms.archived (derived from status)
+// Adds:
+// ✅ binSites table with: id, name, status, used, totalBushels, data
+//
+// Keeps:
+// ✅ farms.status + farms.archived
 // ✅ rtkTowers: no provider
 // ✅ fields: tillable + HEL/CRP + join-filled farmName/rtkTowerName
 
@@ -82,6 +85,7 @@ function createSchema(sqlite) {
     DROP TABLE IF EXISTS farms;
     DROP TABLE IF EXISTS rtkTowers;
     DROP TABLE IF EXISTS fields;
+    DROP TABLE IF EXISTS binSites;
 
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
@@ -117,6 +121,15 @@ function createSchema(sqlite) {
       data TEXT
     );
 
+    CREATE TABLE binSites (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      status TEXT,
+      used INTEGER,
+      totalBushels REAL,
+      data TEXT
+    );
+
     CREATE INDEX idx_farms_name ON farms(name);
     CREATE INDEX idx_farms_status ON farms(status);
     CREATE INDEX idx_farms_archived ON farms(archived);
@@ -128,6 +141,10 @@ function createSchema(sqlite) {
     CREATE INDEX idx_fields_rtkTowerId ON fields(rtkTowerId);
     CREATE INDEX idx_fields_county ON fields(county);
     CREATE INDEX idx_fields_hasHEL ON fields(hasHEL);
+
+    CREATE INDEX idx_binSites_name ON binSites(name);
+    CREATE INDEX idx_binSites_status ON binSites(status);
+    CREATE INDEX idx_binSites_used ON binSites(used);
   `);
 }
 
@@ -181,7 +198,7 @@ export async function buildSnapshotToSqlite() {
   const sqlite = new Database(localPath);
   createSchema(sqlite);
 
-  // Farms (bring status through)
+  // Farms
   const farms = await fetchAllDocs(firestore, "farms", (id, d) => ({
     id,
     name: norm(d.name || d.farmName || ""),
@@ -247,14 +264,26 @@ export async function buildSnapshotToSqlite() {
     };
   });
 
+  // Bin Sites
+  const binSites = await fetchAllDocs(firestore, "binSites", (id, d) => ({
+    id,
+    name: norm(d.name || ""),
+    status: norm(d.status || ""),
+    used: boolOrNull(d.used ?? null),
+    totalBushels: numOrNull(d.totalBushels ?? null),
+    data: JSON.stringify(d)
+  }));
+
   insertRows(sqlite, "farms", farms);
   insertRows(sqlite, "rtkTowers", rtkTowers);
   insertRows(sqlite, "fields", fields);
+  insertRows(sqlite, "binSites", binSites);
 
   const counts = {
     farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
     rtkTowers: sqlite.prepare("SELECT COUNT(1) AS n FROM rtkTowers").get().n,
-    fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n
+    fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n,
+    binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n
   };
 
   sqlite.close();
