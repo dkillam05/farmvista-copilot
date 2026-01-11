@@ -1,63 +1,40 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst11b-human-followups-result-context-farm-fields-fix
+// Rev: 2026-01-11-handleChat-sqlFirst13-registry-tools-context
 //
-// Fixes (additive, keeps your long file):
-// ✅ Prevent "fields in <something> farm" from being misrouted to county fast path
-// ✅ Add fast path: list fields by FARM (resolve farm -> query fields by farmId)
-// ✅ Make "yes" work for farm disambiguation by returning fields list directly
+// This is the reset.
+// ✅ No brittle FAST routes
+// ✅ OpenAI interprets every question
+// ✅ Deterministic DB via db_query
+// ✅ Generic resolver: resolve_entity(type, query)
+// ✅ Generic memory for human follow-ups (list selection, yes/no)
 //
-// Keeps:
-// ✅ SQL-first correctness
-// ✅ Human followups: include acres, yes, either of those, farm number, fields in county
-// ✅ did-you-mean memory (PENDING)
-// ✅ result context memory (RESULT_CTX)
-// ✅ OpenAI tools fallback
+// You are NOT programming questions.
+// You are providing tools + schema + a small generic context layer.
 
 'use strict';
 
 import { ensureDbReady, getDbStatus } from "../context/snapshot-db.js";
 import { runSql } from "./sqlRunner.js";
 
-import { resolveFieldTool, resolveField } from "./resolve-fields.js";
-import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
-import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
+import { resolveEntityTool, resolveEntityGeneric } from "./resolve-entity.js";
+import { getEntity, listEntityTypes, detectRefinement } from "./entityRegistry.js";
+import {
+  pruneContextStore,
+  setLastList,
+  getLastList,
+  setLastSelection,
+  getLastSelection,
+  setPending,
+  getPending,
+  clearPending
+} from "./contextStore.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
-// ==============================
-// Memory maps (in-memory; per Cloud Run instance)
-// ==============================
-
-// Did-you-mean disambiguation memory (existing pattern)
-const PENDING = new Map(); // threadId -> { kind, query, candidates:[{id,name,score}], createdAt, originalQuestion }
-
-// result context memory for "human follow-ups"
-const RESULT_CTX = new Map(); // threadId -> { lastType, items:[{id,name,...}], selectedFarm?, selectedField?, lastPrompt?, pendingRefine?, createdAt }
-
-// TTL cleanup
-const TTL_MS = 10 * 60 * 1000;
-
-function nowMs() { return Date.now(); }
-
-function pruneMemory() {
-  const now = nowMs();
-  for (const [k, v] of PENDING.entries()) {
-    if (!v?.createdAt || (now - v.createdAt) > TTL_MS) PENDING.delete(k);
-  }
-  for (const [k, v] of RESULT_CTX.entries()) {
-    if (!v?.createdAt || (now - v.createdAt) > TTL_MS) RESULT_CTX.delete(k);
-  }
-}
-
-// ==============================
-// Helpers
-// ==============================
-
 function safeStr(v) { return (v == null ? "" : String(v)); }
 function norm(s) { return safeStr(s).trim().toLowerCase(); }
-
 function jsonTryParse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 function isYesLike(s) {
@@ -68,21 +45,6 @@ function isNoLike(s) {
   const v = norm(s);
   return ["no", "n", "nope", "nah"].includes(v);
 }
-
-// Active filter snippet used in deterministic SQL
-function activeWhere(aliasOrNull) {
-  const a = aliasOrNull ? `${aliasOrNull}.` : "";
-  return `(${a}archived IS NULL OR ${a}archived = 0)`;
-}
-
-function fmtAcres(n) {
-  const x = Number(n || 0);
-  return x.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
-// ==============================
-// OpenAI wrapper
-// ==============================
 
 async function openaiResponsesCreate(payload) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -117,23 +79,14 @@ function extractAssistantText(responseJson) {
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   const parts = [];
   for (const it of items) {
-    if (!it) continue;
-    if (it.type === "message") {
-      const content = Array.isArray(it.content) ? it.content : [];
-      for (const c of content) {
-        if (c?.type === "output_text" && typeof c.text === "string") {
-          const t = c.text.trim();
-          if (t) parts.push(t);
-        }
+    if (it?.type === "message") {
+      for (const c of (it.content || [])) {
+        if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) parts.push(c.text.trim());
       }
     }
   }
   return parts.join("\n").trim();
 }
-
-// ==============================
-// Did-you-mean formatter
-// ==============================
 
 function formatDidYouMean(kind, candidates) {
   const lines = [];
@@ -144,316 +97,78 @@ function formatDidYouMean(kind, candidates) {
   return lines.join("\n");
 }
 
-// ==============================
-// Deterministic "human" intent detection
-// ==============================
-
-function looksLikeListFarms(text) {
+function parseNumberSelection(text) {
+  // "number 5", "farm number 5", "#5"
   const t = norm(text);
-  return (
-    t === "farms" ||
-    t.includes("show me all the farms") ||
-    t.includes("list all the farms") ||
-    t.includes("list farms") ||
-    t.includes("show farms")
-  );
-}
-
-function looksLikeIncludeTillable(text) {
-  const t = norm(text);
-  return (
-    t.includes("include tillable") ||
-    t.includes("add tillable") ||
-    t.includes("include acres") ||
-    t.includes("add acres") ||
-    t.includes("with acres") ||
-    t === "include tillable acres" ||
-    t === "include acres"
-  );
-}
-
-function parseFarmNumber(text) {
-  // "farm number 5" / "farm #5" / "number 5"
-  const t = norm(text);
-  let m = t.match(/\bfarm\s*(number|#)\s*(\d{1,3})\b/);
-  if (m) return Number(m[2]);
-  m = t.match(/\bnumber\s*(\d{1,3})\b/);
-  if (m) return Number(m[1]);
+  let m = t.match(/\b(farm\s*)?(number|#)\s*(\d{1,3})\b/);
+  if (m) return Number(m[3]);
+  m = t.match(/\b(\d{1,3})\b/);
+  // only accept pure numeric message
+  if (m && t === m[1]) return Number(m[1]);
   return null;
 }
 
-/**
- * COUNTY parser (FIXED):
- * - Only triggers when user explicitly says "county"
- * - Or when they say "fields in <X county>"
- * - NEVER triggers if they mention "farm" in the same request
- */
-function parseCountyFields(text) {
-  const t = norm(text);
-
-  // Prevent farm requests from being misrouted as county
-  if (t.includes("farm")) return null;
-
-  // Require explicit "county"
-  let m = t.match(/\bfields?\s+in\s+([a-z\s\-]+?)\s+county\b/);
-  if (m) return m[1].trim();
-
-  // Also allow "in Greene county" anywhere
-  m = t.match(/\bin\s+([a-z\s\-]+?)\s+county\b/);
-  if (m) return m[1].trim();
-
-  return null;
-}
-
-/**
- * FARM parser (NEW):
- * Handles:
- * - "fields in the carlinville farm"
- * - "fields in carlinville farm"
- * - "field list for the cville farm"
- * - "all fields in that farm"
- */
-function parseFarmFieldsQuery(text) {
-  const t = norm(text);
-
-  // Must mention farm OR "that farm"
-  if (!t.includes("farm")) return null;
-
-  // If they say "that farm", rely on selectedFarm context
-  if (t.includes("that farm") || t.includes("the farm i asked") || t.includes("the farm that i asked")) {
-    return { kind: "selectedFarm", query: "" };
-  }
-
-  // Try to capture a farm name phrase near "farm"
-  // Examples: "carlinville farm", "cville farm", "cville-stdcty-barnet farm"
-  let m = t.match(/\bfields?\b.*\b([a-z0-9\-\s]+?)\s+farm\b/);
-  if (m && m[1] && m[1].trim().length >= 2) return { kind: "query", query: m[1].trim() };
-
-  m = t.match(/\bfarm\b.*\b([a-z0-9\-\s]+)\b/);
-  // Too risky; skip generic
-  return null;
-}
-
-function looksLikeHelQuestion(text) {
-  const t = norm(text);
-  return (t.includes("hel") && (t.includes(">") || t.includes("greater") || t.includes("have") || t.includes("any")));
-}
-
-function looksLikeEitherOfThose(text) {
-  const t = norm(text);
-  return (
-    t.includes("either") ||
-    t.includes("both") ||
-    t.includes("those fields") ||
-    t.includes("either one") ||
-    t.includes("do either")
-  );
-}
-
-// ==============================
-// Deterministic fast paths
-// ==============================
-
-function listActiveFarmsAndRemember(threadId) {
-  // IMPORTANT: select id internally, but DO NOT display it
-  const sql = `
-    SELECT id, name
-    FROM farms
-    WHERE ${activeWhere("")}
-    ORDER BY name
-    LIMIT 500
-  `;
-  const r = runSql({ sql, limit: 500 });
-  const rows = r.rows || [];
-
-  if (threadId) {
-    RESULT_CTX.set(threadId, {
-      lastType: "farms",
-      items: rows.map(x => ({ id: safeStr(x.id), name: safeStr(x.name) })),
-      createdAt: nowMs()
-    });
-  }
-
-  if (!rows.length) return "No active farms found.";
-
-  const lines = ["Here are the active farms:"];
-  rows.forEach((x, i) => lines.push(`${i + 1}. ${safeStr(x.name)}`));
-  lines.push("");
-  lines.push('You can reply like: "farm number 5" or type the farm name.');
-  return lines.join("\n");
-}
-
-function listActiveFarmsWithTillableAndRemember(threadId) {
-  const sql = `
-    SELECT f.id AS farmId,
-           f.name AS farmName,
-           COALESCE(SUM(CASE WHEN ${activeWhere("fl")} THEN fl.acresTillable ELSE 0 END), 0) AS totalTillable
-    FROM farms f
-    LEFT JOIN fields fl ON fl.farmId = f.id
-    WHERE ${activeWhere("f")}
-    GROUP BY f.id, f.name
-    ORDER BY f.name
-    LIMIT 500
-  `;
-  const r = runSql({ sql, limit: 500 });
-  const rows = r.rows || [];
-
-  if (threadId) {
-    RESULT_CTX.set(threadId, {
-      lastType: "farms_with_acres",
-      items: rows.map(x => ({ id: safeStr(x.farmId), name: safeStr(x.farmName), totalTillable: Number(x.totalTillable || 0) })),
-      createdAt: nowMs()
-    });
-  }
-
-  if (!rows.length) return "No active farms found.";
-
-  const lines = ["Active farms with total tillable acres:"];
-  rows.forEach((x, i) => lines.push(`${i + 1}. ${safeStr(x.farmName)} — ${fmtAcres(x.totalTillable)} acres`));
-  lines.push("");
-  lines.push('You can reply like: "farm number 5" or type the farm name.');
-  return lines.join("\n");
-}
-
-function listFieldsInCountyAndRemember(countyQuery, threadId) {
-  const county = countyQuery.trim();
-  const sql = `
-    SELECT id, name, farmName, acresTillable, county, state, hasHEL, helAcres
-    FROM fields
-    WHERE ${activeWhere("")}
-      AND lower(county) = lower(?)
-    ORDER BY name
-    LIMIT 200
-  `;
-  const r = runSql({ sql, params: [county], limit: 200 });
-  const rows = r.rows || [];
-
-  if (threadId) {
-    RESULT_CTX.set(threadId, {
-      lastType: "fields",
-      items: rows.map(x => ({
-        id: safeStr(x.id),
-        name: safeStr(x.name),
-        farmName: safeStr(x.farmName),
-        acresTillable: Number(x.acresTillable || 0),
-        hasHEL: Number(x.hasHEL || 0),
-        helAcres: Number(x.helAcres || 0)
-      })),
-      createdAt: nowMs()
-    });
-  }
-
-  if (!rows.length) return `No active fields found in ${county} County.`;
-
-  const lines = [`Active fields in ${county} County:`];
-  rows.forEach((x, i) => {
-    lines.push(`${i + 1}. ${safeStr(x.name)} — Farm: ${safeStr(x.farmName) || "(unknown)"} — ${fmtAcres(x.acresTillable)} tillable acres`);
-  });
-  return lines.join("\n");
-}
-
-/**
- * NEW: list fields by farmId (used for carlinville/cville farm requests)
- */
-function listFieldsInFarmByIdAndRemember(farmId, farmName, threadId) {
-  const sql = `
-    SELECT id, name, farmName, acresTillable, county, state, hasHEL, helAcres
-    FROM fields
-    WHERE ${activeWhere("")}
-      AND farmId = ?
-    ORDER BY name
-    LIMIT 500
-  `;
-  const r = runSql({ sql, params: [farmId], limit: 500 });
-  const rows = r.rows || [];
-
-  if (threadId) {
-    RESULT_CTX.set(threadId, {
-      lastType: "fields",
-      items: rows.map(x => ({
-        id: safeStr(x.id),
-        name: safeStr(x.name),
-        farmName: safeStr(x.farmName),
-        acresTillable: Number(x.acresTillable || 0),
-        hasHEL: Number(x.hasHEL || 0),
-        helAcres: Number(x.helAcres || 0)
-      })),
-      selectedFarm: { id: safeStr(farmId), name: safeStr(farmName) },
-      createdAt: nowMs()
-    });
-  }
-
-  if (!rows.length) return `No active fields found for farm ${farmName}.`;
-
-  const lines = [`Active fields in farm ${farmName}:`];
-  rows.forEach((x, i) => {
-    lines.push(`${i + 1}. ${safeStr(x.name)} — ${fmtAcres(x.acresTillable)} tillable acres — ${safeStr(x.county)} County`);
-  });
-  return lines.join("\n");
-}
-
-function answerHelForLastFields(threadId) {
-  const ctx = threadId ? RESULT_CTX.get(threadId) : null;
-  const items = ctx?.items || [];
-  if (!items.length) return "Which fields do you mean? I don't have a recent field list to reference.";
-
-  const focus = items.slice(0, 20);
-  const any = focus.filter(f => Number(f.helAcres || 0) > 0);
-
-  if (!any.length) return "No — none of those fields have HEL acres greater than 0.";
-
-  const lines = ["Yes — these fields have HEL acres greater than 0:"];
-  any.forEach(f => lines.push(`- ${f.name} — HEL acres: ${fmtAcres(f.helAcres)}`));
-  return lines.join("\n");
-}
-
-function selectFarmByNumber(threadId, n) {
-  const ctx = threadId ? RESULT_CTX.get(threadId) : null;
-  const items = ctx?.items || [];
-  if (!items.length) return null;
-  if (!Number.isFinite(n) || n <= 0 || n > items.length) return null;
-  return items[n - 1] || null;
-}
-
-// ==============================
-// System prompt
-// ==============================
-
-function buildSystemPrompt(dbStatus) {
+function buildSystemPrompt(dbStatus, threadId) {
   const counts = dbStatus?.counts || {};
   const snapshotId = dbStatus?.snapshot?.id || "unknown";
-  const loadedAt = dbStatus?.snapshot?.loadedAt || null;
+
+  const lastList = threadId ? getLastList(threadId) : null;
+  const lastSel = threadId ? getLastSelection(threadId) : null;
 
   return `
-You are FarmVista Copilot (SQL-first + fuzzy resolvers).
+You are FarmVista Copilot.
 
-ACTIVE DEFAULT (HARD):
-- Unless user explicitly requests archived/inactive, filter to active:
+YOU do 100% of language understanding and deciding which tools to call.
+But you MUST use tools for database facts.
+
+HARD RULES:
+- Never guess DB facts. Use tools.
+- Do NOT show IDs. Use IDs internally.
+- Active-by-default: unless user explicitly asks archived/inactive, apply active filter:
   (archived IS NULL OR archived = 0)
 
-IMPORTANT:
-- When listing entities (farms/fields/towers), prefer selecting the entity id internally (do NOT display ids).
-  This enables reliable follow-ups like "farm number 5" and "either one of those fields".
+TOOLS:
+- resolve_entity(type, query) -> match or candidates
+- db_query(sql, params?, limit?) -> SELECT-only
 
-DB snapshot:
-- snapshotId: ${snapshotId}
-- loadedAt: ${loadedAt || "unknown"}
-- counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
+ENTITY TYPES:
+${listEntityTypes().join(", ")}
 
-Tables:
-- farms(id, name, status, archived)
-- fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, hasHEL, helAcres, hasCRP, crpAcres, archived)
-- rtkTowers(id, name, networkId, frequency)
+GENERIC FOLLOW-UP BEHAVIOR:
+- If user says "number 5" and there is a last list, interpret it as selecting item #5 from that list.
+- If user asks to "include/add/with" after a list, treat it as a refinement of that same list.
+
+CONTEXT (server memory, not shown to user):
+- lastList: ${lastList ? `${lastList.type} (${lastList.items.length} items)` : "none"}
+- lastSelection: ${lastSel ? `${lastSel.type} (${lastSel.item?.name || ""})` : "none"}
+
+Snapshot: ${snapshotId}
+Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 `.trim();
 }
 
-// ==============================
-// Main handler
-// ==============================
+// Detect list queries so we can store lastList deterministically
+function maybeCaptureLastList(threadId, sql, rows) {
+  if (!threadId || !sql || !Array.isArray(rows) || !rows.length) return;
+
+  const low = sql.toLowerCase();
+  const cap = (type) => {
+    const ent = getEntity(type);
+    if (!ent) return;
+    // If rows contain id+name, store as lastList
+    if (rows[0]?.id != null && rows[0]?.name != null) {
+      setLastList(threadId, type, rows.map(r => ({ id: String(r.id), name: String(r.name) })));
+    }
+  };
+
+  if (low.includes(" from farms")) cap("farms");
+  else if (low.includes(" from fields")) cap("fields");
+  else if (low.includes(" from rtktowers")) cap("rtkTowers");
+}
 
 export async function handleChatHttp(req, res) {
   try {
-    pruneMemory();
+    pruneContextStore();
 
     await ensureDbReady({ force: false });
     const dbStatus = await getDbStatus();
@@ -465,192 +180,69 @@ export async function handleChatHttp(req, res) {
 
     if (!userText) return res.status(400).json({ ok: false, error: "missing_text" });
 
-    // ==============================
-    // FAST PATH 0 (NEW): Fields in FARM (fixes carlinville/cville farm flow)
-    // ==============================
-    const farmFieldsReq = parseFarmFieldsQuery(userText);
-    if (farmFieldsReq && threadId) {
-      // If it references "that farm", use selectedFarm
-      if (farmFieldsReq.kind === "selectedFarm") {
-        const ctx = RESULT_CTX.get(threadId);
-        const sf = ctx?.selectedFarm;
-        if (sf?.id && sf?.name) {
-          const out = listFieldsInFarmByIdAndRemember(sf.id, sf.name, threadId);
-          return res.json({
-            ok: true,
-            text: out,
-            meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:fields_in_farm_selected" } : undefined
-          });
-        }
-        // If no selectedFarm, fall through to OpenAI
-      }
-
-      if (farmFieldsReq.kind === "query") {
-        const rr = resolveFarm(farmFieldsReq.query);
-
-        // clear match
-        if (rr?.match?.id) {
-          const out = listFieldsInFarmByIdAndRemember(rr.match.id, rr.match.name, threadId);
-          return res.json({
-            ok: true,
-            text: out,
-            meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:fields_in_farm" } : undefined
-          });
-        }
-
-        // candidates -> did you mean (but store as special kind so "yes" returns fields)
-        if (!rr?.match && Array.isArray(rr?.candidates) && rr.candidates.length) {
-          PENDING.set(threadId, {
-            kind: "farm_fields",
-            query: farmFieldsReq.query,
-            candidates: rr.candidates,
-            createdAt: nowMs(),
-            originalQuestion: userText
-          });
-          return res.json({
-            ok: true,
-            text: formatDidYouMean("farm", rr.candidates),
-            meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-          });
-        }
-      }
-    }
-
-    // ==============================
-    // FAST PATH 1: List farms
-    // ==============================
-    if (looksLikeListFarms(userText)) {
-      const out = listActiveFarmsAndRemember(threadId);
-      return res.json({
-        ok: true,
-        text: out,
-        meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:list_farms" } : undefined
-      });
-    }
-
-    // ==============================
-    // FAST PATH 2: Follow-up "include tillable acres" after farms list
-    // ==============================
-    if (threadId) {
-      const ctx = RESULT_CTX.get(threadId);
-      if (ctx?.lastType === "farms" && looksLikeIncludeTillable(userText)) {
-        ctx.pendingRefine = "farms_with_acres";
-        ctx.createdAt = nowMs();
-        RESULT_CTX.set(threadId, ctx);
-
-        const out = listActiveFarmsWithTillableAndRemember(threadId);
-        return res.json({
-          ok: true,
-          text: out,
-          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:farms_include_acres" } : undefined
-        });
-      }
-
-      if (isYesLike(userText) && ctx?.pendingRefine === "farms_with_acres") {
-        ctx.pendingRefine = null;
-        ctx.createdAt = nowMs();
-        RESULT_CTX.set(threadId, ctx);
-
-        const out = listActiveFarmsWithTillableAndRemember(threadId);
-        return res.json({
-          ok: true,
-          text: out,
-          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:yes_apply_refine" } : undefined
-        });
-      }
-    }
-
-    // ==============================
-    // FAST PATH 3: Farm number N
-    // ==============================
-    const farmNum = parseFarmNumber(userText);
-    if (threadId && farmNum != null) {
-      const pick = selectFarmByNumber(threadId, farmNum);
-      if (pick) {
-        const prev = RESULT_CTX.get(threadId) || {};
-        RESULT_CTX.set(threadId, {
-          ...prev,
-          selectedFarm: { id: pick.id, name: pick.name },
-          createdAt: nowMs()
-        });
-
-        return res.json({
-          ok: true,
-          text: `Got it — farm #${farmNum} is **${pick.name}**. Ask: "show me all fields in this farm".`,
-          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:farm_number" } : undefined
-        });
-      }
-    }
-
-    // ==============================
-    // FAST PATH 4: Fields in a county (FIXED to require 'county' and not 'farm')
-    // ==============================
-    const countyQ = parseCountyFields(userText);
-    if (countyQ) {
-      const out = listFieldsInCountyAndRemember(countyQ, threadId);
-      return res.json({
-        ok: true,
-        text: out,
-        meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:fields_in_county" } : undefined
-      });
-    }
-
-    // ==============================
-    // FAST PATH 5: HEL question about "either/both/those fields"
-    // ==============================
-    if (threadId) {
-      const ctx = RESULT_CTX.get(threadId);
-      if (ctx?.lastType === "fields" && looksLikeHelQuestion(userText) && looksLikeEitherOfThose(userText)) {
-        const out = answerHelForLastFields(threadId);
-        return res.json({
-          ok: true,
-          text: out,
-          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:hel_for_last_fields" } : undefined
-        });
-      }
-    }
-
-    // ======================================================
-    // Existing YES / NO DISAMBIGUATION (did-you-mean) — extended for farm_fields
-    // ======================================================
-    if (threadId && PENDING.has(threadId)) {
-      const pend = PENDING.get(threadId);
-
-      // NEW: if they asked for fields in a farm and we had candidates, "yes" should list fields
-      if (pend.kind === "farm_fields" && isYesLike(userText)) {
-        const top = pend?.candidates?.[0] || null;
-        if (top?.id && top?.name) {
-          PENDING.delete(threadId);
-          const out = listFieldsInFarmByIdAndRemember(top.id, top.name, threadId);
-          return res.json({
-            ok: true,
-            text: out,
-            meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null, route: "fast:yes_farm_fields" } : undefined
-          });
-        }
-      }
-
-      // Existing behavior
+    // 1) Handle pending "did you mean" with yes/no generically
+    const pend = threadId ? getPending(threadId) : null;
+    if (threadId && pend) {
       if (isYesLike(userText)) {
         const top = pend?.candidates?.[0] || null;
-        if (top && pend.originalQuestion) {
-          userText = `${pend.originalQuestion}\n\nUser confirmed: ${top.name} (id=${top.id}). Proceed using that id.`;
-          PENDING.delete(threadId);
+        if (top?.id && top?.name) {
+          clearPending(threadId);
+          // rewrite userText to include confirmed entity name and type
+          userText = `${pend.originalText}\n\nUser confirmed ${pend.kind}: ${top.name}.`;
+          setLastSelection(threadId, pend.kind, { id: top.id, name: top.name });
         }
       } else if (isNoLike(userText)) {
-        PENDING.delete(threadId);
+        clearPending(threadId);
         return res.json({
           ok: true,
-          text: "Okay — tell me the exact field/farm/tower name you meant.",
+          text: "Okay — tell me the exact name you meant.",
           meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
         });
       }
     }
 
-    // ==============================
-    // Normal OpenAI tool flow (fallback)
-    // ==============================
+    // 2) Handle "number N" selection from last list generically
+    const n = parseNumberSelection(userText);
+    if (threadId && n != null) {
+      const ll = getLastList(threadId);
+      if (ll && Array.isArray(ll.items) && ll.items.length >= n && n > 0) {
+        const pick = ll.items[n - 1];
+        setLastSelection(threadId, ll.type, { id: pick.id, name: pick.name });
+        return res.json({
+          ok: true,
+          text: `Got it — #${n} is ${pick.name}. What would you like to know about it?`,
+          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+        });
+      }
+    }
 
+    // 3) Handle generic list refinement: "include acres" after a farms list
+    if (threadId) {
+      const ll = getLastList(threadId);
+      if (ll && ll.type) {
+        const refKey = detectRefinement(ll.type, userText);
+        if (refKey) {
+          const ent = getEntity(ll.type);
+          const ref = ent?.refinements?.[refKey];
+          if (ref?.sql) {
+            const r = runSql({ sql: ref.sql, limit: 500 });
+            const rows = r.rows || [];
+            // refresh last list with id+name
+            if (rows.length && rows[0]?.id != null && rows[0]?.name != null) {
+              setLastList(threadId, ll.type, rows.map(x => ({ id: String(x.id), name: String(x.name) })));
+            }
+            const lines = rows.map(ref.formatRow).filter(Boolean);
+            return res.json({
+              ok: true,
+              text: lines.join("\n") || "No results.",
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
+        }
+      }
+    }
+
+    // 4) Normal OpenAI tool calling (OpenAI does 100% interpretation)
     const tools = [
       {
         type: "function",
@@ -660,18 +252,16 @@ export async function handleChatHttp(req, res) {
           type: "object",
           properties: {
             sql: { type: "string" },
-            params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
+            params: { type: "array", items: { type: ["string","number","boolean","null"] } },
             limit: { type: "number" }
           },
           required: ["sql"]
         }
       },
-      resolveFieldTool,
-      resolveFarmTool,
-      resolveRtkTowerTool
+      resolveEntityTool
     ];
 
-    const system = buildSystemPrompt(dbStatus);
+    const system = buildSystemPrompt(dbStatus, threadId);
 
     const input_list = [
       { role: "system", content: system },
@@ -701,111 +291,48 @@ export async function handleChatHttp(req, res) {
 
         if (name === "db_query") {
           didAny = true;
-          const sql = safeStr(args.sql || "");
-          const params = Array.isArray(args.params) ? args.params : [];
-          const limit = Number.isFinite(args.limit) ? args.limit : 200;
-
           try {
-            result = runSql({ sql, params, limit });
+            result = runSql({
+              sql: safeStr(args.sql || ""),
+              params: Array.isArray(args.params) ? args.params : [],
+              limit: Number.isFinite(args.limit) ? args.limit : 200
+            });
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
-          // capture list context opportunistically when ids are included
-          if (threadId && result && Array.isArray(result.rows) && result.rows.length) {
-            const sqlLow = sql.toLowerCase();
-
-            if (sqlLow.includes("from farms") && result.rows[0]?.id && result.rows[0]?.name) {
-              RESULT_CTX.set(threadId, {
-                lastType: "farms",
-                items: result.rows.map(r => ({ id: safeStr(r.id), name: safeStr(r.name) })),
-                createdAt: nowMs()
-              });
-            }
-
-            if (sqlLow.includes("from fields") && result.rows[0]?.id && result.rows[0]?.name) {
-              RESULT_CTX.set(threadId, {
-                lastType: "fields",
-                items: result.rows.map(r => ({
-                  id: safeStr(r.id),
-                  name: safeStr(r.name),
-                  farmName: safeStr(r.farmName || ""),
-                  acresTillable: Number(r.acresTillable || 0),
-                  hasHEL: Number(r.hasHEL || 0),
-                  helAcres: Number(r.helAcres || 0)
-                })),
-                createdAt: nowMs()
-              });
-            }
-
-            if (sqlLow.includes("from rtktowers") && result.rows[0]?.id && result.rows[0]?.name) {
-              RESULT_CTX.set(threadId, {
-                lastType: "rtkTowers",
-                items: result.rows.map(r => ({ id: safeStr(r.id), name: safeStr(r.name) })),
-                createdAt: nowMs()
-              });
-            }
+          // capture lastList opportunistically
+          if (threadId && result?.rows && typeof args.sql === "string") {
+            maybeCaptureLastList(threadId, args.sql, result.rows);
           }
 
-        } else if (name === "resolve_field") {
+        } else if (name === "resolve_entity") {
           didAny = true;
-          result = resolveField(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (threadId) {
-              PENDING.set(threadId, {
-                kind: "field",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                createdAt: nowMs(),
-                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
-              });
-            }
+          const type = safeStr(args.type || "");
+          const query = safeStr(args.query || "");
+          result = resolveEntityGeneric(type, query);
+
+          // if candidates, store pending for yes/no
+          if (threadId && result?.ok !== false && !result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            setPending(threadId, {
+              kind: type,
+              query,
+              candidates: result.candidates,
+              originalText: userText,
+              createdAt: Date.now()
+            });
+
             return res.json({
               ok: true,
-              text: formatDidYouMean("field", result.candidates),
+              text: formatDidYouMean(type, result.candidates),
               meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
             });
           }
-        } else if (name === "resolve_farm") {
-          didAny = true;
-          result = resolveFarm(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (threadId) {
-              PENDING.set(threadId, {
-                kind: "farm",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                createdAt: nowMs(),
-                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
-              });
-            }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("farm", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+
+          // if match, store last selection
+          if (threadId && result?.match?.id) {
+            setLastSelection(threadId, type, { id: result.match.id, name: result.match.name });
           }
-        } else if (name === "resolve_rtk_tower") {
-          didAny = true;
-          result = resolveRtkTower(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (threadId) {
-              PENDING.set(threadId, {
-                kind: "rtk tower",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                createdAt: nowMs(),
-                originalQuestion: safeStr(body.text || body.message || body.q || "").trim()
-              });
-            }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("rtk tower", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
-          }
-        } else {
-          continue;
         }
 
         input_list.push({
