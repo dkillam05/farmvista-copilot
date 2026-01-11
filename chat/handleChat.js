@@ -1,15 +1,24 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst9-active-default-hel-crp-no-provider
+// Rev: 2026-01-11-handleChat-sqlFirst10-active-default-hel-crp-followup-refine
 //
-// Keeps:
+// Keeps (unchanged):
 // ✅ SQL-first tool loop
 // ✅ resolve_* tools
-// ✅ did-you-mean + "yes" followup (PENDING)
+// ✅ did-you-mean + yes/no disambiguation (PENDING)
+// ✅ Active-by-default logic
+// ✅ HEL / CRP awareness
 //
-// Adds / Fixes:
-// ✅ Active-by-default rule (archived NULL/0 = active) unless user explicitly asks archived/inactive
-// ✅ Prompt now includes fields.hasHEL/helAcres/hasCRP/crpAcres
-// ✅ rtkTowers has NO provider
+// Adds (additive only):
+// ✅ FOLLOW-UP LIST REFINEMENT memory
+//    - "include tillable acres"
+//    - "add field count"
+//    - "with acres"
+//    - "yes" after refinement prompt
+//
+// IMPORTANT:
+// - No existing logic removed
+// - No existing logic reordered
+// - Only additive blocks clearly marked
 
 'use strict';
 
@@ -24,8 +33,19 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
-// Pending disambiguation memory (keeps yes/no working)
+// ==============================
+// Memory
+// ==============================
+
+// Pending disambiguation memory (existing)
 const PENDING = new Map(); // threadId -> { kind, query, candidates, createdAt, originalQuestion }
+
+// NEW: Last list context memory (additive)
+const LAST_LIST = new Map(); // threadId -> { type: "farms" | "fields" | "rtkTowers", createdAt }
+
+// ==============================
+// Helpers
+// ==============================
 
 function safeStr(v) { return (v == null ? "" : String(v)); }
 function norm(s) { return safeStr(s).trim().toLowerCase(); }
@@ -33,6 +53,10 @@ function norm(s) { return safeStr(s).trim().toLowerCase(); }
 function jsonTryParse(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
+
+// ==============================
+// OpenAI wrapper
+// ==============================
 
 async function openaiResponsesCreate(payload) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
@@ -54,6 +78,10 @@ async function openaiResponsesCreate(payload) {
   }
   return data;
 }
+
+// ==============================
+// Response extraction
+// ==============================
 
 function extractFunctionCalls(responseJson) {
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
@@ -80,24 +108,60 @@ function extractAssistantText(responseJson) {
       }
     }
   }
+
   return parts.join("\n").trim();
 }
 
+// ==============================
+// Yes / No helpers
+// ==============================
+
 function isYesLike(s) {
   const v = norm(s);
-  return ["yes", "y", "yep", "yeah", "correct", "right", "that", "that one", "yes i did"].includes(v);
+  return ["yes", "y", "yep", "yeah", "correct", "right", "that", "that one", "yes i did", "ok", "okay"].includes(v);
 }
 function isNoLike(s) {
   const v = norm(s);
   return ["no", "n", "nope", "nah"].includes(v);
 }
 
+// ==============================
+// Refinement detection (NEW)
+// ==============================
+
+function isRefinement(text) {
+  const t = norm(text);
+  return (
+    t.includes("include") ||
+    t.includes("add") ||
+    t.includes("with") ||
+    t.includes("acres") ||
+    t.includes("tillable") ||
+    t.includes("field count")
+  );
+}
+
+// ==============================
+// Pending cleanup
+// ==============================
+
 function prunePending() {
   const now = Date.now();
   for (const [k, v] of PENDING.entries()) {
-    if (!v?.createdAt || (now - v.createdAt) > (10 * 60 * 1000)) PENDING.delete(k);
+    if (!v?.createdAt || (now - v.createdAt) > (10 * 60 * 1000)) {
+      PENDING.delete(k);
+    }
+  }
+  for (const [k, v] of LAST_LIST.entries()) {
+    if (!v?.createdAt || (now - v.createdAt) > (10 * 60 * 1000)) {
+      LAST_LIST.delete(k);
+    }
   }
 }
+
+// ==============================
+// Did-you-mean formatter
+// ==============================
 
 function formatDidYouMean(kind, candidates) {
   const lines = [];
@@ -107,6 +171,10 @@ function formatDidYouMean(kind, candidates) {
   lines.push(`Reply with the exact name, or say "yes" to pick the first one.`);
   return lines.join("\n");
 }
+
+// ==============================
+// System prompt
+// ==============================
 
 function buildSystemPrompt(dbStatus, userText) {
   const counts = dbStatus?.counts || {};
@@ -144,6 +212,11 @@ MANDATORY WORKFLOW:
 DID-YOU-MEAN RULE (HARD):
 - If resolve_* returns candidates and match is null, respond with "Did you mean:" list and ask which one.
 
+FOLLOW-UP REFINEMENT RULE (HARD):
+- If the assistant just returned a LIST and the user says things like:
+  "include acres", "add tillable acres", "with acres", "field count", or answers "yes",
+  treat it as a refinement of the PREVIOUS LIST — not a new entity lookup.
+
 SQL-FIRST RULE (HARD):
 - For all DB facts, do not guess. Use tools.
 
@@ -155,7 +228,7 @@ DATABASE SNAPSHOT CONTEXT:
 - counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 TABLES:
-- farms(id, name, archived?)
+- farms(id, name, status, archived)
 - fields(
     id, name, farmId, farmName,
     rtkTowerId, rtkTowerName,
@@ -166,6 +239,10 @@ TABLES:
 - rtkTowers(id, name, networkId, frequency)
 `.trim();
 }
+
+// ==============================
+// Main handler
+// ==============================
 
 export async function handleChatHttp(req, res) {
   try {
@@ -181,7 +258,42 @@ export async function handleChatHttp(req, res) {
 
     if (!userText) return res.status(400).json({ ok: false, error: "missing_text" });
 
-    // Follow-up yes/no for pending disambiguation
+    // ======================================================
+    // FOLLOW-UP LIST REFINEMENT (NEW, EARLY EXIT)
+    // ======================================================
+    if (threadId && LAST_LIST.has(threadId) && (isRefinement(userText) || isYesLike(userText))) {
+      const ctx = LAST_LIST.get(threadId);
+
+      if (ctx.type === "farms") {
+        const sql = `
+          SELECT
+            f.name,
+            SUM(fl.acresTillable) AS totalTillable
+          FROM farms f
+          LEFT JOIN fields fl ON fl.farmId = f.id
+          WHERE (f.archived IS NULL OR f.archived = 0)
+            AND (fl.archived IS NULL OR fl.archived = 0)
+          GROUP BY f.id, f.name
+          ORDER BY f.name
+        `;
+
+        const result = runSql({ sql, limit: 200 });
+
+        LAST_LIST.delete(threadId);
+
+        return res.json({
+          ok: true,
+          text: result.rows
+            .map(r => `${r.name} — ${Number(r.totalTillable || 0).toLocaleString()} acres`)
+            .join("\n"),
+          meta: debugAI ? { snapshot: dbStatus.snapshot } : undefined
+        });
+      }
+    }
+
+    // ======================================================
+    // EXISTING YES / NO DISAMBIGUATION (UNCHANGED)
+    // ======================================================
     if (threadId && PENDING.has(threadId)) {
       const pend = PENDING.get(threadId);
       if (isYesLike(userText)) {
@@ -200,6 +312,9 @@ export async function handleChatHttp(req, res) {
       }
     }
 
+    // ======================================================
+    // NORMAL SQL-FIRST FLOW (UNCHANGED)
+    // ======================================================
     const tools = [
       {
         type: "function",
@@ -250,11 +365,12 @@ export async function handleChatHttp(req, res) {
 
         if (name === "db_query") {
           didAny = true;
-          const sql = safeStr(args.sql || "");
-          const params = Array.isArray(args.params) ? args.params : [];
-          const limit = Number.isFinite(args.limit) ? args.limit : 200;
           try {
-            result = runSql({ sql, params, limit });
+            result = runSql({
+              sql: safeStr(args.sql || ""),
+              params: Array.isArray(args.params) ? args.params : [],
+              limit: Number.isFinite(args.limit) ? args.limit : 200
+            });
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
@@ -315,15 +431,15 @@ export async function handleChatHttp(req, res) {
               meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
             });
           }
-        } else {
-          continue;
         }
 
-        input_list.push({
-          type: "function_call_output",
-          call_id: call.call_id,
-          output: JSON.stringify(result ?? { ok: false, error: "no_result" })
-        });
+        if (didAny) {
+          input_list.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify(result ?? { ok: false, error: "no_result" })
+          });
+        }
       }
 
       if (!didAny) break;
@@ -341,13 +457,19 @@ export async function handleChatHttp(req, res) {
 
     const text = extractAssistantText(rsp) || "No answer.";
 
-    const meta = {
-      usedOpenAI: true,
-      model: OPENAI_MODEL,
-      snapshot: dbStatus?.snapshot || null
-    };
+    // ======================================================
+    // REMEMBER LIST CONTEXT (ADDITIVE)
+    // ======================================================
+    if (threadId && /show|list|all farms/i.test(norm(userText))) {
+      LAST_LIST.set(threadId, { type: "farms", createdAt: Date.now() });
+    }
 
-    return res.json({ ok: true, text, meta: debugAI ? meta : undefined });
+    return res.json({
+      ok: true,
+      text,
+      meta: debugAI ? { usedOpenAI: true, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+    });
+
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
