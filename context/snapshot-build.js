@@ -1,13 +1,13 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-11-snapshotBuild-firestore2sqlite4-add-hel-crp
+// Rev: 2026-01-11-snapshotBuild-firestore2sqlite5-no-provider-hel-crp
 //
-// Adds columns:
-// ✅ fields.hasHEL, fields.helAcres, fields.hasCRP, fields.crpAcres
-// Keeps:
-// ✅ farmName join fill
-// ✅ rtkTowerName join fill
-// ✅ acresTillable from d.tillable
-// ✅ frequency from frequencyMHz
+// Changes:
+// ✅ Remove rtkTowers.provider (not needed)
+// ✅ Keep fields.hasHEL, fields.helAcres, fields.hasCRP, fields.crpAcres
+// ✅ Keep farmName join fill (farmId -> farms.name)
+// ✅ Keep rtkTowerName join fill (rtkTowerId -> rtkTowers.name)
+// ✅ acresTillable from d.tillable (with fallbacks)
+// ✅ tower frequency from frequencyMHz into rtkTowers.frequency
 
 'use strict';
 
@@ -90,7 +90,6 @@ function createSchema(sqlite) {
       name TEXT,
       networkId TEXT,
       frequency TEXT,
-      provider TEXT,
       data TEXT
     );
 
@@ -184,13 +183,12 @@ export async function buildSnapshotToSqlite() {
     if (f?.id) farmNameById.set(f.id, f.name || "");
   }
 
-  // RTK towers
+  // RTK towers (no provider)
   const rtkTowers = await fetchAllDocs(firestore, "rtkTowers", (id, d) => ({
     id,
     name: norm(d.name || d.towerName || ""),
     networkId: norm(d.networkId ?? d.netId ?? ""),
     frequency: norm(d.frequency ?? d.freq ?? d.frequencyMHz ?? ""),
-    provider: norm(d.provider || d.networkProvider || ""),
     data: JSON.stringify(d)
   }));
 
