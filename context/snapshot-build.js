@@ -1,12 +1,13 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-10-snapshotBuild-firestore2sqlite3-fillFarmName-mapTillable-frequencyMHz
+// Rev: 2026-01-11-snapshotBuild-firestore2sqlite4-add-hel-crp
 //
-// Builds SQLite snapshot from Firestore and uploads to GCS.
-// Changes from your current file:
-// ✅ Populate fields.farmName by joining farmId -> farms.name during build (so "by farm" works)
-// ✅ Map acresTillable from Firestore field.tillable (your real key), with fallbacks
-// ✅ Map RTK frequency from frequencyMHz into the "frequency" column (keeps existing fallbacks)
-// ✅ Keep your existing towerId -> rtkTowerName join fill
+// Adds columns:
+// ✅ fields.hasHEL, fields.helAcres, fields.hasCRP, fields.crpAcres
+// Keeps:
+// ✅ farmName join fill
+// ✅ rtkTowerName join fill
+// ✅ acresTillable from d.tillable
+// ✅ frequency from frequencyMHz
 
 'use strict';
 
@@ -103,6 +104,10 @@ function createSchema(sqlite) {
       county TEXT,
       state TEXT,
       acresTillable REAL,
+      hasHEL INTEGER,
+      helAcres REAL,
+      hasCRP INTEGER,
+      crpAcres REAL,
       archived INTEGER,
       data TEXT
     );
@@ -112,6 +117,8 @@ function createSchema(sqlite) {
     CREATE INDEX idx_fields_name ON fields(name);
     CREATE INDEX idx_fields_farmId ON fields(farmId);
     CREATE INDEX idx_fields_rtkTowerId ON fields(rtkTowerId);
+    CREATE INDEX idx_fields_county ON fields(county);
+    CREATE INDEX idx_fields_hasHEL ON fields(hasHEL);
   `);
 }
 
@@ -172,7 +179,6 @@ export async function buildSnapshotToSqlite() {
     data: JSON.stringify(d)
   }));
 
-  // ✅ Build farmId -> farmName map (for join fill into fields.farmName)
   const farmNameById = new Map();
   for (const f of farms) {
     if (f?.id) farmNameById.set(f.id, f.name || "");
@@ -183,19 +189,17 @@ export async function buildSnapshotToSqlite() {
     id,
     name: norm(d.name || d.towerName || ""),
     networkId: norm(d.networkId ?? d.netId ?? ""),
-    // ✅ Your data uses frequencyMHz; store it into "frequency" too
     frequency: norm(d.frequency ?? d.freq ?? d.frequencyMHz ?? ""),
     provider: norm(d.provider || d.networkProvider || ""),
     data: JSON.stringify(d)
   }));
 
-  // Build towerId -> towerName map for join fill
   const towerNameById = new Map();
   for (const t of rtkTowers) {
     if (t?.id) towerNameById.set(t.id, t.name || "");
   }
 
-  // Fields (fill rtkTowerName + farmName from maps; map acresTillable from "tillable")
+  // Fields
   const fields = await fetchAllDocs(firestore, "fields", (id, d) => {
     const rtkTowerId = norm(d.rtkTowerId || d.rtkId || "");
     const existingTowerName = norm(d.rtkTowerName || d.rtkName || "");
@@ -205,9 +209,14 @@ export async function buildSnapshotToSqlite() {
     const existingFarmName = norm(d.farmName || "");
     const joinedFarmName = existingFarmName || (farmId ? (farmNameById.get(farmId) || "") : "");
 
-    // ✅ Your real key is "tillable"
     const acresTillable =
       numOrNull(d.tillable ?? d.acresTillable ?? d.tillableAcres ?? d.acres ?? null);
+
+    const hasHEL = boolOrNull(d.hasHEL ?? null);
+    const helAcres = numOrNull(d.helAcres ?? null);
+
+    const hasCRP = boolOrNull(d.hasCRP ?? null);
+    const crpAcres = numOrNull(d.crpAcres ?? null);
 
     return {
       id,
@@ -219,6 +228,10 @@ export async function buildSnapshotToSqlite() {
       county: norm(d.county || ""),
       state: norm(d.state || ""),
       acresTillable,
+      hasHEL,
+      helAcres,
+      hasCRP,
+      crpAcres,
       archived: boolOrNull(d.archived ?? d.isArchived ?? d.inactive ?? null),
       data: JSON.stringify(d)
     };
