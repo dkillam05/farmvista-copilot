@@ -1,13 +1,10 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-11-snapshotBuild-firestore2sqlite5-no-provider-hel-crp
+// Rev: 2026-01-11-snapshotBuild-firestore2sqlite6-farms-status-archived
 //
 // Changes:
-// ✅ Remove rtkTowers.provider (not needed)
-// ✅ Keep fields.hasHEL, fields.helAcres, fields.hasCRP, fields.crpAcres
-// ✅ Keep farmName join fill (farmId -> farms.name)
-// ✅ Keep rtkTowerName join fill (rtkTowerId -> rtkTowers.name)
-// ✅ acresTillable from d.tillable (with fallbacks)
-// ✅ tower frequency from frequencyMHz into rtkTowers.frequency
+// ✅ farms.status + farms.archived (derived from status)
+// ✅ rtkTowers: no provider
+// ✅ fields: tillable + HEL/CRP + join-filled farmName/rtkTowerName
 
 'use strict';
 
@@ -43,6 +40,13 @@ function boolOrNull(v) {
   if (v === true) return 1;
   if (v === false) return 0;
   return null;
+}
+
+function farmArchivedFromStatus(statusRaw) {
+  const s = norm(statusRaw).toLowerCase();
+  if (!s) return null;              // unknown
+  if (s === "active") return 0;     // active
+  return 1;                         // anything else treated as archived/inactive
 }
 
 async function fetchAllDocs(db, collectionName, pickFn) {
@@ -82,6 +86,8 @@ function createSchema(sqlite) {
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
       name TEXT,
+      status TEXT,
+      archived INTEGER,
       data TEXT
     );
 
@@ -112,7 +118,11 @@ function createSchema(sqlite) {
     );
 
     CREATE INDEX idx_farms_name ON farms(name);
+    CREATE INDEX idx_farms_status ON farms(status);
+    CREATE INDEX idx_farms_archived ON farms(archived);
+
     CREATE INDEX idx_rtk_name ON rtkTowers(name);
+
     CREATE INDEX idx_fields_name ON fields(name);
     CREATE INDEX idx_fields_farmId ON fields(farmId);
     CREATE INDEX idx_fields_rtkTowerId ON fields(rtkTowerId);
@@ -171,10 +181,12 @@ export async function buildSnapshotToSqlite() {
   const sqlite = new Database(localPath);
   createSchema(sqlite);
 
-  // Farms
+  // Farms (bring status through)
   const farms = await fetchAllDocs(firestore, "farms", (id, d) => ({
     id,
     name: norm(d.name || d.farmName || ""),
+    status: norm(d.status || ""),
+    archived: farmArchivedFromStatus(d.status),
     data: JSON.stringify(d)
   }));
 
