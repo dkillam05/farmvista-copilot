@@ -1,40 +1,42 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst13-registry-tools-context
+// Rev: 2026-01-11-handleChat-sqlFirst14-hardreset-no-fast-no-registry
 //
-// This is the reset.
-// ✅ No brittle FAST routes
-// ✅ OpenAI interprets every question
-// ✅ Deterministic DB via db_query
-// ✅ Generic resolver: resolve_entity(type, query)
-// ✅ Generic memory for human follow-ups (list selection, yes/no)
+// HARD RESET (per Dane):
+// ✅ No FAST routing / no regex intent handlers
+// ✅ No entity registry / no separate context store files
+// ✅ OpenAI does 100% of intent interpretation and decides what to query
+// ✅ Server provides only:
+//    - db_query tool (SELECT-only SQL)
+//    - resolve_field / resolve_farm / resolve_rtk_tower tools (typo tolerance)
+//    - minimal thread memory (recent messages) so follow-ups work naturally
+//    - minimal pending disambiguation memory so "yes/no" after "Did you mean" works
 //
-// You are NOT programming questions.
-// You are providing tools + schema + a small generic context layer.
+// IMPORTANT:
+// - IDs are allowed internally in SQL and memory, but MUST NOT be displayed to user.
 
 'use strict';
 
 import { ensureDbReady, getDbStatus } from "../context/snapshot-db.js";
 import { runSql } from "./sqlRunner.js";
 
-import { resolveEntityTool, resolveEntityGeneric } from "./resolve-entity.js";
-import { getEntity, listEntityTypes, detectRefinement } from "./entityRegistry.js";
-import {
-  pruneContextStore,
-  setLastList,
-  getLastList,
-  setLastSelection,
-  getLastSelection,
-  setPending,
-  getPending,
-  clearPending
-} from "./contextStore.js";
+import { resolveFieldTool, resolveField } from "./resolve-fields.js";
+import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
+import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
+// -------- Minimal memory (in this file only) --------
+const TTL_MS = 12 * 60 * 60 * 1000;     // 12 hours
+const MAX_TURNS = 24;                   // keep small (app likes clean chat)
+const THREADS = new Map();              // threadId -> { messages:[{role,content}], pending, updatedAt }
+
+function nowMs() { return Date.now(); }
+
 function safeStr(v) { return (v == null ? "" : String(v)); }
 function norm(s) { return safeStr(s).trim().toLowerCase(); }
+
 function jsonTryParse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 function isYesLike(s) {
@@ -46,6 +48,39 @@ function isNoLike(s) {
   return ["no", "n", "nope", "nah"].includes(v);
 }
 
+function pruneThreads() {
+  const now = nowMs();
+  for (const [k, v] of THREADS.entries()) {
+    if (!v?.updatedAt || (now - v.updatedAt) > TTL_MS) THREADS.delete(k);
+  }
+}
+
+function getThread(threadId) {
+  if (!threadId) return null;
+  const cur = THREADS.get(threadId);
+  if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
+
+  const fresh = { messages: [], pending: null, updatedAt: nowMs() };
+  THREADS.set(threadId, fresh);
+  return fresh;
+}
+
+function pushMsg(thread, role, content) {
+  if (!thread) return;
+  thread.messages.push({ role, content: safeStr(content) });
+  if (thread.messages.length > (MAX_TURNS * 2)) {
+    thread.messages = thread.messages.slice(-MAX_TURNS * 2);
+  }
+  thread.updatedAt = nowMs();
+}
+
+function setPending(thread, pending) {
+  if (!thread) return;
+  thread.pending = pending || null; // { kind, query, candidates:[{id,name,score}], originalText }
+  thread.updatedAt = nowMs();
+}
+
+// -------- OpenAI wrapper --------
 async function openaiResponsesCreate(payload) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
@@ -58,10 +93,10 @@ async function openaiResponsesCreate(payload) {
     body: JSON.stringify(payload)
   });
 
-  const text = await rsp.text();
-  const data = jsonTryParse(text);
+  const raw = await rsp.text();
+  const data = jsonTryParse(raw);
   if (!rsp.ok) {
-    const msg = data?.error?.message || text || `OpenAI error (${rsp.status})`;
+    const msg = data?.error?.message || raw || `OpenAI error (${rsp.status})`;
     throw new Error(msg);
   }
   return data;
@@ -78,10 +113,16 @@ function extractAssistantText(responseJson) {
 
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   const parts = [];
+
   for (const it of items) {
-    if (it?.type === "message") {
-      for (const c of (it.content || [])) {
-        if (c?.type === "output_text" && typeof c.text === "string" && c.text.trim()) parts.push(c.text.trim());
+    if (!it) continue;
+    if (it.type === "message") {
+      const content = Array.isArray(it.content) ? it.content : [];
+      for (const c of content) {
+        if (c?.type === "output_text" && typeof c.text === "string") {
+          const t = c.text.trim();
+          if (t) parts.push(t);
+        }
       }
     }
   }
@@ -97,78 +138,45 @@ function formatDidYouMean(kind, candidates) {
   return lines.join("\n");
 }
 
-function parseNumberSelection(text) {
-  // "number 5", "farm number 5", "#5"
-  const t = norm(text);
-  let m = t.match(/\b(farm\s*)?(number|#)\s*(\d{1,3})\b/);
-  if (m) return Number(m[3]);
-  m = t.match(/\b(\d{1,3})\b/);
-  // only accept pure numeric message
-  if (m && t === m[1]) return Number(m[1]);
-  return null;
-}
-
-function buildSystemPrompt(dbStatus, threadId) {
+function buildSystemPrompt(dbStatus) {
   const counts = dbStatus?.counts || {};
   const snapshotId = dbStatus?.snapshot?.id || "unknown";
-
-  const lastList = threadId ? getLastList(threadId) : null;
-  const lastSel = threadId ? getLastSelection(threadId) : null;
 
   return `
 You are FarmVista Copilot.
 
-YOU do 100% of language understanding and deciding which tools to call.
-But you MUST use tools for database facts.
+YOU interpret the user's question 100%.
+But you MUST use tools for any database facts.
 
 HARD RULES:
-- Never guess DB facts. Use tools.
-- Do NOT show IDs. Use IDs internally.
-- Active-by-default: unless user explicitly asks archived/inactive, apply active filter:
-  (archived IS NULL OR archived = 0)
+1) Never guess DB facts. Use tools.
+2) Do NOT show IDs to the user. You MAY select ids internally in SQL to support joins and follow-ups.
+3) Active-by-default: unless the user explicitly requests archived/inactive, filter using:
+   (archived IS NULL OR archived = 0)
+4) Follow-ups are normal. Use conversation context:
+   - If you just listed items and user says "include acres" / "add field count" / "yes", treat it as refining the previous result.
+   - If user says "farm number 5", interpret it based on the last numbered list you provided.
+   - If user says "either one of those fields", interpret it using the last field list you provided.
 
 TOOLS:
-- resolve_entity(type, query) -> match or candidates
-- db_query(sql, params?, limit?) -> SELECT-only
+- resolve_field(query)
+- resolve_farm(query)
+- resolve_rtk_tower(query)
+- db_query(sql, params?, limit?)
 
-ENTITY TYPES:
-${listEntityTypes().join(", ")}
-
-GENERIC FOLLOW-UP BEHAVIOR:
-- If user says "number 5" and there is a last list, interpret it as selecting item #5 from that list.
-- If user asks to "include/add/with" after a list, treat it as a refinement of that same list.
-
-CONTEXT (server memory, not shown to user):
-- lastList: ${lastList ? `${lastList.type} (${lastList.items.length} items)` : "none"}
-- lastSelection: ${lastSel ? `${lastSel.type} (${lastSel.item?.name || ""})` : "none"}
-
-Snapshot: ${snapshotId}
+DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
+
+Tables available:
+- farms(id, name, status, archived)
+- fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, hasHEL, helAcres, hasCRP, crpAcres, archived)
+- rtkTowers(id, name, networkId, frequency)
 `.trim();
-}
-
-// Detect list queries so we can store lastList deterministically
-function maybeCaptureLastList(threadId, sql, rows) {
-  if (!threadId || !sql || !Array.isArray(rows) || !rows.length) return;
-
-  const low = sql.toLowerCase();
-  const cap = (type) => {
-    const ent = getEntity(type);
-    if (!ent) return;
-    // If rows contain id+name, store as lastList
-    if (rows[0]?.id != null && rows[0]?.name != null) {
-      setLastList(threadId, type, rows.map(r => ({ id: String(r.id), name: String(r.name) })));
-    }
-  };
-
-  if (low.includes(" from farms")) cap("farms");
-  else if (low.includes(" from fields")) cap("fields");
-  else if (low.includes(" from rtktowers")) cap("rtkTowers");
 }
 
 export async function handleChatHttp(req, res) {
   try {
-    pruneContextStore();
+    pruneThreads();
 
     await ensureDbReady({ force: false });
     const dbStatus = await getDbStatus();
@@ -180,19 +188,24 @@ export async function handleChatHttp(req, res) {
 
     if (!userText) return res.status(400).json({ ok: false, error: "missing_text" });
 
-    // 1) Handle pending "did you mean" with yes/no generically
-    const pend = threadId ? getPending(threadId) : null;
-    if (threadId && pend) {
+    const thread = getThread(threadId);
+
+    // ---- Handle pending "Did you mean" with yes/no (server-side) ----
+    if (thread && thread.pending) {
+      const pend = thread.pending;
+
       if (isYesLike(userText)) {
         const top = pend?.candidates?.[0] || null;
         if (top?.id && top?.name) {
-          clearPending(threadId);
-          // rewrite userText to include confirmed entity name and type
-          userText = `${pend.originalText}\n\nUser confirmed ${pend.kind}: ${top.name}.`;
-          setLastSelection(threadId, pend.kind, { id: top.id, name: top.name });
+          // Rewrite the user's "yes" into a clarification appended to the original question
+          // so OpenAI continues normally with tools, but now has confirmed entity.
+          userText = `${pend.originalText}\n\nUser confirmed: ${top.name} (id=${top.id}). Use that.`;
+          thread.pending = null;
+          thread.updatedAt = nowMs();
         }
       } else if (isNoLike(userText)) {
-        clearPending(threadId);
+        thread.pending = null;
+        thread.updatedAt = nowMs();
         return res.json({
           ok: true,
           text: "Okay — tell me the exact name you meant.",
@@ -201,48 +214,17 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // 2) Handle "number N" selection from last list generically
-    const n = parseNumberSelection(userText);
-    if (threadId && n != null) {
-      const ll = getLastList(threadId);
-      if (ll && Array.isArray(ll.items) && ll.items.length >= n && n > 0) {
-        const pick = ll.items[n - 1];
-        setLastSelection(threadId, ll.type, { id: pick.id, name: pick.name });
-        return res.json({
-          ok: true,
-          text: `Got it — #${n} is ${pick.name}. What would you like to know about it?`,
-          meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-        });
-      }
-    }
+    // ---- Build input with minimal thread context ----
+    // We keep context small + relevant: last messages + new user message.
+    const system = buildSystemPrompt(dbStatus);
 
-    // 3) Handle generic list refinement: "include acres" after a farms list
-    if (threadId) {
-      const ll = getLastList(threadId);
-      if (ll && ll.type) {
-        const refKey = detectRefinement(ll.type, userText);
-        if (refKey) {
-          const ent = getEntity(ll.type);
-          const ref = ent?.refinements?.[refKey];
-          if (ref?.sql) {
-            const r = runSql({ sql: ref.sql, limit: 500 });
-            const rows = r.rows || [];
-            // refresh last list with id+name
-            if (rows.length && rows[0]?.id != null && rows[0]?.name != null) {
-              setLastList(threadId, ll.type, rows.map(x => ({ id: String(x.id), name: String(x.name) })));
-            }
-            const lines = rows.map(ref.formatRow).filter(Boolean);
-            return res.json({
-              ok: true,
-              text: lines.join("\n") || "No results.",
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
-          }
-        }
-      }
-    }
+    const input_list = [
+      { role: "system", content: system },
+      ...(thread?.messages || []),
+      { role: "user", content: userText }
+    ];
 
-    // 4) Normal OpenAI tool calling (OpenAI does 100% interpretation)
+    // ---- Tools ----
     const tools = [
       {
         type: "function",
@@ -252,22 +234,18 @@ export async function handleChatHttp(req, res) {
           type: "object",
           properties: {
             sql: { type: "string" },
-            params: { type: "array", items: { type: ["string","number","boolean","null"] } },
+            params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
             limit: { type: "number" }
           },
           required: ["sql"]
         }
       },
-      resolveEntityTool
+      resolveFieldTool,
+      resolveFarmTool,
+      resolveRtkTowerTool
     ];
 
-    const system = buildSystemPrompt(dbStatus, threadId);
-
-    const input_list = [
-      { role: "system", content: system },
-      { role: "user", content: userText }
-    ];
-
+    // ---- OpenAI first call (must call at least one tool) ----
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -276,8 +254,10 @@ export async function handleChatHttp(req, res) {
       temperature: 0.2
     });
 
+    // Append model outputs into the running input for tool loop
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
+    // ---- Tool loop ----
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -301,37 +281,64 @@ export async function handleChatHttp(req, res) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
-          // capture lastList opportunistically
-          if (threadId && result?.rows && typeof args.sql === "string") {
-            maybeCaptureLastList(threadId, args.sql, result.rows);
-          }
-
-        } else if (name === "resolve_entity") {
+        } else if (name === "resolve_field") {
           didAny = true;
-          const type = safeStr(args.type || "");
-          const query = safeStr(args.query || "");
-          result = resolveEntityGeneric(type, query);
+          result = resolveField(safeStr(args.query || ""));
 
-          // if candidates, store pending for yes/no
-          if (threadId && result?.ok !== false && !result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            setPending(threadId, {
-              kind: type,
-              query,
-              candidates: result.candidates,
-              originalText: userText,
-              createdAt: Date.now()
-            });
-
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, {
+                kind: "field",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                originalText: safeStr(body.text || body.message || body.q || "")
+              });
+            }
             return res.json({
               ok: true,
-              text: formatDidYouMean(type, result.candidates),
+              text: formatDidYouMean("field", result.candidates),
               meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
             });
           }
 
-          // if match, store last selection
-          if (threadId && result?.match?.id) {
-            setLastSelection(threadId, type, { id: result.match.id, name: result.match.name });
+        } else if (name === "resolve_farm") {
+          didAny = true;
+          result = resolveFarm(safeStr(args.query || ""));
+
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, {
+                kind: "farm",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                originalText: safeStr(body.text || body.message || body.q || "")
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("farm", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
+
+        } else if (name === "resolve_rtk_tower") {
+          didAny = true;
+          result = resolveRtkTower(safeStr(args.query || ""));
+
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, {
+                kind: "rtk tower",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                originalText: safeStr(body.text || body.message || body.q || "")
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("rtk tower", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
           }
         }
 
@@ -356,6 +363,12 @@ export async function handleChatHttp(req, res) {
     }
 
     const text = extractAssistantText(rsp) || "No answer.";
+
+    // ---- Save conversation turns for follow-ups ----
+    if (thread) {
+      pushMsg(thread, "user", userText);
+      pushMsg(thread, "assistant", text);
+    }
 
     const meta = {
       usedOpenAI: true,
