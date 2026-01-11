@@ -1,18 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst14-hardreset-no-fast-no-registry
+// Rev: 2026-01-11-handleChat-sqlFirst15-hardreset-add-binSites
 //
-// HARD RESET (per Dane):
-// ✅ No FAST routing / no regex intent handlers
-// ✅ No entity registry / no separate context store files
-// ✅ OpenAI does 100% of intent interpretation and decides what to query
-// ✅ Server provides only:
-//    - db_query tool (SELECT-only SQL)
-//    - resolve_field / resolve_farm / resolve_rtk_tower tools (typo tolerance)
-//    - minimal thread memory (recent messages) so follow-ups work naturally
-//    - minimal pending disambiguation memory so "yes/no" after "Did you mean" works
+// Adds:
+// ✅ resolve_binSite tool
+// ✅ binSites table mentioned in prompt
 //
-// IMPORTANT:
-// - IDs are allowed internally in SQL and memory, but MUST NOT be displayed to user.
+// Keeps:
+// ✅ hard reset architecture: OpenAI interprets 100%, server executes tools
+// ✅ minimal thread memory + pending did-you-mean
 
 'use strict';
 
@@ -22,6 +17,7 @@ import { runSql } from "./sqlRunner.js";
 import { resolveFieldTool, resolveField } from "./resolve-fields.js";
 import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
 import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
+import { resolveBinSiteTool, resolveBinSite } from "./resolve-binSites.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
@@ -162,6 +158,7 @@ TOOLS:
 - resolve_field(query)
 - resolve_farm(query)
 - resolve_rtk_tower(query)
+- resolve_binSite(query)
 - db_query(sql, params?, limit?)
 
 DB snapshot: ${snapshotId}
@@ -171,6 +168,7 @@ Tables available:
 - farms(id, name, status, archived)
 - fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, hasHEL, helAcres, hasCRP, crpAcres, archived)
 - rtkTowers(id, name, networkId, frequency)
+- binSites(id, name, status, used, totalBushels)
 `.trim();
 }
 
@@ -197,8 +195,6 @@ export async function handleChatHttp(req, res) {
       if (isYesLike(userText)) {
         const top = pend?.candidates?.[0] || null;
         if (top?.id && top?.name) {
-          // Rewrite the user's "yes" into a clarification appended to the original question
-          // so OpenAI continues normally with tools, but now has confirmed entity.
           userText = `${pend.originalText}\n\nUser confirmed: ${top.name} (id=${top.id}). Use that.`;
           thread.pending = null;
           thread.updatedAt = nowMs();
@@ -215,7 +211,6 @@ export async function handleChatHttp(req, res) {
     }
 
     // ---- Build input with minimal thread context ----
-    // We keep context small + relevant: last messages + new user message.
     const system = buildSystemPrompt(dbStatus);
 
     const input_list = [
@@ -242,7 +237,8 @@ export async function handleChatHttp(req, res) {
       },
       resolveFieldTool,
       resolveFarmTool,
-      resolveRtkTowerTool
+      resolveRtkTowerTool,
+      resolveBinSiteTool
     ];
 
     // ---- OpenAI first call (must call at least one tool) ----
@@ -254,7 +250,6 @@ export async function handleChatHttp(req, res) {
       temperature: 0.2
     });
 
-    // Append model outputs into the running input for tool loop
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
     // ---- Tool loop ----
@@ -284,7 +279,6 @@ export async function handleChatHttp(req, res) {
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
-
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
               setPending(thread, {
@@ -304,7 +298,6 @@ export async function handleChatHttp(req, res) {
         } else if (name === "resolve_farm") {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
-
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
               setPending(thread, {
@@ -324,7 +317,6 @@ export async function handleChatHttp(req, res) {
         } else if (name === "resolve_rtk_tower") {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
-
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
               setPending(thread, {
@@ -337,6 +329,25 @@ export async function handleChatHttp(req, res) {
             return res.json({
               ok: true,
               text: formatDidYouMean("rtk tower", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
+
+        } else if (name === "resolve_binSite") {
+          didAny = true;
+          result = resolveBinSite(safeStr(args.query || ""));
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, {
+                kind: "bin site",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                originalText: safeStr(body.text || body.message || body.q || "")
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("bin site", result.candidates),
               meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
             });
           }
