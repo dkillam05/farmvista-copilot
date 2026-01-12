@@ -1,21 +1,17 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-11-snapshotBuild-firestore2sqlite8-binMovements-inventory
+// Rev: 2026-01-11-snapshotBuild-firestore2sqlite9-binMovements-normalize-cropType
 //
-// Adds deterministic inventory via binMovements:
-// ✅ binSites table
-// ✅ binMovements table
-// ✅ Views:
-//    - v_bin_inventory (siteId+binNum+cropType)
-//    - v_site_inventory (siteId+cropType)
-//    - v_total_inventory (cropType)
+// Change:
+// ✅ Adds v_bin_movements_norm that auto-fills missing cropType:
+//    - For rows where cropType is blank, use the most recent prior non-blank cropType
+//      for the same siteId + binNum (based on dateISO order).
+// ✅ Inventory views now use cropTypeNorm, eliminating "(unknown)" for typical workflows.
 //
 // Keeps:
-// ✅ farms.status + farms.archived
-// ✅ rtkTowers no provider
-// ✅ fields with tillable + HEL/CRP + join-filled farmName/rtkTowerName
-//
-// IMPORTANT:
-// Inventory uses: SUM(in) - SUM(out) grouped by siteId, binNum, cropType (best accuracy).
+// ✅ binSites table
+// ✅ binMovements table (raw preserved)
+// ✅ v_bin_inventory / v_site_inventory / v_total_inventory still exist
+// ✅ farms/fields/rtkTowers unchanged
 
 'use strict';
 
@@ -91,9 +87,10 @@ function createSchema(sqlite) {
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
 
-    DROP VIEW IF EXISTS v_bin_inventory;
-    DROP VIEW IF EXISTS v_site_inventory;
     DROP VIEW IF EXISTS v_total_inventory;
+    DROP VIEW IF EXISTS v_site_inventory;
+    DROP VIEW IF EXISTS v_bin_inventory;
+    DROP VIEW IF EXISTS v_bin_movements_norm;
 
     DROP TABLE IF EXISTS farms;
     DROP TABLE IF EXISTS rtkTowers;
@@ -182,14 +179,43 @@ function createSchema(sqlite) {
     CREATE INDEX idx_binMoves_date ON binMovements(dateISO);
     CREATE INDEX idx_binMoves_dir ON binMovements(direction);
 
-    -- Inventory views (deterministic math)
+    /*
+      v_bin_movements_norm:
+      - cropTypeNorm is:
+        - the row's cropType if present
+        - else the most recent prior non-empty cropType for same siteId+binNum (by dateISO, then id)
+      This matches reality: corn in -> corn out, without editing old records.
+    */
+    CREATE VIEW v_bin_movements_norm AS
+      SELECT
+        m.*,
+        COALESCE(
+          NULLIF(TRIM(m.cropType), ''),
+          (
+            SELECT NULLIF(TRIM(m2.cropType), '')
+            FROM binMovements m2
+            WHERE m2.siteId = m.siteId
+              AND m2.binNum = m.binNum
+              AND NULLIF(TRIM(m2.cropType), '') IS NOT NULL
+              AND (
+                    m2.dateISO < m.dateISO
+                 OR (m2.dateISO = m.dateISO AND m2.id <= m.id)
+                  )
+            ORDER BY m2.dateISO DESC, m2.id DESC
+            LIMIT 1
+          ),
+          '(unknown)'
+        ) AS cropTypeNorm
+      FROM binMovements m;
+
+    -- Inventory views built from normalized movements
     CREATE VIEW v_bin_inventory AS
       SELECT
         m.siteId AS siteId,
         COALESCE(s.name, m.siteName) AS siteName,
         m.binNum AS binNum,
         m.binIndex AS binIndex,
-        COALESCE(NULLIF(TRIM(m.cropType), ''), '(unknown)') AS cropType,
+        COALESCE(NULLIF(TRIM(m.cropTypeNorm), ''), '(unknown)') AS cropType,
 
         SUM(CASE
               WHEN lower(m.direction) = 'in'  THEN COALESCE(m.bushels, 0)
@@ -205,9 +231,9 @@ function createSchema(sqlite) {
         s.status AS siteStatus,
         s.used AS siteUsed
 
-      FROM binMovements m
+      FROM v_bin_movements_norm m
       LEFT JOIN binSites s ON s.id = m.siteId
-      GROUP BY m.siteId, COALESCE(s.name, m.siteName), m.binNum, m.binIndex, COALESCE(NULLIF(TRIM(m.cropType), ''), '(unknown)');
+      GROUP BY m.siteId, COALESCE(s.name, m.siteName), m.binNum, m.binIndex, COALESCE(NULLIF(TRIM(m.cropTypeNorm), ''), '(unknown)');
 
     CREATE VIEW v_site_inventory AS
       SELECT
