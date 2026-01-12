@@ -1,12 +1,15 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst19-cropYear-clarify
+// Rev: 2026-01-12-handleChat-sqlFirst20-cropYear+grain-totaling
 //
 // Change:
-// ✅ If a question involves data with cropYear (ex: grainBagEvents) and the user doesn't specify,
-//    the assistant MUST ask which crop year (or combined years) before answering.
+// ✅ Adds a HARD "GRAIN TOTALING RULE" to combine bins + bags when user explicitly asks for total.
+// ✅ Keeps cropYear clarification.
+// ✅ Keeps bin inventory rule (binSiteBins is source of truth).
 //
-// Keeps:
-// ✅ your current logic, tools, and flow as-is.
+// IMPORTANT NOTE:
+// - grainBagEvents does NOT include bushel quantities. It has counts and bag SKU/dimensions.
+// - Therefore the bot cannot add “bag bushels” unless you later store bushels (or an agreed conversion).
+// - When user asks for total bushels including bags, the bot will return bin bushels + bag counts and ask for an estimation rule.
 
 'use strict';
 
@@ -162,11 +165,32 @@ CROP YEAR RULE (HARD):
 - Current cropYear table(s):
   - grainBagEvents(cropYear)
 
-BIN INVENTORY RULE:
+BIN INVENTORY RULE (HARD):
 - Bin inventory is SOURCE OF TRUTH from binSiteBins.onHandBushels.
 - Crop-in-bin is binSiteBins.lastCropType.
 - Capacity is binSiteBins.capacityBushels.
 - Site status is binSites.status.
+- Crop filters MUST be case-insensitive:
+  lower(lastCropType) = lower(?)
+
+GRAIN TOTALING RULE (HARD):
+- There are two separate storage locations:
+  1) Grain bins (bushels): binSiteBins.onHandBushels
+  2) Grain bags (events): grainBagEvents
+- If the user asks for "TOTAL", "ALL STORAGE", "OVERALL", or "BINS + BAGS", you MUST include BOTH:
+  - Bin storage result
+  - Grain bag result
+  and clearly show a breakdown.
+
+IMPORTANT LIMITATION (HARD):
+- grainBagEvents does NOT store a bushel quantity per bag in the current schema.
+  It stores counts (full/partial), partialFeet, and SKU dimensions.
+- Therefore, you MUST NOT invent bag bushels.
+- If the user asks for "total BUSHELS including bags", you must:
+  1) Provide bin bushels from binSiteBins
+  2) Provide bag counts (full/partial) from grainBagEvents
+  3) Ask whether they want an ESTIMATE for bag bushels and what conversion rule to use
+     (e.g., bushels per full bag, or bushels per foot).
 
 TOOLS:
 - resolve_field(query)
@@ -179,7 +203,16 @@ DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 Tables:
-- grainBagEvents(id, type, datePlaced, cropType, cropYear, cropMoisture, fieldId, fieldName, bagBrand, bagDiameterFt, bagSizeFeet, countFull, countPartial, priority, priorityReason, createdAtISO, updatedAtISO, data)
+- grainBagEvents(
+    id, type, datePlaced, cropType, cropYear, cropMoisture,
+    fieldId, fieldName,
+    bagBrand, bagDiameterFt, bagSizeFeet,
+    countFull, countPartial,
+    partialFeetJson, partialUsageJson,
+    priority, priorityReason,
+    createdAtISO, updatedAtISO,
+    data
+  )
 - binSites(id, name, status, used, totalBushels)
 - binSiteBins(siteId, siteName, binNum, capacityBushels, onHandBushels, lastCropType, lastCropMoisture, lastUpdatedMs, lastUpdatedBy, lastUpdatedUid)
 `.trim();
