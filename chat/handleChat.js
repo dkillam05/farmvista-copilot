@@ -1,19 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst25-min-guardrails-openai-led
+// Rev: 2026-01-12-handleChat-sqlFirst26-min-guardrails-auto-first
 //
-// GOAL (per Dane):
-// ✅ Remove hardcoded intent/routing behavior.
-// ✅ Let OpenAI decide what to query and when.
-// ✅ Keep only SMALL guardrails to prevent rabbit holes:
-//    1) Never guess DB facts — use tools.
-//    2) Never show IDs.
-//    3) If user says "in storage" and doesn't specify bins/bags/total → ask ONE clarifier.
-//    4) CropYear: only ask for bags when multiple years exist (auto-use if single year).
+// FIX:
+// ✅ First OpenAI call uses tool_choice:"auto" (NOT "required").
+//    This allows the model to ask a clarifying question instead of being forced into a tool call.
+// ✅ Tool loop remains the same.
+// ✅ Minimal guardrails remain the same.
+// ✅ No intent routing / no fast handlers.
 //
-// Keeps:
-// ✅ SQL tool loop
-// ✅ Minimal thread memory + pending did-you-mean ("yes/no")
-// ✅ resolvers available (but model chooses when to use them)
+// This prevents: "corn" -> resolve_field -> Cornpile suggestions.
 
 'use strict';
 
@@ -157,50 +152,33 @@ SMALL GUARDRAILS:
    ask ONE clarifying question first:
    "Do you mean bin storage, field bag storage, or total (bins + bags)?"
 4) CropYear (bags only): if answering a field-bag question and user didn't specify crop year,
-   check distinct crop years first:
-     SELECT COUNT(DISTINCT cropYear) AS nYears
-     FROM grainBagEvents
-     WHERE type='putDown'
-       AND (status IS NULL OR status <> 'pickedUp')
-       AND cropYear IS NOT NULL
-       AND lower(cropType)=lower(?);
-   - If nYears=0 or nYears=1, proceed without asking (auto-use the single year if present).
-   - If nYears>=2, ask:
-     "Which crop year (e.g., 2025), or all years combined?"
+   check distinct crop years first; only ask if 2+ years exist.
 
-IMPORTANT: Do NOT treat crop words like "corn" or "soybeans" as a field name. Only resolve a field/farm/tower/site when the user clearly refers to one.
+IMPORTANT: Do NOT treat crop words like "corn" or "soybeans" as a field/farm name.
+Only resolve a field/farm/tower/site when the user clearly refers to one.
 
-GRAIN LOGIC (matches the FarmVista app):
+GRAIN LOGIC (matches the app):
 - Bin bushels: SUM(binSiteBins.onHandBushels) filtered by lower(lastCropType)=lower(crop).
 - Field bag bushels:
-  - Use productsGrainBags (corn-rated bushels) + grainBagEvents (counts + partialFeetJson).
   - ratedCornBu per open putDown row =
       countFull * productsGrainBags.bushelsCorn
     + sum(partialFeet) * (productsGrainBags.bushelsCorn / productsGrainBags.lengthFt)
-  - Convert ratedCornBu to crop bushels using the same factors as /Farm-vista/js/grain-capacity.js:
-      corn 1.00
-      soybeans 0.93
-      wheat 1.07
-      milo 1.02
-      oats 0.78
+  - convert to crop using factors:
+      corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78
     cropBu = ratedCornBu * factor
-  - Join grainBagEvents to productsGrainBags by:
-      grainBagEvents.bagDiameterFt = productsGrainBags.diameterFt AND
-      grainBagEvents.bagSizeFeet   = productsGrainBags.lengthFt
-  - partialFeetJson is a JSON array; sum feet using json_each() in SQLite.
 
 TOOLS AVAILABLE:
 - db_query(sql, params?, limit?)
-- resolve_field(query) / resolve_farm(query) / resolve_rtk_tower(query) / resolve_binSite(query)
-(Use resolvers only when needed; otherwise go straight to SQL.)
+- resolve_field / resolve_farm / resolve_rtk_tower / resolve_binSite
+(use resolvers only when needed)
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 Key tables:
-- binSiteBins(siteId, siteName, binNum, onHandBushels, lastCropType, ...)
-- grainBagEvents(id, type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetJson, ...)
-- productsGrainBags(id, brand, diameterFt, lengthFt, bushelsCorn, status, ...)
+- binSiteBins(...)
+- grainBagEvents(...)
+- productsGrainBags(...)
 `.trim();
 }
 
@@ -220,7 +198,7 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
-    // ---- Handle pending "Did you mean" with yes/no (server-side) ----
+    // ---- pending did-you-mean yes/no ----
     if (thread && thread.pending) {
       const pend = thread.pending;
 
@@ -271,11 +249,11 @@ export async function handleChatHttp(req, res) {
       resolveBinSiteTool
     ];
 
-    // First call: require at least one tool call (keeps DB-first discipline)
+    // ✅ FIRST CALL: allow the model to ask a clarifying question (no forced tool call)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
-      tool_choice: "required",
+      tool_choice: "auto",
       input: input_list,
       temperature: 0.2
     });
@@ -306,42 +284,14 @@ export async function handleChatHttp(req, res) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
-        } else if (name === "resolve_binSite") {
-          didAny = true;
-          result = resolveBinSite(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, {
-                kind: "bin site",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                originalText: safeStr(body.text || body.message || body.q || "")
-              });
-            }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("bin site", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
-          }
-
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
-              setPending(thread, {
-                kind: "field",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                originalText: safeStr(body.text || body.message || body.q || "")
-              });
+              setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("field", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
         } else if (name === "resolve_farm") {
@@ -349,18 +299,9 @@ export async function handleChatHttp(req, res) {
           result = resolveFarm(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
-              setPending(thread, {
-                kind: "farm",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                originalText: safeStr(body.text || body.message || body.q || "")
-              });
+              setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("farm", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
         } else if (name === "resolve_rtk_tower") {
@@ -368,18 +309,19 @@ export async function handleChatHttp(req, res) {
           result = resolveRtkTower(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
             if (thread) {
-              setPending(thread, {
-                kind: "rtk tower",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                originalText: safeStr(body.text || body.message || body.q || "")
-              });
+              setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("rtk tower", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+          }
+
+        } else if (name === "resolve_binSite") {
+          didAny = true;
+          result = resolveBinSite(safeStr(args.query || ""));
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            }
+            return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
         }
 
@@ -410,12 +352,7 @@ export async function handleChatHttp(req, res) {
       pushMsg(thread, "assistant", text);
     }
 
-    const meta = {
-      usedOpenAI: true,
-      model: OPENAI_MODEL,
-      snapshot: dbStatus?.snapshot || null
-    };
-
+    const meta = { usedOpenAI: true, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null };
     return res.json({ ok: true, text, meta: debugAI ? meta : undefined });
 
   } catch (e) {
