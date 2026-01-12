@@ -1,13 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst15-hardreset-add-binSites
+// Rev: 2026-01-11-handleChat-sqlFirst16-hardreset-add-bin-inventory-views
 //
-// Adds:
-// ✅ resolve_binSite tool
-// ✅ binSites table mentioned in prompt
+// Change:
+// ✅ System prompt now includes binMovements and inventory views so OpenAI can answer inventory questions accurately.
 //
 // Keeps:
 // ✅ hard reset architecture: OpenAI interprets 100%, server executes tools
 // ✅ minimal thread memory + pending did-you-mean
+// ✅ resolve_binSite already wired
 
 'use strict';
 
@@ -169,6 +169,16 @@ Tables available:
 - fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, hasHEL, helAcres, hasCRP, crpAcres, archived)
 - rtkTowers(id, name, networkId, frequency)
 - binSites(id, name, status, used, totalBushels)
+- binMovements(id, siteId, siteName, binNum, binIndex, dateISO, direction[in|out], bushels, cropType, cropMoisture, note, submittedBy, submittedByUid)
+
+Inventory Views (preferred for accuracy):
+- v_bin_inventory(siteId, siteName, binNum, binIndex, cropType, netBushels, totalIn, totalOut, lastDateISO, siteCapacityBushels, siteStatus, siteUsed)
+- v_site_inventory(siteId, siteName, cropType, netBushels, totalIn, totalOut, lastDateISO)
+- v_total_inventory(cropType, netBushels)
+
+IMPORTANT:
+- Inventory is deterministic: netBushels = SUM(in) - SUM(out).
+- Prefer querying the views above for "how many bushels left" questions.
 `.trim();
 }
 
