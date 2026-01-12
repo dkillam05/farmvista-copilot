@@ -1,18 +1,13 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite11-binSites-onHand-only
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite12-add-grain-bag-events
 //
-// Inventory SOURCE OF TRUTH:
-// ✅ binSites.bins[].onHand (NOT binMovements)
-//
-// Changes:
-// ✅ REMOVE binMovements + all inventory views
-// ✅ ADD binSiteBins table (expanded from binSites.bins[] array)
+// Adds:
+// ✅ grainBagEvents table (from Firestore collection grain_bag_events)
+// ✅ Stores full raw record in data, and extracts key columns for querying
 //
 // Keeps:
-// ✅ farms/status/archived
-// ✅ rtkTowers
-// ✅ fields + HEL/CRP + join-filled farmName/rtkTowerName
-// ✅ binSites table
+// ✅ farms/fields/rtkTowers
+// ✅ binSites + binSiteBins (onHand inventory mode)
 
 'use strict';
 
@@ -58,6 +53,34 @@ function farmArchivedFromStatus(statusRaw) {
   return 1;
 }
 
+function toISO(ts) {
+  try {
+    if (!ts) return "";
+    if (typeof ts === "string") return ts;
+    if (typeof ts === "object") {
+      if (typeof ts.__time__ === "string") return ts.__time__;
+      if (typeof ts.toDate === "function") return ts.toDate().toISOString();
+      if (typeof ts.seconds === "number") return new Date(ts.seconds * 1000).toISOString();
+    }
+  } catch {}
+  return "";
+}
+
+function toMs(ts) {
+  try {
+    const iso = toISO(ts);
+    if (iso) {
+      const ms = Date.parse(iso);
+      return Number.isFinite(ms) ? ms : null;
+    }
+    if (ts && typeof ts.toMillis === "function") {
+      const ms = ts.toMillis();
+      return Number.isFinite(ms) ? ms : null;
+    }
+  } catch {}
+  return null;
+}
+
 async function fetchAllDocs(db, collectionName, pickFn) {
   const col = db.collection(collectionName);
 
@@ -93,6 +116,7 @@ function createSchema(sqlite) {
     DROP TABLE IF EXISTS fields;
     DROP TABLE IF EXISTS binSites;
     DROP TABLE IF EXISTS binSiteBins;
+    DROP TABLE IF EXISTS grainBagEvents;
 
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
@@ -137,7 +161,6 @@ function createSchema(sqlite) {
       data TEXT
     );
 
-    -- Expanded bins[] array from binSites
     CREATE TABLE binSiteBins (
       siteId TEXT,
       siteName TEXT,
@@ -152,23 +175,59 @@ function createSchema(sqlite) {
       PRIMARY KEY (siteId, binNum)
     );
 
+    -- Grain bag events (normalized + raw)
+    CREATE TABLE grainBagEvents (
+      id TEXT PRIMARY KEY,
+      type TEXT,
+      datePlaced TEXT,
+      cropType TEXT,
+      cropYear INTEGER,
+      cropMoisture REAL,
+
+      fieldId TEXT,
+      fieldName TEXT,
+
+      bagSkuId TEXT,
+      bagBrand TEXT,
+      bagDiameterFt REAL,
+      bagSizeFeet REAL,
+
+      countFull INTEGER,
+      countPartial INTEGER,
+
+      partialFeetJson TEXT,
+      partialUsageJson TEXT,
+
+      priority INTEGER,
+      priorityReason TEXT,
+
+      submittedByEmail TEXT,
+      submittedByName TEXT,
+
+      createdAtISO TEXT,
+      createdAtMs INTEGER,
+      updatedAtISO TEXT,
+      updatedAtMs INTEGER,
+
+      data TEXT
+    );
+
     CREATE INDEX idx_farms_name ON farms(name);
-    CREATE INDEX idx_farms_status ON farms(status);
     CREATE INDEX idx_farms_archived ON farms(archived);
 
     CREATE INDEX idx_rtk_name ON rtkTowers(name);
 
     CREATE INDEX idx_fields_name ON fields(name);
     CREATE INDEX idx_fields_farmId ON fields(farmId);
-    CREATE INDEX idx_fields_rtkTowerId ON fields(rtkTowerId);
     CREATE INDEX idx_fields_county ON fields(county);
-    CREATE INDEX idx_fields_hasHEL ON fields(hasHEL);
 
     CREATE INDEX idx_binSites_name ON binSites(name);
-    CREATE INDEX idx_binSites_status ON binSites(status);
-
-    CREATE INDEX idx_binSiteBins_site ON binSiteBins(siteName);
     CREATE INDEX idx_binSiteBins_crop ON binSiteBins(lastCropType);
+
+    CREATE INDEX idx_gbe_crop ON grainBagEvents(cropType);
+    CREATE INDEX idx_gbe_date ON grainBagEvents(datePlaced);
+    CREATE INDEX idx_gbe_field ON grainBagEvents(fieldId);
+    CREATE INDEX idx_gbe_type ON grainBagEvents(type);
   `);
 }
 
@@ -256,12 +315,6 @@ export async function buildSnapshotToSqlite() {
     const existingFarmName = norm(d.farmName || "");
     const joinedFarmName = existingFarmName || (farmId ? (farmNameById.get(farmId) || "") : "");
 
-    const acresTillable = numOrNull(d.tillable ?? d.acresTillable ?? d.tillableAcres ?? d.acres ?? null);
-    const hasHEL = bool01(d.hasHEL ?? null);
-    const helAcres = numOrNull(d.helAcres ?? null);
-    const hasCRP = bool01(d.hasCRP ?? null);
-    const crpAcres = numOrNull(d.crpAcres ?? null);
-
     return {
       id,
       name: norm(d.name || d.fieldName || ""),
@@ -271,17 +324,17 @@ export async function buildSnapshotToSqlite() {
       rtkTowerName: joinedTowerName,
       county: norm(d.county || ""),
       state: norm(d.state || ""),
-      acresTillable,
-      hasHEL,
-      helAcres,
-      hasCRP,
-      crpAcres,
+      acresTillable: numOrNull(d.tillable ?? d.acresTillable ?? d.tillableAcres ?? d.acres ?? null),
+      hasHEL: bool01(d.hasHEL ?? null),
+      helAcres: numOrNull(d.helAcres ?? null),
+      hasCRP: bool01(d.hasCRP ?? null),
+      crpAcres: numOrNull(d.crpAcres ?? null),
       archived: bool01(d.archived ?? d.isArchived ?? d.inactive ?? null),
       data: JSON.stringify(d)
     };
   });
 
-  // binSites + expanded bins
+  // binSites + expanded bins[]
   const binSitesRaw = await fetchAllDocs(firestore, "binSites", (id, d) => ({
     id,
     name: norm(d.name || ""),
@@ -303,15 +356,13 @@ export async function buildSnapshotToSqlite() {
 
   const binSiteBins = [];
   for (const s of binSitesRaw) {
-    const siteId = s.id;
-    const siteName = s.name;
     for (const b of (s.bins || [])) {
       const binNum = numOrNull(b.num ?? null);
       if (!binNum) continue;
 
       binSiteBins.push({
-        siteId,
-        siteName,
+        siteId: s.id,
+        siteName: s.name,
         binNum,
         capacityBushels: numOrNull(b.bushels ?? null),
         onHandBushels: numOrNull(b.onHand ?? null),
@@ -324,18 +375,65 @@ export async function buildSnapshotToSqlite() {
     }
   }
 
+  // grain_bag_events (ALL sections preserved via data)
+  const grainBagEvents = await fetchAllDocs(firestore, "grain_bag_events", (id, d) => {
+    const bagSku = (d.bagSku && typeof d.bagSku === "object") ? d.bagSku : {};
+    const counts = (d.counts && typeof d.counts === "object") ? d.counts : {};
+    const field = (d.field && typeof d.field === "object") ? d.field : {};
+    const submittedBy = (d.submittedBy && typeof d.submittedBy === "object") ? d.submittedBy : {};
+
+    return {
+      id,
+
+      type: norm(d.type || ""),
+      datePlaced: norm(d.datePlaced || d.dateISO || ""),
+      cropType: norm(d.cropType || ""),
+      cropYear: numOrNull(d.cropYear ?? null),
+      cropMoisture: numOrNull(d.cropMoisture ?? null),
+
+      fieldId: norm(field.id || ""),
+      fieldName: norm(field.name || ""),
+
+      bagSkuId: norm(bagSku.id || ""),
+      bagBrand: norm(bagSku.brand || ""),
+      bagDiameterFt: numOrNull(bagSku.diameterFt ?? null),
+      bagSizeFeet: numOrNull(bagSku.sizeFeet ?? null),
+
+      countFull: numOrNull(counts.full ?? null),
+      countPartial: numOrNull(counts.partial ?? null),
+
+      partialFeetJson: JSON.stringify(Array.isArray(d.partialFeet) ? d.partialFeet : []),
+      partialUsageJson: JSON.stringify(Array.isArray(d.partialUsage) ? d.partialUsage : []),
+
+      priority: numOrNull(d.priority ?? null),
+      priorityReason: norm(d.priorityReason || ""),
+
+      submittedByEmail: norm(submittedBy.email || d.submittedByUid || ""),
+      submittedByName: norm(submittedBy.name || d.submittedBy || ""),
+
+      createdAtISO: toISO(d.createdAt),
+      createdAtMs: toMs(d.createdAt),
+      updatedAtISO: toISO(d.updatedAt),
+      updatedAtMs: toMs(d.updatedAt),
+
+      data: JSON.stringify(d)
+    };
+  });
+
   insertRows(sqlite, "farms", farms);
   insertRows(sqlite, "rtkTowers", rtkTowers);
   insertRows(sqlite, "fields", fields);
   insertRows(sqlite, "binSites", binSites);
   if (binSiteBins.length) insertRows(sqlite, "binSiteBins", binSiteBins);
+  if (grainBagEvents.length) insertRows(sqlite, "grainBagEvents", grainBagEvents);
 
   const counts = {
     farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
     rtkTowers: sqlite.prepare("SELECT COUNT(1) AS n FROM rtkTowers").get().n,
     fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n,
     binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n,
-    binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n
+    binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n,
+    grainBagEvents: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagEvents").get().n
   };
 
   sqlite.close();
