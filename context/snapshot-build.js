@@ -1,15 +1,18 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite10-binMovements-createdAt-normalize
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite11-binSites-onHand-only
 //
-// Fix:
-// ✅ Add binMovements.createdAtISO + createdAtMs
-// ✅ Normalize missing cropType using last known cropType for same siteId+binNum
-//    ordered by createdAtMs (NOT dateISO/id)
-// ✅ Inventory views use normalized cropType so "corn in => corn out" works reliably
+// Inventory SOURCE OF TRUTH:
+// ✅ binSites.bins[].onHand (NOT binMovements)
+//
+// Changes:
+// ✅ REMOVE binMovements + all inventory views
+// ✅ ADD binSiteBins table (expanded from binSites.bins[] array)
 //
 // Keeps:
-// ✅ binSites + binMovements + inventory views
-// ✅ farms/fields/rtkTowers unchanged
+// ✅ farms/status/archived
+// ✅ rtkTowers
+// ✅ fields + HEL/CRP + join-filled farmName/rtkTowerName
+// ✅ binSites table
 
 'use strict';
 
@@ -55,36 +58,6 @@ function farmArchivedFromStatus(statusRaw) {
   return 1;
 }
 
-function toCreatedAtISO(d) {
-  // Firestore Timestamp sometimes comes in as { "__time__": "..." } in your snapshot JSON-ish shape
-  // In admin SDK, it can be a Timestamp object.
-  try {
-    if (!d) return "";
-    if (typeof d === "string") return d;
-    if (typeof d === "object") {
-      if (typeof d.__time__ === "string") return d.__time__;
-      if (typeof d.toDate === "function") return d.toDate().toISOString();
-      if (typeof d.seconds === "number") return new Date(d.seconds * 1000).toISOString();
-    }
-  } catch {}
-  return "";
-}
-
-function toCreatedAtMs(d) {
-  try {
-    const iso = toCreatedAtISO(d);
-    if (iso) {
-      const ms = Date.parse(iso);
-      return Number.isFinite(ms) ? ms : null;
-    }
-    if (d && typeof d.toMillis === "function") {
-      const ms = d.toMillis();
-      return Number.isFinite(ms) ? ms : null;
-    }
-  } catch {}
-  return null;
-}
-
 async function fetchAllDocs(db, collectionName, pickFn) {
   const col = db.collection(collectionName);
 
@@ -115,16 +88,11 @@ function createSchema(sqlite) {
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
 
-    DROP VIEW IF EXISTS v_total_inventory;
-    DROP VIEW IF EXISTS v_site_inventory;
-    DROP VIEW IF EXISTS v_bin_inventory;
-    DROP VIEW IF EXISTS v_bin_movements_norm;
-
     DROP TABLE IF EXISTS farms;
     DROP TABLE IF EXISTS rtkTowers;
     DROP TABLE IF EXISTS fields;
     DROP TABLE IF EXISTS binSites;
-    DROP TABLE IF EXISTS binMovements;
+    DROP TABLE IF EXISTS binSiteBins;
 
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
@@ -169,23 +137,19 @@ function createSchema(sqlite) {
       data TEXT
     );
 
-    CREATE TABLE binMovements (
-      id TEXT PRIMARY KEY,
+    -- Expanded bins[] array from binSites
+    CREATE TABLE binSiteBins (
       siteId TEXT,
       siteName TEXT,
-      binIndex INTEGER,
       binNum INTEGER,
-      dateISO TEXT,
-      createdAtISO TEXT,
-      createdAtMs INTEGER,
-      direction TEXT,        -- 'in' or 'out'
-      bushels REAL,
-      cropType TEXT,
-      cropMoisture REAL,
-      note TEXT,
-      submittedBy TEXT,
-      submittedByUid TEXT,
-      data TEXT
+      capacityBushels REAL,
+      onHandBushels REAL,
+      lastCropType TEXT,
+      lastCropMoisture REAL,
+      lastUpdatedMs INTEGER,
+      lastUpdatedBy TEXT,
+      lastUpdatedUid TEXT,
+      PRIMARY KEY (siteId, binNum)
     );
 
     CREATE INDEX idx_farms_name ON farms(name);
@@ -203,71 +167,8 @@ function createSchema(sqlite) {
     CREATE INDEX idx_binSites_name ON binSites(name);
     CREATE INDEX idx_binSites_status ON binSites(status);
 
-    CREATE INDEX idx_binMoves_site_bin ON binMovements(siteId, binNum);
-    CREATE INDEX idx_binMoves_site_bin_time ON binMovements(siteId, binNum, createdAtMs);
-    CREATE INDEX idx_binMoves_date ON binMovements(dateISO);
-    CREATE INDEX idx_binMoves_dir ON binMovements(direction);
-
-    /*
-      v_bin_movements_norm:
-      - cropTypeNorm is:
-        - row cropType if present
-        - else last prior non-empty cropType for same siteId+binNum ordered by createdAtMs
-      This makes "corn in => corn out" work even when OUT doesn't store cropType.
-    */
-    CREATE VIEW v_bin_movements_norm AS
-      SELECT
-        m.*,
-        COALESCE(
-          NULLIF(TRIM(m.cropType), ''),
-          (
-            SELECT NULLIF(TRIM(m2.cropType), '')
-            FROM binMovements m2
-            WHERE m2.siteId = m.siteId
-              AND m2.binNum = m.binNum
-              AND NULLIF(TRIM(m2.cropType), '') IS NOT NULL
-              AND COALESCE(m2.createdAtMs, 0) <= COALESCE(m.createdAtMs, 0)
-            ORDER BY COALESCE(m2.createdAtMs, 0) DESC, m2.id DESC
-            LIMIT 1
-          ),
-          '(unknown)'
-        ) AS cropTypeNorm
-      FROM binMovements m;
-
-    -- Inventory views built from normalized movements
-    CREATE VIEW v_bin_inventory AS
-      SELECT
-        m.siteId AS siteId,
-        COALESCE(s.name, m.siteName) AS siteName,
-        m.binNum AS binNum,
-        m.binIndex AS binIndex,
-        COALESCE(NULLIF(TRIM(m.cropTypeNorm), ''), '(unknown)') AS cropType,
-
-        SUM(CASE
-              WHEN lower(m.direction) = 'in'  THEN COALESCE(m.bushels, 0)
-              WHEN lower(m.direction) = 'out' THEN -COALESCE(m.bushels, 0)
-              ELSE 0
-            END) AS netBushels
-
-      FROM v_bin_movements_norm m
-      LEFT JOIN binSites s ON s.id = m.siteId
-      GROUP BY m.siteId, COALESCE(s.name, m.siteName), m.binNum, m.binIndex, COALESCE(NULLIF(TRIM(m.cropTypeNorm), ''), '(unknown)');
-
-    CREATE VIEW v_site_inventory AS
-      SELECT
-        siteId,
-        siteName,
-        cropType,
-        SUM(netBushels) AS netBushels
-      FROM v_bin_inventory
-      GROUP BY siteId, siteName, cropType;
-
-    CREATE VIEW v_total_inventory AS
-      SELECT
-        cropType,
-        SUM(netBushels) AS netBushels
-      FROM v_bin_inventory
-      GROUP BY cropType;
+    CREATE INDEX idx_binSiteBins_site ON binSiteBins(siteName);
+    CREATE INDEX idx_binSiteBins_crop ON binSiteBins(lastCropType);
   `);
 }
 
@@ -380,48 +281,61 @@ export async function buildSnapshotToSqlite() {
     };
   });
 
-  // binSites
-  const binSites = await fetchAllDocs(firestore, "binSites", (id, d) => ({
+  // binSites + expanded bins
+  const binSitesRaw = await fetchAllDocs(firestore, "binSites", (id, d) => ({
     id,
     name: norm(d.name || ""),
     status: norm(d.status || ""),
     used: bool01(d.used ?? null),
     totalBushels: numOrNull(d.totalBushels ?? null),
+    bins: Array.isArray(d.bins) ? d.bins : [],
     data: JSON.stringify(d)
   }));
 
-  // binMovements
-  const binMovements = await fetchAllDocs(firestore, "binMovements", (id, d) => ({
-    id,
-    siteId: norm(d.siteId || ""),
-    siteName: norm(d.siteName || ""),
-    binIndex: numOrNull(d.binIndex ?? null),
-    binNum: numOrNull(d.binNum ?? null),
-    dateISO: norm(d.dateISO || ""),
-    createdAtISO: toCreatedAtISO(d.createdAt),
-    createdAtMs: toCreatedAtMs(d.createdAt),
-    direction: lower(d.direction || ""),
-    bushels: numOrNull(d.bushels ?? null),
-    cropType: norm(d.cropType || ""),
-    cropMoisture: numOrNull(d.cropMoisture ?? null),
-    note: d.note == null ? null : String(d.note),
-    submittedBy: norm(d.submittedBy || ""),
-    submittedByUid: norm(d.submittedByUid || ""),
-    data: JSON.stringify(d)
+  const binSites = binSitesRaw.map(s => ({
+    id: s.id,
+    name: s.name,
+    status: s.status,
+    used: s.used,
+    totalBushels: s.totalBushels,
+    data: s.data
   }));
+
+  const binSiteBins = [];
+  for (const s of binSitesRaw) {
+    const siteId = s.id;
+    const siteName = s.name;
+    for (const b of (s.bins || [])) {
+      const binNum = numOrNull(b.num ?? null);
+      if (!binNum) continue;
+
+      binSiteBins.push({
+        siteId,
+        siteName,
+        binNum,
+        capacityBushels: numOrNull(b.bushels ?? null),
+        onHandBushels: numOrNull(b.onHand ?? null),
+        lastCropType: norm(b.lastCropType || ""),
+        lastCropMoisture: numOrNull(b.lastCropMoisture ?? null),
+        lastUpdatedMs: numOrNull(b.lastUpdatedMs ?? null),
+        lastUpdatedBy: norm(b.lastUpdatedBy || ""),
+        lastUpdatedUid: norm(b.lastUpdatedUid || "")
+      });
+    }
+  }
 
   insertRows(sqlite, "farms", farms);
   insertRows(sqlite, "rtkTowers", rtkTowers);
   insertRows(sqlite, "fields", fields);
   insertRows(sqlite, "binSites", binSites);
-  insertRows(sqlite, "binMovements", binMovements);
+  if (binSiteBins.length) insertRows(sqlite, "binSiteBins", binSiteBins);
 
   const counts = {
     farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
     rtkTowers: sqlite.prepare("SELECT COUNT(1) AS n FROM rtkTowers").get().n,
     fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n,
     binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n,
-    binMovements: sqlite.prepare("SELECT COUNT(1) AS n FROM binMovements").get().n
+    binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n
   };
 
   sqlite.close();
