@@ -1,14 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst26-min-guardrails-auto-first
+// Rev: 2026-01-12-handleChat-sqlFirst27-auto-first-empty-retry-dbquery-only
 //
-// FIX:
-// ✅ First OpenAI call uses tool_choice:"auto" (NOT "required").
-//    This allows the model to ask a clarifying question instead of being forced into a tool call.
-// ✅ Tool loop remains the same.
-// ✅ Minimal guardrails remain the same.
-// ✅ No intent routing / no fast handlers.
+// Fix:
+// ✅ Keep OpenAI-led flow (tool_choice:"auto" first)
+// ✅ If Responses API returns an empty reply (no tool calls + no text),
+//    retry ONCE with tool_choice:"required" but ONLY db_query tool available.
+//    This prevents "No answer." and avoids resolver rabbit holes.
 //
-// This prevents: "corn" -> resolve_field -> Cornpile suggestions.
+// Keeps:
+// ✅ Minimal guardrails in system prompt
+// ✅ Pending did-you-mean support
+// ✅ Resolvers available in normal flow, but NOT in the retry fallback
 
 'use strict';
 
@@ -182,6 +184,23 @@ Key tables:
 `.trim();
 }
 
+function dbQueryToolDef() {
+  return {
+    type: "function",
+    name: "db_query",
+    description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database.",
+    parameters: {
+      type: "object",
+      properties: {
+        sql: { type: "string" },
+        params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
+        limit: { type: "number" }
+      },
+      required: ["sql"]
+    }
+  };
+}
+
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -229,27 +248,14 @@ export async function handleChatHttp(req, res) {
     ];
 
     const tools = [
-      {
-        type: "function",
-        name: "db_query",
-        description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database.",
-        parameters: {
-          type: "object",
-          properties: {
-            sql: { type: "string" },
-            params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
-            limit: { type: "number" }
-          },
-          required: ["sql"]
-        }
-      },
+      dbQueryToolDef(),
       resolveFieldTool,
       resolveFarmTool,
       resolveRtkTowerTool,
       resolveBinSiteTool
     ];
 
-    // ✅ FIRST CALL: allow the model to ask a clarifying question (no forced tool call)
+    // FIRST CALL: allow model to ask a clarifying question OR call tools
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -259,6 +265,22 @@ export async function handleChatHttp(req, res) {
     });
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
+
+    // ---- EMPTY RESPONSE SAFETY RETRY ----
+    // If no tool calls and no assistant text, retry once forcing db_query only.
+    // This avoids "No answer." and avoids resolver traps.
+    const firstCalls = extractFunctionCalls(rsp);
+    const firstText = extractAssistantText(rsp);
+    if (!firstCalls.length && !firstText) {
+      rsp = await openaiResponsesCreate({
+        model: OPENAI_MODEL,
+        tools: [dbQueryToolDef()],
+        tool_choice: "required",
+        input: input_list,
+        temperature: 0.2
+      });
+      if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
+    }
 
     // Tool loop
     for (let i = 0; i < 10; i++) {
@@ -288,9 +310,7 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            }
+            if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
@@ -298,9 +318,7 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            }
+            if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
@@ -308,9 +326,7 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            }
+            if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
@@ -318,9 +334,7 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveBinSite(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            }
+            if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
             return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
         }
