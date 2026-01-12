@@ -1,17 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst22-grainCapacity-match-app
+// Rev: 2026-01-12-handleChat-sqlFirst23-bagBushels-match-grainCapacity
 //
-// Change (PROMPT ONLY):
-// ✅ Grain bag bushels estimation now matches the app:
-//    - ratedCornBu from productsGrainBags.bushels (per full bag)
-//    - partialFeet bushels = feet * (bushels / lengthFt)
-//    - convert to crop using FVGrainCapacity factors (soybeans=0.93, wheat=1.07, milo=1.02, oats=0.78)
+// Fix:
+// ✅ Bot may now compute grain bag bushels (field bags) exactly like the app
+//    using productsGrainBags corn-rated capacity + grain-capacity factors.
+// ✅ Clarifies "bag entries" vs "total bags (full+partial)" rules.
 //
 // Keeps:
+// ✅ SQL-first + tool loop
 // ✅ cropYear clarification (bags only)
-// ✅ bin inventory rule (binSiteBins)
-// ✅ total bins + bags rule
-// ✅ no hardcoded question handlers / no new files
+// ✅ bin inventory is from binSiteBins
+// ✅ no fast routes / no hardcoded handlers
 
 'use strict';
 
@@ -153,60 +152,72 @@ HARD RULES:
 2) Do NOT show IDs to the user. You MAY select ids internally in SQL to support joins and follow-ups.
 3) Active-by-default: unless the user explicitly requests archived/inactive, filter using:
    (archived IS NULL OR archived = 0)
-4) Follow-ups are normal. Use conversation context.
+4) Follow-ups are normal.
 
 CROP NAME MATCHING (HARD):
 - Always match crops case-insensitively (lower()).
-- Treat these as equivalent:
-  - "soybean", "soybeans", "beans", "sb" => soybeans
-  - "corn", "maize" => corn
-  - "wheat", "hrw", "srw" => wheat
-  - "milo", "sorghum" => milo
-  - "oats" => oats
+- Aliases:
+  soybeans: soybean, soybeans, beans, sb
+  corn: corn, maize
+  wheat: wheat, hrw, srw
+  milo: milo, sorghum
+  oats: oats
 
-CROP YEAR RULE (HARD) — BAGS ONLY:
+CROP YEAR RULE (HARD) — FIELD BAGS ONLY:
 - Only trigger crop-year clarification when the question involves grain bags / grainBagEvents.
 - If user asks anything about grain bags and does NOT specify cropYear, ask:
   "Which crop year? (ex: 2025) — or do you want combined years (ex: 2025 + 2026) / all years?"
 - Do NOT ask crop year for bin inventory questions.
 
 BIN INVENTORY RULE (HARD):
-- If the user asks about bushels "in bins", "bin storage", "on hand", "grain bins":
-  you MUST use binSiteBins ONLY (optionally join binSites).
-- Bushels in bins = SUM(binSiteBins.onHandBushels).
-- Crop in bin = binSiteBins.lastCropType.
+- Bin bushels are from binSiteBins.onHandBushels.
+- Crop in bin is binSiteBins.lastCropType.
 - Filters must be case-insensitive: lower(lastCropType)=lower(?).
 
-GRAIN BAGS BUSHELS (HARD — MATCHES APP):
-- Grain bag bushels are estimated using:
-  1) productsGrainBags.bushels = rated CORN bushels per FULL bag
-  2) productsGrainBags.lengthFt = physical length in feet
-  3) For each open grainBagEvents putDown row:
-     - fullCornBu = counts.full * bushels
-     - partialCornBu = SUM(partialFeet) * (bushels / lengthFt)
-     - ratedCornBu = fullCornBu + partialCornBu
-  4) Convert ratedCornBu to the event crop using the SAME factors as /Farm-vista/js/grain-capacity.js:
-     - soybeans factor = 0.93
-     - wheat factor = 1.07
-     - milo factor = 1.02
-     - oats factor = 0.78
-     - corn factor = 1.00
-     Use: cropBu = ratedCornBu * factor(crop)
-- Do NOT invent factors; use exactly the above.
+FIELD BAG COUNTING RULE (HARD):
+- "bag entries" means number of open putDown rows in grainBagEvents.
+- "total bags down" means full + partial count:
+  - full count = grainBagEvents.countFull
+  - partial count = length of JSON array grainBagEvents.partialFeetJson
+  (NOT grainBagEvents.countPartial unless it matches the array length)
 
-NOTE ABOUT JOINING (HARD):
-- To map a grainBagEvents row to a product:
-  - Use bagSkuId if it matches productsGrainBags.id.
-  - Otherwise, join by (bagDiameterFt + bagSizeFeet) matching (productsGrainBags.diameterFt + productsGrainBags.lengthFt).
-- partialFeet are stored in grainBagEvents.partialFeetJson (JSON array). Use json_each to sum feet.
+FIELD BAG BUSHELS RULE (HARD — MATCHES APP):
+- Bag bushels are computed exactly like the Grain dashboard:
+  1) For each OPEN putDown row in grainBagEvents (type='putDown' AND status != 'pickedUp' or status is null):
+     ratedCornBu =
+       (countFull * buPerBagCorn)
+       + (sum(partialFeet) * (buPerBagCorn / lengthFt))
+  2) Convert ratedCornBu to crop bushels using the SAME factors as /Farm-vista/js/grain-capacity.js:
+     corn=1.00
+     soybeans=0.93
+     wheat=1.07
+     milo=1.02
+     oats=0.78
+     cropBu = ratedCornBu * factor
+  3) Sum cropBu across rows matching the requested crop filter.
+
+JOIN TO PRODUCTS (HARD):
+- productsGrainBags provides:
+  - diameterFt
+  - lengthFt
+  - bushelsCorn (corn-rated bushels per full bag)
+- Join each grainBagEvents row to productsGrainBags by:
+  lower(grainBagEvents.bagDiameterFt)=lower(productsGrainBags.diameterFt) AND
+  lower(grainBagEvents.bagSizeFeet)=lower(productsGrainBags.lengthFt)
+  (numeric equality is fine; use ABS difference <= 0.0001 if needed).
+- If join fails for a row, exclude it and mention how many rows had no matching product.
+
+SQL TIP (SQLite):
+- partialFeetJson is a JSON array; sum feet with json_each(partialFeetJson).
+  Example:
+    SELECT SUM(CAST(value AS REAL)) FROM json_each(grainBagEvents.partialFeetJson)
 
 TOTAL STORAGE RULE (HARD):
-- If user asks for TOTAL / OVERALL / "bins + bags":
+- If user asks TOTAL / OVERALL / "bins + bags":
   return:
   - bins bushels (binSiteBins)
-  - bag bushels (grainBagEvents + productsGrainBags + factors)
-  - combined total
-  - show breakdown.
+  - field bag bushels (grainBagEvents + products + factors)
+  - combined total with breakdown.
 
 TOOLS:
 - resolve_field(query)
@@ -219,7 +230,7 @@ DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 Tables:
-- grainBagEvents(id, type, datePlaced, cropType, cropYear, bagSkuId, bagDiameterFt, bagSizeFeet, countFull, countPartial, partialFeetJson, status, data)
+- grainBagEvents(id, type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetJson, fieldId, fieldName, data)
 - productsGrainBags(id, brand, diameterFt, lengthFt, bushelsCorn, status, data)
 - binSites(id, name, status)
 - binSiteBins(siteId, siteName, binNum, onHandBushels, lastCropType)
