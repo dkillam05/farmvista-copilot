@@ -1,14 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst18-onHand-binSiteBins
+// Rev: 2026-01-12-handleChat-sqlFirst19-cropYear-clarify
 //
 // Change:
-// ✅ Inventory is now SOURCE OF TRUTH from binSiteBins.onHandBushels (expanded from binSites.bins[])
-// ✅ Removes binMovements + v_* inventory view guidance in prompt
+// ✅ If a question involves data with cropYear (ex: grainBagEvents) and the user doesn't specify,
+//    the assistant MUST ask which crop year (or combined years) before answering.
 //
 // Keeps:
-// ✅ hard reset architecture
-// ✅ minimal thread memory + pending did-you-mean
-// ✅ resolve_binSite
+// ✅ your current logic, tools, and flow as-is.
 
 'use strict';
 
@@ -155,13 +153,20 @@ HARD RULES:
    - If user says "farm number 5", interpret it based on the last numbered list you provided.
    - If user says "either one of those fields", interpret it using the last field list you provided.
 
-BIN INVENTORY RULE (HARD):
-- Bin inventory is SOURCE OF TRUTH from binSiteBins.onHandBushels (NOT binMovements).
-- Crop-in-bin is binSiteBins.lastCropType (may be blank if unknown).
+CROP YEAR RULE (HARD):
+- If the user's question involves any table that has a crop year field (cropYear),
+  and the user did NOT specify a year, you MUST ask a clarifying question BEFORE answering:
+    "Which crop year? (ex: 2025) — or do you want combined years (ex: 2025 + 2026) / all years?"
+- Only skip this clarification if the user explicitly says:
+  - "all years", "combined years", "all crop years", or provides a specific year like 2025, 2026, etc.
+- Current cropYear table(s):
+  - grainBagEvents(cropYear)
+
+BIN INVENTORY RULE:
+- Bin inventory is SOURCE OF TRUTH from binSiteBins.onHandBushels.
+- Crop-in-bin is binSiteBins.lastCropType.
 - Capacity is binSiteBins.capacityBushels.
-- Use binSites.status to filter active sites if user asks "active" or if it makes sense by default.
-- For crop totals like "corn":
-  SUM(onHandBushels) WHERE lower(lastCropType)=lower('Corn').
+- Site status is binSites.status.
 
 TOOLS:
 - resolve_field(query)
@@ -173,7 +178,8 @@ TOOLS:
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
-Tables / Views:
+Tables:
+- grainBagEvents(id, type, datePlaced, cropType, cropYear, cropMoisture, fieldId, fieldName, bagBrand, bagDiameterFt, bagSizeFeet, countFull, countPartial, priority, priorityReason, createdAtISO, updatedAtISO, data)
 - binSites(id, name, status, used, totalBushels)
 - binSiteBins(siteId, siteName, binNum, capacityBushels, onHandBushels, lastCropType, lastCropMoisture, lastUpdatedMs, lastUpdatedBy, lastUpdatedUid)
 `.trim();
@@ -283,6 +289,25 @@ export async function handleChatHttp(req, res) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
+        } else if (name === "resolve_binSite") {
+          didAny = true;
+          result = resolveBinSite(safeStr(args.query || ""));
+          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+            if (thread) {
+              setPending(thread, {
+                kind: "bin site",
+                query: safeStr(args.query || ""),
+                candidates: result.candidates,
+                originalText: safeStr(body.text || body.message || body.q || "")
+              });
+            }
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("bin site", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
+
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
@@ -339,25 +364,6 @@ export async function handleChatHttp(req, res) {
               meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
             });
           }
-
-        } else if (name === "resolve_binSite") {
-          didAny = true;
-          result = resolveBinSite(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) {
-              setPending(thread, {
-                kind: "bin site",
-                query: safeStr(args.query || ""),
-                candidates: result.candidates,
-                originalText: safeStr(body.text || body.message || body.q || "")
-              });
-            }
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("bin site", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
-          }
         }
 
         input_list.push({
@@ -382,7 +388,6 @@ export async function handleChatHttp(req, res) {
 
     const text = extractAssistantText(rsp) || "No answer.";
 
-    // ---- Save conversation turns for follow-ups ----
     if (thread) {
       pushMsg(thread, "user", userText);
       pushMsg(thread, "assistant", text);
