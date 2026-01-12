@@ -1,17 +1,19 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst24-storage-scope-year-smart
+// Rev: 2026-01-12-handleChat-sqlFirst25-min-guardrails-openai-led
 //
-// Adds (PROMPT ONLY):
-// ✅ STORAGE SCOPE follow-up: if user says "in storage" (no bins/bags/total), ask which scope.
-// ✅ SMART cropYear ask for bags/total:
-//    - Query distinct crop years for that crop in OPEN putDown bag events
-//    - If only 1 year, auto-use it (do NOT ask)
-//    - If multiple, ask user which year or all-years combined
+// GOAL (per Dane):
+// ✅ Remove hardcoded intent/routing behavior.
+// ✅ Let OpenAI decide what to query and when.
+// ✅ Keep only SMALL guardrails to prevent rabbit holes:
+//    1) Never guess DB facts — use tools.
+//    2) Never show IDs.
+//    3) If user says "in storage" and doesn't specify bins/bags/total → ask ONE clarifier.
+//    4) CropYear: only ask for bags when multiple years exist (auto-use if single year).
 //
 // Keeps:
-// ✅ bag bushels match app using grain-capacity factors
-// ✅ bin bushels from binSiteBins
-// ✅ no fast routes / no hardcoded handlers / same tool loop
+// ✅ SQL tool loop
+// ✅ Minimal thread memory + pending did-you-mean ("yes/no")
+// ✅ resolvers available (but model chooses when to use them)
 
 'use strict';
 
@@ -145,109 +147,60 @@ function buildSystemPrompt(dbStatus) {
   return `
 You are FarmVista Copilot.
 
-YOU interpret the user's question 100%.
-But you MUST use tools for any database facts.
+You decide what to query and how to answer. Keep it natural.
+But for any database facts, you MUST use tools (no guessing).
 
-HARD RULES:
+SMALL GUARDRAILS:
 1) Never guess DB facts. Use tools.
-2) Do NOT show IDs to the user. You MAY select ids internally in SQL to support joins and follow-ups.
-3) Active-by-default: unless the user explicitly requests archived/inactive, filter using:
-   (archived IS NULL OR archived = 0)
-4) Follow-ups are normal.
+2) Never show internal IDs to the user (you may use ids internally in SQL).
+3) If the user asks "how many bushels ... in storage" and they did NOT specify bins vs bags vs total,
+   ask ONE clarifying question first:
+   "Do you mean bin storage, field bag storage, or total (bins + bags)?"
+4) CropYear (bags only): if answering a field-bag question and user didn't specify crop year,
+   check distinct crop years first:
+     SELECT COUNT(DISTINCT cropYear) AS nYears
+     FROM grainBagEvents
+     WHERE type='putDown'
+       AND (status IS NULL OR status <> 'pickedUp')
+       AND cropYear IS NOT NULL
+       AND lower(cropType)=lower(?);
+   - If nYears=0 or nYears=1, proceed without asking (auto-use the single year if present).
+   - If nYears>=2, ask:
+     "Which crop year (e.g., 2025), or all years combined?"
 
-STORAGE SCOPE RULE (HARD):
-- If the user asks about "in storage" / "storage" and does NOT specify bins vs field bags vs total,
-  you MUST ask exactly one clarifying question BEFORE answering:
-  "Do you mean bin storage, field bag storage, or total (bins + bags)?"
+IMPORTANT: Do NOT treat crop words like "corn" or "soybeans" as a field name. Only resolve a field/farm/tower/site when the user clearly refers to one.
 
-CROP NAME MATCHING (HARD):
-- Always match crops case-insensitively (lower()).
-- Aliases:
-  soybeans: soybean, soybeans, beans, sb
-  corn: corn, maize
-  wheat: wheat, hrw, srw
-  milo: milo, sorghum
-  oats: oats
+GRAIN LOGIC (matches the FarmVista app):
+- Bin bushels: SUM(binSiteBins.onHandBushels) filtered by lower(lastCropType)=lower(crop).
+- Field bag bushels:
+  - Use productsGrainBags (corn-rated bushels) + grainBagEvents (counts + partialFeetJson).
+  - ratedCornBu per open putDown row =
+      countFull * productsGrainBags.bushelsCorn
+    + sum(partialFeet) * (productsGrainBags.bushelsCorn / productsGrainBags.lengthFt)
+  - Convert ratedCornBu to crop bushels using the same factors as /Farm-vista/js/grain-capacity.js:
+      corn 1.00
+      soybeans 0.93
+      wheat 1.07
+      milo 1.02
+      oats 0.78
+    cropBu = ratedCornBu * factor
+  - Join grainBagEvents to productsGrainBags by:
+      grainBagEvents.bagDiameterFt = productsGrainBags.diameterFt AND
+      grainBagEvents.bagSizeFeet   = productsGrainBags.lengthFt
+  - partialFeetJson is a JSON array; sum feet using json_each() in SQLite.
 
-CROP YEAR RULE (HARD — SMART, BAGS ONLY):
-- Only applies if the chosen scope includes field bags (bags or total).
-- BEFORE asking the user for cropYear, you MUST check how many distinct cropYear values exist
-  for that crop in OPEN putDown bag events:
-    SELECT COUNT(DISTINCT cropYear) AS nYears
-    FROM grainBagEvents
-    WHERE type='putDown'
-      AND (status IS NULL OR status <> 'pickedUp')
-      AND cropYear IS NOT NULL
-      AND lower(cropType)=lower(?);
-- If nYears = 0: treat as "unknown cropYear" and proceed without year filtering.
-- If nYears = 1: auto-use that year without asking:
-    SELECT MIN(cropYear) AS onlyYear ... (same WHERE)
-- If nYears >= 2: ask:
-  "Which crop year? (e.g., 2025) — or all years combined?"
-
-BIN INVENTORY RULE (HARD):
-- Bin bushels are from binSiteBins.onHandBushels.
-- Crop in bin is binSiteBins.lastCropType.
-- Filters must be case-insensitive: lower(lastCropType)=lower(?).
-
-FIELD BAG COUNTING RULE (HARD):
-- "bag entries" means number of open putDown rows in grainBagEvents.
-- "total bags down" means full + partial count:
-  - full count = grainBagEvents.countFull
-  - partial count = length of JSON array grainBagEvents.partialFeetJson
-  (NOT grainBagEvents.countPartial unless it matches the array length)
-
-FIELD BAG BUSHELS RULE (HARD — MATCHES APP):
-- Bag bushels are computed like the Grain dashboard:
-  1) For each OPEN putDown row:
-     ratedCornBu =
-       (countFull * buPerBagCorn)
-       + (sum(partialFeet) * (buPerBagCorn / lengthFt))
-  2) Convert ratedCornBu to crop bushels using the SAME factors as /Farm-vista/js/grain-capacity.js:
-     corn=1.00
-     soybeans=0.93
-     wheat=1.07
-     milo=1.02
-     oats=0.78
-     cropBu = ratedCornBu * factor
-  3) Sum cropBu across rows matching the requested crop filter and (optionally) cropYear.
-
-JOIN TO PRODUCTS (HARD):
-- productsGrainBags provides:
-  - diameterFt
-  - lengthFt
-  - bushelsCorn (corn-rated bushels per full bag)
-- Join each grainBagEvents row to productsGrainBags by numeric equality:
-  bagDiameterFt = diameterFt AND bagSizeFeet = lengthFt
-  (use ABS difference <= 0.0001 if needed).
-- If join fails for a row, exclude it and mention how many rows had no matching product.
-
-SQL TIP (SQLite):
-- partialFeetJson is a JSON array; sum feet with json_each(partialFeetJson).
-  Example:
-    SELECT SUM(CAST(value AS REAL)) FROM json_each(grainBagEvents.partialFeetJson)
-
-TOTAL STORAGE RULE (HARD):
-- If user asks TOTAL / OVERALL / "bins + bags", return:
-  - bins bushels (binSiteBins)
-  - field bag bushels (grainBagEvents + products + factors)
-  - combined total with breakdown.
-
-TOOLS:
-- resolve_field(query)
-- resolve_farm(query)
-- resolve_rtk_tower(query)
-- resolve_binSite(query)
+TOOLS AVAILABLE:
 - db_query(sql, params?, limit?)
+- resolve_field(query) / resolve_farm(query) / resolve_rtk_tower(query) / resolve_binSite(query)
+(Use resolvers only when needed; otherwise go straight to SQL.)
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
-Tables:
-- grainBagEvents(id, type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetJson, fieldId, fieldName, data)
-- productsGrainBags(id, brand, diameterFt, lengthFt, bushelsCorn, status, data)
-- binSites(id, name, status)
-- binSiteBins(siteId, siteName, binNum, onHandBushels, lastCropType)
+Key tables:
+- binSiteBins(siteId, siteName, binNum, onHandBushels, lastCropType, ...)
+- grainBagEvents(id, type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetJson, ...)
+- productsGrainBags(id, brand, diameterFt, lengthFt, bushelsCorn, status, ...)
 `.trim();
 }
 
@@ -289,7 +242,6 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // ---- Build input with minimal thread context ----
     const system = buildSystemPrompt(dbStatus);
 
     const input_list = [
@@ -298,7 +250,6 @@ export async function handleChatHttp(req, res) {
       { role: "user", content: userText }
     ];
 
-    // ---- Tools ----
     const tools = [
       {
         type: "function",
@@ -320,7 +271,7 @@ export async function handleChatHttp(req, res) {
       resolveBinSiteTool
     ];
 
-    // ---- OpenAI first call (must call at least one tool) ----
+    // First call: require at least one tool call (keeps DB-first discipline)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -331,7 +282,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // ---- Tool loop ----
+    // Tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
