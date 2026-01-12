@@ -1,16 +1,14 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-11-snapshotBuild-firestore2sqlite9-binMovements-normalize-cropType
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite10-binMovements-createdAt-normalize
 //
-// Change:
-// ✅ Adds v_bin_movements_norm that auto-fills missing cropType:
-//    - For rows where cropType is blank, use the most recent prior non-blank cropType
-//      for the same siteId + binNum (based on dateISO order).
-// ✅ Inventory views now use cropTypeNorm, eliminating "(unknown)" for typical workflows.
+// Fix:
+// ✅ Add binMovements.createdAtISO + createdAtMs
+// ✅ Normalize missing cropType using last known cropType for same siteId+binNum
+//    ordered by createdAtMs (NOT dateISO/id)
+// ✅ Inventory views use normalized cropType so "corn in => corn out" works reliably
 //
 // Keeps:
-// ✅ binSites table
-// ✅ binMovements table (raw preserved)
-// ✅ v_bin_inventory / v_site_inventory / v_total_inventory still exist
+// ✅ binSites + binMovements + inventory views
 // ✅ farms/fields/rtkTowers unchanged
 
 'use strict';
@@ -55,6 +53,36 @@ function farmArchivedFromStatus(statusRaw) {
   if (!s) return null;
   if (s === "active") return 0;
   return 1;
+}
+
+function toCreatedAtISO(d) {
+  // Firestore Timestamp sometimes comes in as { "__time__": "..." } in your snapshot JSON-ish shape
+  // In admin SDK, it can be a Timestamp object.
+  try {
+    if (!d) return "";
+    if (typeof d === "string") return d;
+    if (typeof d === "object") {
+      if (typeof d.__time__ === "string") return d.__time__;
+      if (typeof d.toDate === "function") return d.toDate().toISOString();
+      if (typeof d.seconds === "number") return new Date(d.seconds * 1000).toISOString();
+    }
+  } catch {}
+  return "";
+}
+
+function toCreatedAtMs(d) {
+  try {
+    const iso = toCreatedAtISO(d);
+    if (iso) {
+      const ms = Date.parse(iso);
+      return Number.isFinite(ms) ? ms : null;
+    }
+    if (d && typeof d.toMillis === "function") {
+      const ms = d.toMillis();
+      return Number.isFinite(ms) ? ms : null;
+    }
+  } catch {}
+  return null;
 }
 
 async function fetchAllDocs(db, collectionName, pickFn) {
@@ -148,6 +176,8 @@ function createSchema(sqlite) {
       binIndex INTEGER,
       binNum INTEGER,
       dateISO TEXT,
+      createdAtISO TEXT,
+      createdAtMs INTEGER,
       direction TEXT,        -- 'in' or 'out'
       bushels REAL,
       cropType TEXT,
@@ -173,18 +203,17 @@ function createSchema(sqlite) {
     CREATE INDEX idx_binSites_name ON binSites(name);
     CREATE INDEX idx_binSites_status ON binSites(status);
 
-    CREATE INDEX idx_binMoves_siteId ON binMovements(siteId);
     CREATE INDEX idx_binMoves_site_bin ON binMovements(siteId, binNum);
-    CREATE INDEX idx_binMoves_site_bin_crop ON binMovements(siteId, binNum, cropType);
+    CREATE INDEX idx_binMoves_site_bin_time ON binMovements(siteId, binNum, createdAtMs);
     CREATE INDEX idx_binMoves_date ON binMovements(dateISO);
     CREATE INDEX idx_binMoves_dir ON binMovements(direction);
 
     /*
       v_bin_movements_norm:
       - cropTypeNorm is:
-        - the row's cropType if present
-        - else the most recent prior non-empty cropType for same siteId+binNum (by dateISO, then id)
-      This matches reality: corn in -> corn out, without editing old records.
+        - row cropType if present
+        - else last prior non-empty cropType for same siteId+binNum ordered by createdAtMs
+      This makes "corn in => corn out" work even when OUT doesn't store cropType.
     */
     CREATE VIEW v_bin_movements_norm AS
       SELECT
@@ -197,11 +226,8 @@ function createSchema(sqlite) {
             WHERE m2.siteId = m.siteId
               AND m2.binNum = m.binNum
               AND NULLIF(TRIM(m2.cropType), '') IS NOT NULL
-              AND (
-                    m2.dateISO < m.dateISO
-                 OR (m2.dateISO = m.dateISO AND m2.id <= m.id)
-                  )
-            ORDER BY m2.dateISO DESC, m2.id DESC
+              AND COALESCE(m2.createdAtMs, 0) <= COALESCE(m.createdAtMs, 0)
+            ORDER BY COALESCE(m2.createdAtMs, 0) DESC, m2.id DESC
             LIMIT 1
           ),
           '(unknown)'
@@ -221,15 +247,7 @@ function createSchema(sqlite) {
               WHEN lower(m.direction) = 'in'  THEN COALESCE(m.bushels, 0)
               WHEN lower(m.direction) = 'out' THEN -COALESCE(m.bushels, 0)
               ELSE 0
-            END) AS netBushels,
-
-        SUM(CASE WHEN lower(m.direction) = 'in'  THEN COALESCE(m.bushels, 0) ELSE 0 END) AS totalIn,
-        SUM(CASE WHEN lower(m.direction) = 'out' THEN COALESCE(m.bushels, 0) ELSE 0 END) AS totalOut,
-
-        MAX(m.dateISO) AS lastDateISO,
-        s.totalBushels AS siteCapacityBushels,
-        s.status AS siteStatus,
-        s.used AS siteUsed
+            END) AS netBushels
 
       FROM v_bin_movements_norm m
       LEFT JOIN binSites s ON s.id = m.siteId
@@ -240,10 +258,7 @@ function createSchema(sqlite) {
         siteId,
         siteName,
         cropType,
-        SUM(netBushels) AS netBushels,
-        SUM(totalIn) AS totalIn,
-        SUM(totalOut) AS totalOut,
-        MAX(lastDateISO) AS lastDateISO
+        SUM(netBushels) AS netBushels
       FROM v_bin_inventory
       GROUP BY siteId, siteName, cropType;
 
@@ -383,6 +398,8 @@ export async function buildSnapshotToSqlite() {
     binIndex: numOrNull(d.binIndex ?? null),
     binNum: numOrNull(d.binNum ?? null),
     dateISO: norm(d.dateISO || ""),
+    createdAtISO: toCreatedAtISO(d.createdAt),
+    createdAtMs: toCreatedAtMs(d.createdAt),
     direction: lower(d.direction || ""),
     bushels: numOrNull(d.bushels ?? null),
     cropType: norm(d.cropType || ""),
