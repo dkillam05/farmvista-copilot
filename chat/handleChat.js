@@ -1,9 +1,9 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst17-inventory-rule
+// Rev: 2026-01-12-handleChat-sqlFirst18-onHand-binSiteBins
 //
 // Change:
-// ✅ Force inventory questions to use v_total_inventory / v_site_inventory / v_bin_inventory first.
-// ✅ Crop-specific questions must query totals first, then filter case-insensitively.
+// ✅ Inventory is now SOURCE OF TRUTH from binSiteBins.onHandBushels (expanded from binSites.bins[])
+// ✅ Removes binMovements + v_* inventory view guidance in prompt
 //
 // Keeps:
 // ✅ hard reset architecture
@@ -155,16 +155,13 @@ HARD RULES:
    - If user says "farm number 5", interpret it based on the last numbered list you provided.
    - If user says "either one of those fields", interpret it using the last field list you provided.
 
-INVENTORY RULE (HARD):
-- For any question about "bushels", "inventory", "what's in bins", "how much corn/soybeans we have",
-  you MUST query inventory VIEWS first (NOT raw binMovements):
-  - v_total_inventory for totals by crop
-  - v_site_inventory for totals by site + crop
-  - v_bin_inventory for site+bin+crop details
-- For crop-specific questions (e.g. "corn"), do this:
-  1) Query v_total_inventory to see what cropType values exist.
-  2) Then match the requested crop case-insensitively (lower(cropType)=lower(?)).
-  3) Return that netBushels number.
+BIN INVENTORY RULE (HARD):
+- Bin inventory is SOURCE OF TRUTH from binSiteBins.onHandBushels (NOT binMovements).
+- Crop-in-bin is binSiteBins.lastCropType (may be blank if unknown).
+- Capacity is binSiteBins.capacityBushels.
+- Use binSites.status to filter active sites if user asks "active" or if it makes sense by default.
+- For crop totals like "corn":
+  SUM(onHandBushels) WHERE lower(lastCropType)=lower('Corn').
 
 TOOLS:
 - resolve_field(query)
@@ -178,10 +175,7 @@ Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=
 
 Tables / Views:
 - binSites(id, name, status, used, totalBushels)
-- binMovements(...)
-- v_total_inventory(cropType, netBushels)
-- v_site_inventory(siteId, siteName, cropType, netBushels, totalIn, totalOut, lastDateISO)
-- v_bin_inventory(siteId, siteName, binNum, binIndex, cropType, netBushels, totalIn, totalOut, lastDateISO, siteCapacityBushels, siteStatus, siteUsed)
+- binSiteBins(siteId, siteName, binNum, capacityBushels, onHandBushels, lastCropType, lastCropMoisture, lastUpdatedMs, lastUpdatedBy, lastUpdatedUid)
 `.trim();
 }
 
