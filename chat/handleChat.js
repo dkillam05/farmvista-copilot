@@ -1,13 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-11-handleChat-sqlFirst16-hardreset-add-bin-inventory-views
+// Rev: 2026-01-12-handleChat-sqlFirst17-inventory-rule
 //
 // Change:
-// ✅ System prompt now includes binMovements and inventory views so OpenAI can answer inventory questions accurately.
+// ✅ Force inventory questions to use v_total_inventory / v_site_inventory / v_bin_inventory first.
+// ✅ Crop-specific questions must query totals first, then filter case-insensitively.
 //
 // Keeps:
-// ✅ hard reset architecture: OpenAI interprets 100%, server executes tools
+// ✅ hard reset architecture
 // ✅ minimal thread memory + pending did-you-mean
-// ✅ resolve_binSite already wired
+// ✅ resolve_binSite
 
 'use strict';
 
@@ -154,6 +155,17 @@ HARD RULES:
    - If user says "farm number 5", interpret it based on the last numbered list you provided.
    - If user says "either one of those fields", interpret it using the last field list you provided.
 
+INVENTORY RULE (HARD):
+- For any question about "bushels", "inventory", "what's in bins", "how much corn/soybeans we have",
+  you MUST query inventory VIEWS first (NOT raw binMovements):
+  - v_total_inventory for totals by crop
+  - v_site_inventory for totals by site + crop
+  - v_bin_inventory for site+bin+crop details
+- For crop-specific questions (e.g. "corn"), do this:
+  1) Query v_total_inventory to see what cropType values exist.
+  2) Then match the requested crop case-insensitively (lower(cropType)=lower(?)).
+  3) Return that netBushels number.
+
 TOOLS:
 - resolve_field(query)
 - resolve_farm(query)
@@ -164,21 +176,12 @@ TOOLS:
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
-Tables available:
-- farms(id, name, status, archived)
-- fields(id, name, farmId, farmName, rtkTowerId, rtkTowerName, county, state, acresTillable, hasHEL, helAcres, hasCRP, crpAcres, archived)
-- rtkTowers(id, name, networkId, frequency)
+Tables / Views:
 - binSites(id, name, status, used, totalBushels)
-- binMovements(id, siteId, siteName, binNum, binIndex, dateISO, direction[in|out], bushels, cropType, cropMoisture, note, submittedBy, submittedByUid)
-
-Inventory Views (preferred for accuracy):
-- v_bin_inventory(siteId, siteName, binNum, binIndex, cropType, netBushels, totalIn, totalOut, lastDateISO, siteCapacityBushels, siteStatus, siteUsed)
-- v_site_inventory(siteId, siteName, cropType, netBushels, totalIn, totalOut, lastDateISO)
+- binMovements(...)
 - v_total_inventory(cropType, netBushels)
-
-IMPORTANT:
-- Inventory is deterministic: netBushels = SUM(in) - SUM(out).
-- Prefer querying the views above for "how many bushels left" questions.
+- v_site_inventory(siteId, siteName, cropType, netBushels, totalIn, totalOut, lastDateISO)
+- v_bin_inventory(siteId, siteName, binNum, binIndex, cropType, netBushels, totalIn, totalOut, lastDateISO, siteCapacityBushels, siteStatus, siteUsed)
 `.trim();
 }
 
