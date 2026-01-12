@@ -1,15 +1,17 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst20-cropYear+grain-totaling
+// Rev: 2026-01-12-handleChat-sqlFirst22-grainCapacity-match-app
 //
-// Change:
-// ✅ Adds a HARD "GRAIN TOTALING RULE" to combine bins + bags when user explicitly asks for total.
-// ✅ Keeps cropYear clarification.
-// ✅ Keeps bin inventory rule (binSiteBins is source of truth).
+// Change (PROMPT ONLY):
+// ✅ Grain bag bushels estimation now matches the app:
+//    - ratedCornBu from productsGrainBags.bushels (per full bag)
+//    - partialFeet bushels = feet * (bushels / lengthFt)
+//    - convert to crop using FVGrainCapacity factors (soybeans=0.93, wheat=1.07, milo=1.02, oats=0.78)
 //
-// IMPORTANT NOTE:
-// - grainBagEvents does NOT include bushel quantities. It has counts and bag SKU/dimensions.
-// - Therefore the bot cannot add “bag bushels” unless you later store bushels (or an agreed conversion).
-// - When user asks for total bushels including bags, the bot will return bin bushels + bag counts and ask for an estimation rule.
+// Keeps:
+// ✅ cropYear clarification (bags only)
+// ✅ bin inventory rule (binSiteBins)
+// ✅ total bins + bags rule
+// ✅ no hardcoded question handlers / no new files
 
 'use strict';
 
@@ -151,46 +153,60 @@ HARD RULES:
 2) Do NOT show IDs to the user. You MAY select ids internally in SQL to support joins and follow-ups.
 3) Active-by-default: unless the user explicitly requests archived/inactive, filter using:
    (archived IS NULL OR archived = 0)
-4) Follow-ups are normal. Use conversation context:
-   - If you just listed items and user says "include acres" / "add field count" / "yes", treat it as refining the previous result.
-   - If user says "farm number 5", interpret it based on the last numbered list you provided.
-   - If user says "either one of those fields", interpret it using the last field list you provided.
+4) Follow-ups are normal. Use conversation context.
 
-CROP YEAR RULE (HARD):
-- If the user's question involves any table that has a crop year field (cropYear),
-  and the user did NOT specify a year, you MUST ask a clarifying question BEFORE answering:
-    "Which crop year? (ex: 2025) — or do you want combined years (ex: 2025 + 2026) / all years?"
-- Only skip this clarification if the user explicitly says:
-  - "all years", "combined years", "all crop years", or provides a specific year like 2025, 2026, etc.
-- Current cropYear table(s):
-  - grainBagEvents(cropYear)
+CROP NAME MATCHING (HARD):
+- Always match crops case-insensitively (lower()).
+- Treat these as equivalent:
+  - "soybean", "soybeans", "beans", "sb" => soybeans
+  - "corn", "maize" => corn
+  - "wheat", "hrw", "srw" => wheat
+  - "milo", "sorghum" => milo
+  - "oats" => oats
+
+CROP YEAR RULE (HARD) — BAGS ONLY:
+- Only trigger crop-year clarification when the question involves grain bags / grainBagEvents.
+- If user asks anything about grain bags and does NOT specify cropYear, ask:
+  "Which crop year? (ex: 2025) — or do you want combined years (ex: 2025 + 2026) / all years?"
+- Do NOT ask crop year for bin inventory questions.
 
 BIN INVENTORY RULE (HARD):
-- Bin inventory is SOURCE OF TRUTH from binSiteBins.onHandBushels.
-- Crop-in-bin is binSiteBins.lastCropType.
-- Capacity is binSiteBins.capacityBushels.
-- Site status is binSites.status.
-- Crop filters MUST be case-insensitive:
-  lower(lastCropType) = lower(?)
+- If the user asks about bushels "in bins", "bin storage", "on hand", "grain bins":
+  you MUST use binSiteBins ONLY (optionally join binSites).
+- Bushels in bins = SUM(binSiteBins.onHandBushels).
+- Crop in bin = binSiteBins.lastCropType.
+- Filters must be case-insensitive: lower(lastCropType)=lower(?).
 
-GRAIN TOTALING RULE (HARD):
-- There are two separate storage locations:
-  1) Grain bins (bushels): binSiteBins.onHandBushels
-  2) Grain bags (events): grainBagEvents
-- If the user asks for "TOTAL", "ALL STORAGE", "OVERALL", or "BINS + BAGS", you MUST include BOTH:
-  - Bin storage result
-  - Grain bag result
-  and clearly show a breakdown.
+GRAIN BAGS BUSHELS (HARD — MATCHES APP):
+- Grain bag bushels are estimated using:
+  1) productsGrainBags.bushels = rated CORN bushels per FULL bag
+  2) productsGrainBags.lengthFt = physical length in feet
+  3) For each open grainBagEvents putDown row:
+     - fullCornBu = counts.full * bushels
+     - partialCornBu = SUM(partialFeet) * (bushels / lengthFt)
+     - ratedCornBu = fullCornBu + partialCornBu
+  4) Convert ratedCornBu to the event crop using the SAME factors as /Farm-vista/js/grain-capacity.js:
+     - soybeans factor = 0.93
+     - wheat factor = 1.07
+     - milo factor = 1.02
+     - oats factor = 0.78
+     - corn factor = 1.00
+     Use: cropBu = ratedCornBu * factor(crop)
+- Do NOT invent factors; use exactly the above.
 
-IMPORTANT LIMITATION (HARD):
-- grainBagEvents does NOT store a bushel quantity per bag in the current schema.
-  It stores counts (full/partial), partialFeet, and SKU dimensions.
-- Therefore, you MUST NOT invent bag bushels.
-- If the user asks for "total BUSHELS including bags", you must:
-  1) Provide bin bushels from binSiteBins
-  2) Provide bag counts (full/partial) from grainBagEvents
-  3) Ask whether they want an ESTIMATE for bag bushels and what conversion rule to use
-     (e.g., bushels per full bag, or bushels per foot).
+NOTE ABOUT JOINING (HARD):
+- To map a grainBagEvents row to a product:
+  - Use bagSkuId if it matches productsGrainBags.id.
+  - Otherwise, join by (bagDiameterFt + bagSizeFeet) matching (productsGrainBags.diameterFt + productsGrainBags.lengthFt).
+- partialFeet are stored in grainBagEvents.partialFeetJson (JSON array). Use json_each to sum feet.
+
+TOTAL STORAGE RULE (HARD):
+- If user asks for TOTAL / OVERALL / "bins + bags":
+  return:
+  - bins bushels (binSiteBins)
+  - bag bushels (grainBagEvents + productsGrainBags + factors)
+  - combined total
+  - show breakdown.
 
 TOOLS:
 - resolve_field(query)
@@ -203,18 +219,10 @@ DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 
 Tables:
-- grainBagEvents(
-    id, type, datePlaced, cropType, cropYear, cropMoisture,
-    fieldId, fieldName,
-    bagBrand, bagDiameterFt, bagSizeFeet,
-    countFull, countPartial,
-    partialFeetJson, partialUsageJson,
-    priority, priorityReason,
-    createdAtISO, updatedAtISO,
-    data
-  )
-- binSites(id, name, status, used, totalBushels)
-- binSiteBins(siteId, siteName, binNum, capacityBushels, onHandBushels, lastCropType, lastCropMoisture, lastUpdatedMs, lastUpdatedBy, lastUpdatedUid)
+- grainBagEvents(id, type, datePlaced, cropType, cropYear, bagSkuId, bagDiameterFt, bagSizeFeet, countFull, countPartial, partialFeetJson, status, data)
+- productsGrainBags(id, brand, diameterFt, lengthFt, bushelsCorn, status, data)
+- binSites(id, name, status)
+- binSiteBins(siteId, siteName, binNum, onHandBushels, lastCropType)
 `.trim();
 }
 
