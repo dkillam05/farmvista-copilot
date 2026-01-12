@@ -1,13 +1,16 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite12-add-grain-bag-events
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite13-add-productsGrainBags
 //
 // Adds:
-// ✅ grainBagEvents table (from Firestore collection grain_bag_events)
-// ✅ Stores full raw record in data, and extracts key columns for querying
+// ✅ productsGrainBags table (from Firestore collection productsGrainBags)
+//    - bushelsCorn (baseline from doc.bushels)
+//    - optional soyPct / wheatPct (multipliers) if present in Firestore
+//    - optional bushelsSoy / bushelsWheat if present in Firestore
 //
 // Keeps:
-// ✅ farms/fields/rtkTowers
 // ✅ binSites + binSiteBins (onHand inventory mode)
+// ✅ grainBagEvents
+// ✅ farms/fields/rtkTowers
 
 'use strict';
 
@@ -117,6 +120,7 @@ function createSchema(sqlite) {
     DROP TABLE IF EXISTS binSites;
     DROP TABLE IF EXISTS binSiteBins;
     DROP TABLE IF EXISTS grainBagEvents;
+    DROP TABLE IF EXISTS productsGrainBags;
 
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
@@ -175,7 +179,6 @@ function createSchema(sqlite) {
       PRIMARY KEY (siteId, binNum)
     );
 
-    -- Grain bag events (normalized + raw)
     CREATE TABLE grainBagEvents (
       id TEXT PRIMARY KEY,
       type TEXT,
@@ -212,6 +215,32 @@ function createSchema(sqlite) {
       data TEXT
     );
 
+    -- Products: Grain bags (bushel estimates)
+    -- bushelsCorn is the baseline (doc.bushels).
+    -- If you store soyPct/wheatPct or bushelsSoy/bushelsWheat, we capture those too.
+    CREATE TABLE productsGrainBags (
+      id TEXT PRIMARY KEY,
+      brand TEXT,
+      diameterFt REAL,
+      lengthFt REAL,
+      thicknessMil REAL,
+      status TEXT,
+      notes TEXT,
+
+      bushelsCorn REAL,
+      soyPct REAL,
+      wheatPct REAL,
+      bushelsSoy REAL,
+      bushelsWheat REAL,
+
+      createdAtISO TEXT,
+      createdAtMs INTEGER,
+      updatedAtISO TEXT,
+      updatedAtMs INTEGER,
+
+      data TEXT
+    );
+
     CREATE INDEX idx_farms_name ON farms(name);
     CREATE INDEX idx_farms_archived ON farms(archived);
 
@@ -225,9 +254,14 @@ function createSchema(sqlite) {
     CREATE INDEX idx_binSiteBins_crop ON binSiteBins(lastCropType);
 
     CREATE INDEX idx_gbe_crop ON grainBagEvents(cropType);
+    CREATE INDEX idx_gbe_year ON grainBagEvents(cropYear);
     CREATE INDEX idx_gbe_date ON grainBagEvents(datePlaced);
     CREATE INDEX idx_gbe_field ON grainBagEvents(fieldId);
     CREATE INDEX idx_gbe_type ON grainBagEvents(type);
+
+    CREATE INDEX idx_pgb_size ON productsGrainBags(diameterFt, lengthFt);
+    CREATE INDEX idx_pgb_brand ON productsGrainBags(brand);
+    CREATE INDEX idx_pgb_status ON productsGrainBags(status);
   `);
 }
 
@@ -375,7 +409,7 @@ export async function buildSnapshotToSqlite() {
     }
   }
 
-  // grain_bag_events (ALL sections preserved via data)
+  // grain_bag_events
   const grainBagEvents = await fetchAllDocs(firestore, "grain_bag_events", (id, d) => {
     const bagSku = (d.bagSku && typeof d.bagSku === "object") ? d.bagSku : {};
     const counts = (d.counts && typeof d.counts === "object") ? d.counts : {};
@@ -405,8 +439,8 @@ export async function buildSnapshotToSqlite() {
       partialFeetJson: JSON.stringify(Array.isArray(d.partialFeet) ? d.partialFeet : []),
       partialUsageJson: JSON.stringify(Array.isArray(d.partialUsage) ? d.partialUsage : []),
 
-      priority: numOrNull(d.priority ?? null),
-      priorityReason: norm(d.priorityReason || ""),
+      priority: numOrNull(d.priority ?? field.priority ?? null),
+      priorityReason: norm(d.priorityReason || field.priorityReason || ""),
 
       submittedByEmail: norm(submittedBy.email || d.submittedByUid || ""),
       submittedByName: norm(submittedBy.name || d.submittedBy || ""),
@@ -420,12 +454,42 @@ export async function buildSnapshotToSqlite() {
     };
   });
 
+  // productsGrainBags
+  const productsGrainBags = await fetchAllDocs(firestore, "productsGrainBags", (id, d) => ({
+    id,
+    brand: norm(d.brand || ""),
+    diameterFt: numOrNull(d.diameterFt ?? null),
+    lengthFt: numOrNull(d.lengthFt ?? null),
+    thicknessMil: numOrNull(d.thicknessMil ?? null),
+    status: norm(d.status || ""),
+    notes: norm(d.notes || ""),
+
+    // Baseline (you said: this number is CORN)
+    bushelsCorn: numOrNull(d.bushels ?? null),
+
+    // Optional multipliers if you store them (recommended):
+    soyPct: numOrNull(d.soyPct ?? d.soybeanPct ?? null),
+    wheatPct: numOrNull(d.wheatPct ?? null),
+
+    // Optional direct values if you store them:
+    bushelsSoy: numOrNull(d.bushelsSoy ?? d.soyBushels ?? null),
+    bushelsWheat: numOrNull(d.bushelsWheat ?? d.wheatBushels ?? null),
+
+    createdAtISO: toISO(d.createdAt),
+    createdAtMs: toMs(d.createdAt),
+    updatedAtISO: toISO(d.updatedAt),
+    updatedAtMs: toMs(d.updatedAt),
+
+    data: JSON.stringify(d)
+  }));
+
   insertRows(sqlite, "farms", farms);
   insertRows(sqlite, "rtkTowers", rtkTowers);
   insertRows(sqlite, "fields", fields);
   insertRows(sqlite, "binSites", binSites);
   if (binSiteBins.length) insertRows(sqlite, "binSiteBins", binSiteBins);
   if (grainBagEvents.length) insertRows(sqlite, "grainBagEvents", grainBagEvents);
+  if (productsGrainBags.length) insertRows(sqlite, "productsGrainBags", productsGrainBags);
 
   const counts = {
     farms: sqlite.prepare("SELECT COUNT(1) AS n FROM farms").get().n,
@@ -433,7 +497,8 @@ export async function buildSnapshotToSqlite() {
     fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n,
     binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n,
     binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n,
-    grainBagEvents: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagEvents").get().n
+    grainBagEvents: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagEvents").get().n,
+    productsGrainBags: sqlite.prepare("SELECT COUNT(1) AS n FROM productsGrainBags").get().n
   };
 
   sqlite.close();
