@@ -1,16 +1,17 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst23-bagBushels-match-grainCapacity
+// Rev: 2026-01-12-handleChat-sqlFirst24-storage-scope-year-smart
 //
-// Fix:
-// ✅ Bot may now compute grain bag bushels (field bags) exactly like the app
-//    using productsGrainBags corn-rated capacity + grain-capacity factors.
-// ✅ Clarifies "bag entries" vs "total bags (full+partial)" rules.
+// Adds (PROMPT ONLY):
+// ✅ STORAGE SCOPE follow-up: if user says "in storage" (no bins/bags/total), ask which scope.
+// ✅ SMART cropYear ask for bags/total:
+//    - Query distinct crop years for that crop in OPEN putDown bag events
+//    - If only 1 year, auto-use it (do NOT ask)
+//    - If multiple, ask user which year or all-years combined
 //
 // Keeps:
-// ✅ SQL-first + tool loop
-// ✅ cropYear clarification (bags only)
-// ✅ bin inventory is from binSiteBins
-// ✅ no fast routes / no hardcoded handlers
+// ✅ bag bushels match app using grain-capacity factors
+// ✅ bin bushels from binSiteBins
+// ✅ no fast routes / no hardcoded handlers / same tool loop
 
 'use strict';
 
@@ -154,6 +155,11 @@ HARD RULES:
    (archived IS NULL OR archived = 0)
 4) Follow-ups are normal.
 
+STORAGE SCOPE RULE (HARD):
+- If the user asks about "in storage" / "storage" and does NOT specify bins vs field bags vs total,
+  you MUST ask exactly one clarifying question BEFORE answering:
+  "Do you mean bin storage, field bag storage, or total (bins + bags)?"
+
 CROP NAME MATCHING (HARD):
 - Always match crops case-insensitively (lower()).
 - Aliases:
@@ -163,11 +169,21 @@ CROP NAME MATCHING (HARD):
   milo: milo, sorghum
   oats: oats
 
-CROP YEAR RULE (HARD) — FIELD BAGS ONLY:
-- Only trigger crop-year clarification when the question involves grain bags / grainBagEvents.
-- If user asks anything about grain bags and does NOT specify cropYear, ask:
-  "Which crop year? (ex: 2025) — or do you want combined years (ex: 2025 + 2026) / all years?"
-- Do NOT ask crop year for bin inventory questions.
+CROP YEAR RULE (HARD — SMART, BAGS ONLY):
+- Only applies if the chosen scope includes field bags (bags or total).
+- BEFORE asking the user for cropYear, you MUST check how many distinct cropYear values exist
+  for that crop in OPEN putDown bag events:
+    SELECT COUNT(DISTINCT cropYear) AS nYears
+    FROM grainBagEvents
+    WHERE type='putDown'
+      AND (status IS NULL OR status <> 'pickedUp')
+      AND cropYear IS NOT NULL
+      AND lower(cropType)=lower(?);
+- If nYears = 0: treat as "unknown cropYear" and proceed without year filtering.
+- If nYears = 1: auto-use that year without asking:
+    SELECT MIN(cropYear) AS onlyYear ... (same WHERE)
+- If nYears >= 2: ask:
+  "Which crop year? (e.g., 2025) — or all years combined?"
 
 BIN INVENTORY RULE (HARD):
 - Bin bushels are from binSiteBins.onHandBushels.
@@ -182,8 +198,8 @@ FIELD BAG COUNTING RULE (HARD):
   (NOT grainBagEvents.countPartial unless it matches the array length)
 
 FIELD BAG BUSHELS RULE (HARD — MATCHES APP):
-- Bag bushels are computed exactly like the Grain dashboard:
-  1) For each OPEN putDown row in grainBagEvents (type='putDown' AND status != 'pickedUp' or status is null):
+- Bag bushels are computed like the Grain dashboard:
+  1) For each OPEN putDown row:
      ratedCornBu =
        (countFull * buPerBagCorn)
        + (sum(partialFeet) * (buPerBagCorn / lengthFt))
@@ -194,17 +210,16 @@ FIELD BAG BUSHELS RULE (HARD — MATCHES APP):
      milo=1.02
      oats=0.78
      cropBu = ratedCornBu * factor
-  3) Sum cropBu across rows matching the requested crop filter.
+  3) Sum cropBu across rows matching the requested crop filter and (optionally) cropYear.
 
 JOIN TO PRODUCTS (HARD):
 - productsGrainBags provides:
   - diameterFt
   - lengthFt
   - bushelsCorn (corn-rated bushels per full bag)
-- Join each grainBagEvents row to productsGrainBags by:
-  lower(grainBagEvents.bagDiameterFt)=lower(productsGrainBags.diameterFt) AND
-  lower(grainBagEvents.bagSizeFeet)=lower(productsGrainBags.lengthFt)
-  (numeric equality is fine; use ABS difference <= 0.0001 if needed).
+- Join each grainBagEvents row to productsGrainBags by numeric equality:
+  bagDiameterFt = diameterFt AND bagSizeFeet = lengthFt
+  (use ABS difference <= 0.0001 if needed).
 - If join fails for a row, exclude it and mention how many rows had no matching product.
 
 SQL TIP (SQLite):
@@ -213,8 +228,7 @@ SQL TIP (SQLite):
     SELECT SUM(CAST(value AS REAL)) FROM json_each(grainBagEvents.partialFeetJson)
 
 TOTAL STORAGE RULE (HARD):
-- If user asks TOTAL / OVERALL / "bins + bags":
-  return:
+- If user asks TOTAL / OVERALL / "bins + bags", return:
   - bins bushels (binSiteBins)
   - field bag bushels (grainBagEvents + products + factors)
   - combined total with breakdown.
