@@ -1,16 +1,15 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst29-bagBushels-canonical-sql
+// Rev: 2026-01-12-handleChat-sqlFirst30-sql-sanitize-bagcount-default
 //
-// Fix:
-// ✅ Prevent soybean-bag queries from generating brittle SQL.
-// ✅ Canonical method:
-//    1) SQL returns ratedCornBu for open putDown bag events (by crop / cropYear)
-//    2) Apply grain-capacity factor outside SQL (corn=1.00, soybeans=0.93, etc)
+// Fixes:
+// ✅ Prevent "multi-statement SQL" false positives by stripping trailing semicolons,
+//    and rejecting internal semicolons before runSql().
+// ✅ Define "How many grain bags are there?" as TOTAL BAGS (full + partial), not entry rows.
 //
 // Keeps:
-// ✅ OpenAI-led (no intent routing)
-// ✅ tool_choice:"auto" first call + empty-response retry (db_query-only)
-// ✅ minimal guardrails, pending did-you-mean
+// ✅ OpenAI-led (no routing/intent trees)
+// ✅ tool_choice:"auto" first call + empty-response retry (db_query only)
+// ✅ pending did-you-mean behavior
 
 'use strict';
 
@@ -50,7 +49,6 @@ function pruneThreads() {
     if (!v?.updatedAt || (now - v.updatedAt) > TTL_MS) THREADS.delete(k);
   }
 }
-
 function getThread(threadId) {
   if (!threadId) return null;
   const cur = THREADS.get(threadId);
@@ -59,20 +57,31 @@ function getThread(threadId) {
   THREADS.set(threadId, fresh);
   return fresh;
 }
-
 function pushMsg(thread, role, content) {
   if (!thread) return;
   thread.messages.push({ role, content: safeStr(content) });
   if (thread.messages.length > (MAX_TURNS * 2)) thread.messages = thread.messages.slice(-MAX_TURNS * 2);
   thread.updatedAt = nowMs();
 }
-
 function setPending(thread, pending) {
   if (!thread) return;
   thread.pending = pending || null;
   thread.updatedAt = nowMs();
 }
 
+// --- SQL sanitizer (fixes "multi-statement" false positives) ---
+function cleanSql(raw) {
+  let s = safeStr(raw || "").trim();
+  // Strip trailing semicolons (common LLM habit)
+  s = s.replace(/;\s*$/g, "").trim();
+  // Disallow any remaining semicolons (would indicate multi-statement)
+  if (s.includes(";")) {
+    throw new Error("multi_statement_sql_not_allowed");
+  }
+  return s;
+}
+
+// -------- OpenAI wrapper --------
 async function openaiResponsesCreate(payload) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
@@ -95,7 +104,6 @@ function extractFunctionCalls(responseJson) {
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   return items.filter(it => it && it.type === "function_call");
 }
-
 function extractAssistantText(responseJson) {
   const direct = safeStr(responseJson?.output_text || "").trim();
   if (direct) return direct;
@@ -128,7 +136,7 @@ function dbQueryToolDef() {
   return {
     type: "function",
     name: "db_query",
-    description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database.",
+    description: "Run a read-only SQL SELECT query against the FarmVista SQLite snapshot database. Single statement only; do not include semicolons.",
     parameters: {
       type: "object",
       properties: {
@@ -149,55 +157,27 @@ function buildSystemPrompt(dbStatus) {
 You are FarmVista Copilot.
 
 OpenAI-led: you decide what to query and how to answer.
-For DB facts, you MUST use tools (no guessing). Do NOT show internal IDs.
+For DB facts you MUST use tools (no guessing). Do NOT show internal IDs.
 
-Active fields rule:
+Active fields:
 - Active = (archived IS NULL OR archived = 0)
 
-Do NOT treat crop words ("corn", "soybeans") as field/farm names.
-Only use resolvers if user clearly refers to a field/farm/tower/bin-site by name.
+Grain bag counting (IMPORTANT):
+- "How many grain bags are there?" means TOTAL BAGS DOWN (full + partial),
+  not the number of putDown entry rows.
+- "How many bag entries?" means number of open putDown rows.
 
-Storage wording:
-- If user asks "bushels in storage" without bins vs bags vs total, ask ONE clarifier:
-  "Do you mean bin storage, field bag storage, or total (bins + bags)?"
+Avoid resolver traps:
+- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
+- Use resolvers only when user clearly refers to a field/farm/tower/bin site by name.
 
-CropYear (bags only):
-- Only ask cropYear if there are 2+ distinct cropYear values for that crop in OPEN putDown rows.
-  Otherwise auto-use the single year (or proceed if none).
+Grain bushels:
+- Bin bushels: SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(crop).
+- Field bag bushels: compute rated corn bushels from productsGrainBags + grainBagEvents,
+  then apply grain-capacity factors (corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78).
 
-BIN bushels:
-- SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(?).
-
-FIELD BAG bushels (MATCH APP) — CANONICAL SQL (HARD):
-When user asks "bushels in grain bags" (any crop), you MUST:
-1) Compute ratedCornBu in SQL using ONLY these columns:
-   - grainBagEvents: type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetSum
-   - productsGrainBags: diameterFt, lengthFt, bushelsCorn
-   Open row condition:
-     lower(type)='putdown' AND (status IS NULL OR status='' OR lower(status) <> 'pickedup')
-   Join:
-     ABS(grainBagEvents.bagDiameterFt - productsGrainBags.diameterFt) <= 0.001
-     AND ABS(grainBagEvents.bagSizeFeet - productsGrainBags.lengthFt) <= 0.001
-   ratedCornBu formula:
-     SUM( COALESCE(countFull,0) * productsGrainBags.bushelsCorn
-        + COALESCE(partialFeetSum,0) * (productsGrainBags.bushelsCorn / NULLIF(productsGrainBags.lengthFt,0))
-     ) AS ratedCornBu
-2) THEN convert ratedCornBu to crop bushels OUTSIDE SQL using factors:
-   corn 1.00
-   soybeans 0.93
-   wheat 1.07
-   milo 1.02
-   oats 0.78
-   cropBu = ratedCornBu * factor
-
-IMPORTANT:
-- Do NOT implement the crop factor inside SQL. Always do it outside SQL.
-- Use lower(cropType)=lower(?) for crop filtering.
-
-Tables:
-- binSiteBins(...)
-- grainBagEvents(...)
-- productsGrainBags(...)
+SQL tool rule:
+- db_query must be a SINGLE statement with NO semicolons.
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
@@ -295,8 +275,9 @@ export async function handleChatHttp(req, res) {
         if (name === "db_query") {
           didAny = true;
           try {
+            const sql = cleanSql(args.sql || "");
             result = runSql({
-              sql: safeStr(args.sql || ""),
+              sql,
               params: Array.isArray(args.params) ? args.params : [],
               limit: Number.isFinite(args.limit) ? args.limit : 200
             });
