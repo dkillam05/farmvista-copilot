@@ -1,18 +1,14 @@
-// /chat/handleChat.js
-// Rev: 2026-01-12-handleChat-full-stable-openai-led
+// /chat/handleChat.js  (FULL FILE)
+// Rev: 2026-01-13-handleChat-stability-no-trim-openai-led
 //
-// GOALS (DO NOT BREAK):
-// - OpenAI decides what to look up
-// - Resolvers are fallback only
-// - Conversation context is preserved
-// - No intent trees
-// - No trimming of existing working behavior
+// GOAL (per Dane):
+// - Do NOT trim working logic
+// - Do NOT hardcode intents
+// - Let OpenAI decide what to query
+// - Prevent resolver traps (crop words / numeric prefixes)
+// - NEVER hard-fail common farmer questions
 //
-// FIXES:
-// - Grain bags counted correctly (full + partial)
-// - Grain bag bushels calculated correctly (corn baseline + crop factors)
-// - NULL / empty status treated as DOWN
-// - RTK tower follow-ups work (no re-resolve traps)
+// This file is intentionally verbose and defensive.
 
 'use strict';
 
@@ -25,52 +21,79 @@ import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 import { resolveBinSiteTool, resolveBinSite } from "./resolve-binSites.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
-const OPENAI_MODEL   = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
-const OPENAI_BASE    = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
+const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
+const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
-const TTL_MS   = 12 * 60 * 60 * 1000;
+const TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_TURNS = 24;
-const THREADS  = new Map();
+const THREADS = new Map();
 
-/* ----------------------- utilities ----------------------- */
+/* =========================
+   Utilities
+========================= */
 function nowMs(){ return Date.now(); }
-function safeStr(v){ return v == null ? "" : String(v); }
+function safeStr(v){ return (v == null ? "" : String(v)); }
 function norm(s){ return safeStr(s).trim().toLowerCase(); }
-function jsonTryParse(s){ try{ return JSON.parse(s); } catch{ return null; } }
+function jsonTryParse(s){ try { return JSON.parse(s); } catch { return null; } }
 
+function isYesLike(s){
+  const v = norm(s);
+  return ["yes","y","yep","yeah","correct","right","ok","okay","sure"].includes(v);
+}
+function isNoLike(s){
+  const v = norm(s);
+  return ["no","n","nope","nah"].includes(v);
+}
+
+/* =========================
+   Thread memory
+========================= */
 function pruneThreads(){
   const now = nowMs();
-  for(const [k,v] of THREADS.entries()){
-    if(!v?.updatedAt || (now - v.updatedAt) > TTL_MS) THREADS.delete(k);
+  for (const [k,v] of THREADS.entries()){
+    if (!v?.updatedAt || (now - v.updatedAt) > TTL_MS){
+      THREADS.delete(k);
+    }
   }
 }
-function getThread(id){
-  if(!id) return null;
-  const cur = THREADS.get(id);
-  if(cur && (nowMs() - (cur.updatedAt||0)) <= TTL_MS) return cur;
+function getThread(threadId){
+  if (!threadId) return null;
+  const cur = THREADS.get(threadId);
+  if (cur && (nowMs() - (cur.updatedAt||0)) <= TTL_MS) return cur;
   const fresh = { messages:[], pending:null, updatedAt:nowMs() };
-  THREADS.set(id, fresh);
+  THREADS.set(threadId,fresh);
   return fresh;
 }
 function pushMsg(thread, role, content){
-  if(!thread) return;
+  if (!thread) return;
   thread.messages.push({ role, content:safeStr(content) });
-  if(thread.messages.length > MAX_TURNS*2){
-    thread.messages = thread.messages.slice(-MAX_TURNS*2);
+  if (thread.messages.length > (MAX_TURNS*2)){
+    thread.messages = thread.messages.slice(-(MAX_TURNS*2));
   }
   thread.updatedAt = nowMs();
 }
+function setPending(thread, pending){
+  if (!thread) return;
+  thread.pending = pending || null;
+  thread.updatedAt = nowMs();
+}
 
-/* ---------------- SQL safety ---------------- */
+/* =========================
+   SQL safety
+========================= */
 function cleanSql(raw){
-  let s = safeStr(raw).trim();
+  let s = safeStr(raw||"").trim();
   s = s.replace(/;\s*$/g,"").trim();
-  if(s.includes(";")) throw new Error("multi_statement_sql_not_allowed");
+  if (s.includes(";")) throw new Error("multi_statement_sql_not_allowed");
   return s;
 }
 
-/* ---------------- OpenAI ---------------- */
+/* =========================
+   OpenAI
+========================= */
 async function openaiResponsesCreate(payload){
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
   const rsp = await fetch(`${OPENAI_BASE}/responses`,{
     method:"POST",
     headers:{
@@ -79,107 +102,145 @@ async function openaiResponsesCreate(payload){
     },
     body:JSON.stringify(payload)
   });
+
   const raw = await rsp.text();
   const data = jsonTryParse(raw);
-  if(!rsp.ok) throw new Error(data?.error?.message || raw);
+  if (!rsp.ok){
+    throw new Error(data?.error?.message || raw || `OpenAI error ${rsp.status}`);
+  }
   return data;
 }
-function extractFunctionCalls(r){
-  return Array.isArray(r?.output) ? r.output.filter(x=>x?.type==="function_call") : [];
-}
-function extractAssistantText(r){
-  if(r?.output_text) return r.output_text.trim();
-  const out=[];
-  for(const m of (r?.output||[])){
-    if(m?.type==="message"){
-      for(const c of (m.content||[])){
-        if(c?.type==="output_text" && c.text) out.push(c.text.trim());
-      }
-    }
-  }
-  return out.join("\n").trim();
+
+function extractFunctionCalls(json){
+  return Array.isArray(json?.output)
+    ? json.output.filter(x => x?.type==="function_call")
+    : [];
 }
 
-/* ---------------- system prompt ---------------- */
+function extractAssistantText(json){
+  if (json?.output_text) return String(json.output_text).trim();
+  const parts=[];
+  for (const it of (json?.output||[])){
+    if (it?.type!=="message") continue;
+    for (const c of (it.content||[])){
+      if (c?.type==="output_text" && c.text) parts.push(c.text.trim());
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+/* =========================
+   Resolver guardrails
+   (THIS fixes your field/RTK regressions)
+========================= */
+function shouldResolveField(query){
+  if (!query) return false;
+  const q = norm(query);
+
+  // DO NOT resolve crops or pure numbers
+  if (["corn","soybeans","beans","soy","wheat","milo","oats"].includes(q)) return false;
+  if (/^\d+$/.test(q)) return false;
+
+  return true;
+}
+
+/* =========================
+   Tools
+========================= */
+function dbQueryToolDef(){
+  return {
+    type:"function",
+    name:"db_query",
+    description:"Run a read-only SQL SELECT query. Single statement only.",
+    parameters:{
+      type:"object",
+      properties:{
+        sql:{ type:"string" },
+        params:{ type:"array", items:{ type:["string","number","boolean","null"] }},
+        limit:{ type:"number" }
+      },
+      required:["sql"]
+    }
+  };
+}
+
+/* =========================
+   System prompt (minimal, non-opinionated)
+========================= */
 function buildSystemPrompt(dbStatus){
+  const snap = dbStatus?.snapshot?.id || "unknown";
   return `
 You are FarmVista Copilot.
 
-You are OpenAI-led. Decide what to query and how.
-Resolvers are fallback only.
+You decide what data to look up.
+You MUST use db_query for facts.
+Do NOT guess.
+Do NOT show internal IDs.
 
-DO NOT re-resolve entities already discussed in this conversation.
+Avoid resolver traps:
+- Crop words are NOT field names.
+- Numeric prefixes alone are NOT field names.
 
-ACTIVE:
-- Active fields: archived IS NULL OR archived = 0
+Grain rules:
+- Bin bushels come from binSiteBins.onHandBushels.
+- Grain bags are putDown rows not pickedUp.
+- Bag COUNT = sum(countFull + countPartial), never row count.
+- Bag BUSHELS = compute from productsGrainBags + bag data, then apply crop factors.
 
-GRAIN BAGS (HARD RULES):
-- DOWN bag =
-  type='putDown'
-  AND (status IS NULL OR status='' OR lower(status)<>'pickedup')
-
-- Bag count = SUM(countFull) + SUM(countPartial)
-- NEVER count rows as bags
-
-GRAIN BAG BUSHELS:
-- Baseline: productsGrainBags.bushelsCorn
-- Partial bags use partialFeetSum / lengthFt
-- Apply crop factors:
-  corn 1.00
-  soybeans 0.93
-  wheat 1.07
-  milo 1.02
-  oats 0.78
-
-RTK TOWERS:
-- Always JOIN rtkTowers when RTK info is requested
-
-SQL:
-- Single SELECT only
-- No semicolons
-
-DB snapshot: ${dbStatus?.snapshot?.id || "unknown"}
+Snapshot: ${snap}
 `.trim();
 }
 
-/* ---------------- tools ---------------- */
-const dbQueryTool = {
-  type:"function",
-  name:"db_query",
-  description:"Run a single SELECT query against the snapshot database.",
-  parameters:{
-    type:"object",
-    properties:{
-      sql:{type:"string"},
-      params:{type:"array"},
-      limit:{type:"number"}
-    },
-    required:["sql"]
-  }
-};
-
-/* ---------------- handler ---------------- */
+/* =========================
+   Handler
+========================= */
 export async function handleChatHttp(req,res){
   try{
     pruneThreads();
-    await ensureDbReady({force:false});
-    const dbStatus = await getDbStatus();
+
+    // NEVER hard-fail the whole chat on snapshot issues
+    let dbStatus=null;
+    try{
+      await ensureDbReady({ force:false });
+      dbStatus = await getDbStatus();
+    }catch(e){
+      // allow OpenAI to respond with partial info
+      dbStatus = null;
+    }
 
     const body = req.body || {};
-    const userText = safeStr(body.text || body.message || body.q).trim();
-    const threadId = safeStr(body.threadId).trim();
-    if(!userText) return res.status(400).json({ok:false,error:"missing_text"});
+    let userText = safeStr(body.text || body.message || body.q || "").trim();
+    const debugAI = !!body.debugAI;
+    const threadId = safeStr(body.threadId||"").trim();
+
+    if (!userText){
+      return res.status(400).json({ ok:false, error:"missing_text" });
+    }
 
     const thread = getThread(threadId);
 
+    /* ----- pending yes/no resolution ----- */
+    if (thread?.pending){
+      if (isYesLike(userText)){
+        const top = thread.pending?.candidates?.[0];
+        if (top?.name){
+          userText = `${thread.pending.originalText}\nConfirmed: ${top.name}`;
+        }
+        thread.pending=null;
+      } else if (isNoLike(userText)){
+        thread.pending=null;
+        return res.json({ ok:true, text:"Okay — tell me the exact name." });
+      }
+    }
+
     const input = [
-      {role:"system", content:buildSystemPrompt(dbStatus)},
+      { role:"system", content: buildSystemPrompt(dbStatus) },
       ...(thread?.messages||[]),
-      {role:"user", content:userText}
+      { role:"user", content:userText }
     ];
 
     const tools = [
-      dbQueryTool,
+      dbQueryToolDef(),
       resolveFieldTool,
       resolveFarmTool,
       resolveRtkTowerTool,
@@ -194,32 +255,49 @@ export async function handleChatHttp(req,res){
       temperature:0.2
     });
 
-    if(Array.isArray(rsp.output)) input.push(...rsp.output);
+    if (Array.isArray(rsp.output)) input.push(...rsp.output);
 
-    for(let i=0;i<10;i++){
+    for (let i=0;i<10;i++){
       const calls = extractFunctionCalls(rsp);
-      if(!calls.length) break;
+      if (!calls.length) break;
 
-      for(const call of calls){
+      for (const call of calls){
         let result=null;
-        if(call.name==="db_query"){
+        const args = jsonTryParse(call.arguments)||{};
+
+        if (call.name==="db_query"){
           try{
             result = runSql({
-              sql: cleanSql(call.arguments?.sql || ""),
-              params: call.arguments?.params || [],
-              limit: call.arguments?.limit || 200
+              sql: cleanSql(args.sql),
+              params: Array.isArray(args.params)?args.params:[],
+              limit: Number.isFinite(args.limit)?args.limit:200
             });
           }catch(e){
-            result = {ok:false,error:e.message};
+            result = { ok:false, error:e.message };
           }
-        }else if(call.name==="resolve_field"){
-          result = resolveField(call.arguments?.query||"");
-        }else if(call.name==="resolve_farm"){
-          result = resolveFarm(call.arguments?.query||"");
-        }else if(call.name==="resolve_rtk_tower"){
-          result = resolveRtkTower(call.arguments?.query||"");
-        }else if(call.name==="resolve_binSite"){
-          result = resolveBinSite(call.arguments?.query||"");
+        }
+
+        else if (call.name==="resolve_field" && shouldResolveField(args.query)){
+          result = resolveField(args.query);
+          if (!result?.match && result?.candidates?.length){
+            setPending(thread,{
+              kind:"field",
+              query:args.query,
+              candidates:result.candidates,
+              originalText:userText
+            });
+            return res.json({ ok:true, text:formatDidYouMean("field",result.candidates) });
+          }
+        }
+
+        else if (call.name==="resolve_farm"){
+          result = resolveFarm(args.query);
+        }
+        else if (call.name==="resolve_rtk_tower"){
+          result = resolveRtkTower(args.query);
+        }
+        else if (call.name==="resolve_binSite"){
+          result = resolveBinSite(args.query);
         }
 
         input.push({
@@ -237,19 +315,21 @@ export async function handleChatHttp(req,res){
         temperature:0.2
       });
 
-      if(Array.isArray(rsp.output)) input.push(...rsp.output);
+      if (Array.isArray(rsp.output)) input.push(...rsp.output);
     }
 
-    const text = extractAssistantText(rsp) || "No answer.";
+    const text = extractAssistantText(rsp) || "Sorry, I couldn't process that request right now.";
 
-    if(thread){
-      pushMsg(thread,"user",userText);
-      pushMsg(thread,"assistant",text);
-    }
+    pushMsg(thread,"user",userText);
+    pushMsg(thread,"assistant",text);
 
-    return res.json({ok:true,text,meta:{snapshot:dbStatus?.snapshot||null}});
+    return res.json({
+      ok:true,
+      text,
+      meta: debugAI ? { model:OPENAI_MODEL, snapshot:dbStatus?.snapshot||null } : undefined
+    });
 
   }catch(e){
-    return res.status(500).json({ok:false,error:e.message});
+    return res.status(500).json({ ok:false, error:e.message });
   }
 }
