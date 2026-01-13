@@ -1,16 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst27-auto-first-empty-retry-dbquery-only
+// Rev: 2026-01-12-handleChat-sqlFirst28-openai-led-stable-bags-active
 //
 // Fix:
-// ✅ Keep OpenAI-led flow (tool_choice:"auto" first)
-// ✅ If Responses API returns an empty reply (no tool calls + no text),
-//    retry ONCE with tool_choice:"required" but ONLY db_query tool available.
-//    This prevents "No answer." and avoids resolver rabbit holes.
-//
-// Keeps:
-// ✅ Minimal guardrails in system prompt
-// ✅ Pending did-you-mean support
-// ✅ Resolvers available in normal flow, but NOT in the retry fallback
+// ✅ No forced tool call on first turn (prevents resolver traps).
+// ✅ If model returns empty response, retry once with db_query only.
+// ✅ Active fields: archived IS NULL OR archived=0
+// ✅ Grain bag bushels math uses grainBagEvents.partialFeetSum + status (no json_each).
+// ✅ OpenAI-led: no intent routing, no regex handlers, minimal guardrails only.
 
 'use strict';
 
@@ -26,16 +22,14 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
-// -------- Minimal memory (in this file only) --------
-const TTL_MS = 12 * 60 * 60 * 1000;     // 12 hours
-const MAX_TURNS = 24;                   // keep small (app likes clean chat)
-const THREADS = new Map();              // threadId -> { messages:[{role,content}], pending, updatedAt }
+// -------- Minimal memory --------
+const TTL_MS = 12 * 60 * 60 * 1000;
+const MAX_TURNS = 24;
+const THREADS = new Map();
 
 function nowMs() { return Date.now(); }
-
 function safeStr(v) { return (v == null ? "" : String(v)); }
 function norm(s) { return safeStr(s).trim().toLowerCase(); }
-
 function jsonTryParse(s) { try { return JSON.parse(s); } catch { return null; } }
 
 function isYesLike(s) {
@@ -53,29 +47,23 @@ function pruneThreads() {
     if (!v?.updatedAt || (now - v.updatedAt) > TTL_MS) THREADS.delete(k);
   }
 }
-
 function getThread(threadId) {
   if (!threadId) return null;
   const cur = THREADS.get(threadId);
   if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
-
   const fresh = { messages: [], pending: null, updatedAt: nowMs() };
   THREADS.set(threadId, fresh);
   return fresh;
 }
-
 function pushMsg(thread, role, content) {
   if (!thread) return;
   thread.messages.push({ role, content: safeStr(content) });
-  if (thread.messages.length > (MAX_TURNS * 2)) {
-    thread.messages = thread.messages.slice(-MAX_TURNS * 2);
-  }
+  if (thread.messages.length > (MAX_TURNS * 2)) thread.messages = thread.messages.slice(-MAX_TURNS * 2);
   thread.updatedAt = nowMs();
 }
-
 function setPending(thread, pending) {
   if (!thread) return;
-  thread.pending = pending || null; // { kind, query, candidates:[{id,name,score}], originalText }
+  thread.pending = pending || null;
   thread.updatedAt = nowMs();
 }
 
@@ -85,10 +73,7 @@ async function openaiResponsesCreate(payload) {
 
   const rsp = await fetch(`${OPENAI_BASE}/responses`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${OPENAI_API_KEY}`
-    },
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
     body: JSON.stringify(payload)
   });
 
@@ -105,23 +90,19 @@ function extractFunctionCalls(responseJson) {
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   return items.filter(it => it && it.type === "function_call");
 }
-
 function extractAssistantText(responseJson) {
   const direct = safeStr(responseJson?.output_text || "").trim();
   if (direct) return direct;
 
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   const parts = [];
-
   for (const it of items) {
-    if (!it) continue;
-    if (it.type === "message") {
-      const content = Array.isArray(it.content) ? it.content : [];
-      for (const c of content) {
-        if (c?.type === "output_text" && typeof c.text === "string") {
-          const t = c.text.trim();
-          if (t) parts.push(t);
-        }
+    if (it?.type !== "message") continue;
+    const content = Array.isArray(it.content) ? it.content : [];
+    for (const c of content) {
+      if (c?.type === "output_text" && typeof c.text === "string") {
+        const t = c.text.trim();
+        if (t) parts.push(t);
       }
     }
   }
@@ -132,56 +113,9 @@ function formatDidYouMean(kind, candidates) {
   const lines = [];
   lines.push(`Did you mean (${kind}):`);
   for (const c of (candidates || []).slice(0, 8)) lines.push(`- ${c.name}`);
-  lines.push(``);
+  lines.push("");
   lines.push(`Reply with the exact name, or say "yes" to pick the first one.`);
   return lines.join("\n");
-}
-
-function buildSystemPrompt(dbStatus) {
-  const counts = dbStatus?.counts || {};
-  const snapshotId = dbStatus?.snapshot?.id || "unknown";
-
-  return `
-You are FarmVista Copilot.
-
-You decide what to query and how to answer. Keep it natural.
-But for any database facts, you MUST use tools (no guessing).
-
-SMALL GUARDRAILS:
-1) Never guess DB facts. Use tools.
-2) Never show internal IDs to the user (you may use ids internally in SQL).
-3) If the user asks "how many bushels ... in storage" and they did NOT specify bins vs bags vs total,
-   ask ONE clarifying question first:
-   "Do you mean bin storage, field bag storage, or total (bins + bags)?"
-4) CropYear (bags only): if answering a field-bag question and user didn't specify crop year,
-   check distinct crop years first; only ask if 2+ years exist.
-
-IMPORTANT: Do NOT treat crop words like "corn" or "soybeans" as a field/farm name.
-Only resolve a field/farm/tower/site when the user clearly refers to one.
-
-GRAIN LOGIC (matches the app):
-- Bin bushels: SUM(binSiteBins.onHandBushels) filtered by lower(lastCropType)=lower(crop).
-- Field bag bushels:
-  - ratedCornBu per open putDown row =
-      countFull * productsGrainBags.bushelsCorn
-    + sum(partialFeet) * (productsGrainBags.bushelsCorn / productsGrainBags.lengthFt)
-  - convert to crop using factors:
-      corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78
-    cropBu = ratedCornBu * factor
-
-TOOLS AVAILABLE:
-- db_query(sql, params?, limit?)
-- resolve_field / resolve_farm / resolve_rtk_tower / resolve_binSite
-(use resolvers only when needed)
-
-DB snapshot: ${snapshotId}
-Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
-
-Key tables:
-- binSiteBins(...)
-- grainBagEvents(...)
-- productsGrainBags(...)
-`.trim();
 }
 
 function dbQueryToolDef() {
@@ -201,6 +135,44 @@ function dbQueryToolDef() {
   };
 }
 
+function buildSystemPrompt(dbStatus) {
+  const counts = dbStatus?.counts || {};
+  const snapshotId = dbStatus?.snapshot?.id || "unknown";
+
+  return `
+You are FarmVista Copilot.
+
+OpenAI-led: you decide what to query and when.
+But for DB facts you MUST use tools (no guessing).
+
+Guardrails (small):
+- Never show internal IDs (you can use IDs internally in SQL).
+- "Active fields" means: (archived IS NULL OR archived = 0).
+- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
+- Use resolvers only when user clearly refers to a field/farm/tower/site by name.
+
+Grain math (matches the app):
+- Bin bushels: SUM(binSiteBins.onHandBushels) filtered by lower(lastCropType)=lower(crop).
+- Field bag bushels:
+  ratedCornBu per open putDown row =
+      COALESCE(countFull,0) * productsGrainBags.bushelsCorn
+    + COALESCE(partialFeetSum,0) * (productsGrainBags.bushelsCorn / productsGrainBags.lengthFt)
+  Convert to crop using factors: corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78.
+
+Open bags:
+- grainBagEvents row is OPEN if type='putDown' AND (status IS NULL OR status='' OR lower(status) <> 'pickedup').
+
+Tables:
+- fields(..., archived)
+- binSiteBins(..., onHandBushels, lastCropType)
+- grainBagEvents(type, status, cropType, cropYear, bagDiameterFt, bagSizeFeet, countFull, partialFeetSum)
+- productsGrainBags(diameterFt, lengthFt, bushelsCorn)
+
+DB snapshot: ${snapshotId}
+Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
+`.trim();
+}
+
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -217,10 +189,9 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
-    // ---- pending did-you-mean yes/no ----
+    // pending did-you-mean yes/no
     if (thread && thread.pending) {
       const pend = thread.pending;
-
       if (isYesLike(userText)) {
         const top = pend?.candidates?.[0] || null;
         if (top?.id && top?.name) {
@@ -255,7 +226,7 @@ export async function handleChatHttp(req, res) {
       resolveBinSiteTool
     ];
 
-    // FIRST CALL: allow model to ask a clarifying question OR call tools
+    // First call: auto (allows clarifying questions)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -266,9 +237,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // ---- EMPTY RESPONSE SAFETY RETRY ----
-    // If no tool calls and no assistant text, retry once forcing db_query only.
-    // This avoids "No answer." and avoids resolver traps.
+    // Empty-response retry: force db_query only (prevents "No answer" and avoids resolvers)
     const firstCalls = extractFunctionCalls(rsp);
     const firstText = extractAssistantText(rsp);
     if (!firstCalls.length && !firstText) {
