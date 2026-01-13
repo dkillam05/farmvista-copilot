@@ -1,16 +1,17 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite13-add-productsGrainBags
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite14-grainBags-status-partialFeetSum
 //
-// Adds:
-// ✅ productsGrainBags table (from Firestore collection productsGrainBags)
-//    - bushelsCorn (baseline from doc.bushels)
-//    - optional soyPct / wheatPct (multipliers) if present in Firestore
-//    - optional bushelsSoy / bushelsWheat if present in Firestore
+// Fix:
+// ✅ Add grainBagEvents.status column (prevents "no such column: status" SQL crashes)
+// ✅ Add grainBagEvents.partialFeetSum REAL (avoids JSON1 dependence for partials math)
 //
 // Keeps:
-// ✅ binSites + binSiteBins (onHand inventory mode)
-// ✅ grainBagEvents
+// ✅ productsGrainBags (bushelsCorn baseline, lengthFt, diameterFt)
+// ✅ binSites + binSiteBins (onHand)
 // ✅ farms/fields/rtkTowers
+//
+// NOTE:
+// - This makes bag-bushel math match the app and makes SQL reliable.
 
 'use strict';
 
@@ -179,9 +180,11 @@ function createSchema(sqlite) {
       PRIMARY KEY (siteId, binNum)
     );
 
+    -- ✅ Fixed grain bag events schema (adds status + partialFeetSum)
     CREATE TABLE grainBagEvents (
       id TEXT PRIMARY KEY,
       type TEXT,
+      status TEXT,
       datePlaced TEXT,
       cropType TEXT,
       cropYear INTEGER,
@@ -199,6 +202,7 @@ function createSchema(sqlite) {
       countPartial INTEGER,
 
       partialFeetJson TEXT,
+      partialFeetSum REAL,
       partialUsageJson TEXT,
 
       priority INTEGER,
@@ -215,9 +219,6 @@ function createSchema(sqlite) {
       data TEXT
     );
 
-    -- Products: Grain bags (bushel estimates)
-    -- bushelsCorn is the baseline (doc.bushels).
-    -- If you store soyPct/wheatPct or bushelsSoy/bushelsWheat, we capture those too.
     CREATE TABLE productsGrainBags (
       id TEXT PRIMARY KEY,
       brand TEXT,
@@ -249,18 +250,18 @@ function createSchema(sqlite) {
     CREATE INDEX idx_fields_name ON fields(name);
     CREATE INDEX idx_fields_farmId ON fields(farmId);
     CREATE INDEX idx_fields_county ON fields(county);
+    CREATE INDEX idx_fields_archived ON fields(archived);
 
     CREATE INDEX idx_binSites_name ON binSites(name);
     CREATE INDEX idx_binSiteBins_crop ON binSiteBins(lastCropType);
 
+    CREATE INDEX idx_gbe_type ON grainBagEvents(type);
+    CREATE INDEX idx_gbe_status ON grainBagEvents(status);
     CREATE INDEX idx_gbe_crop ON grainBagEvents(cropType);
     CREATE INDEX idx_gbe_year ON grainBagEvents(cropYear);
-    CREATE INDEX idx_gbe_date ON grainBagEvents(datePlaced);
     CREATE INDEX idx_gbe_field ON grainBagEvents(fieldId);
-    CREATE INDEX idx_gbe_type ON grainBagEvents(type);
 
     CREATE INDEX idx_pgb_size ON productsGrainBags(diameterFt, lengthFt);
-    CREATE INDEX idx_pgb_brand ON productsGrainBags(brand);
     CREATE INDEX idx_pgb_status ON productsGrainBags(status);
   `);
 }
@@ -409,17 +410,25 @@ export async function buildSnapshotToSqlite() {
     }
   }
 
-  // grain_bag_events
+  // grain_bag_events (now includes status + partialFeetSum)
   const grainBagEvents = await fetchAllDocs(firestore, "grain_bag_events", (id, d) => {
     const bagSku = (d.bagSku && typeof d.bagSku === "object") ? d.bagSku : {};
     const counts = (d.counts && typeof d.counts === "object") ? d.counts : {};
     const field = (d.field && typeof d.field === "object") ? d.field : {};
     const submittedBy = (d.submittedBy && typeof d.submittedBy === "object") ? d.submittedBy : {};
 
+    const pf = Array.isArray(d.partialFeet) ? d.partialFeet : [];
+    let pfSum = 0;
+    for (const v of pf) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) pfSum += n;
+    }
+
     return {
       id,
 
       type: norm(d.type || ""),
+      status: norm(d.status || ""), // ✅
       datePlaced: norm(d.datePlaced || d.dateISO || ""),
       cropType: norm(d.cropType || ""),
       cropYear: numOrNull(d.cropYear ?? null),
@@ -436,7 +445,8 @@ export async function buildSnapshotToSqlite() {
       countFull: numOrNull(counts.full ?? null),
       countPartial: numOrNull(counts.partial ?? null),
 
-      partialFeetJson: JSON.stringify(Array.isArray(d.partialFeet) ? d.partialFeet : []),
+      partialFeetJson: JSON.stringify(pf),
+      partialFeetSum: numOrNull(pfSum), // ✅
       partialUsageJson: JSON.stringify(Array.isArray(d.partialUsage) ? d.partialUsage : []),
 
       priority: numOrNull(d.priority ?? field.priority ?? null),
@@ -464,14 +474,11 @@ export async function buildSnapshotToSqlite() {
     status: norm(d.status || ""),
     notes: norm(d.notes || ""),
 
-    // Baseline (you said: this number is CORN)
     bushelsCorn: numOrNull(d.bushels ?? null),
 
-    // Optional multipliers if you store them (recommended):
     soyPct: numOrNull(d.soyPct ?? d.soybeanPct ?? null),
     wheatPct: numOrNull(d.wheatPct ?? null),
 
-    // Optional direct values if you store them:
     bushelsSoy: numOrNull(d.bushelsSoy ?? d.soyBushels ?? null),
     bushelsWheat: numOrNull(d.bushelsWheat ?? d.wheatBushels ?? null),
 
