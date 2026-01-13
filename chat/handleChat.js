@@ -1,16 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst31-grainbag-down-null-status-view
+// Rev: 2026-01-12-handleChat-sqlFirst32-fix-didyoumean-numeric-that-tower-bagdown
 //
-// Fixes (adds missing definitions; no trimming / no routing):
-// ✅ Define "bag DOWN" so NULL/empty status rows are INCLUDED (your real data)
-// ✅ Force bag counting to use SUM(countFull)+SUM(countPartial), never row counts
-// ✅ Prefer v_grainBag_open_remaining for "still down" after pickups (if the view exists)
-//
-// Keeps:
-// ✅ OpenAI-led (no routing/intent trees)
-// ✅ tool_choice:"auto" first call + empty-response retry (db_query only)
-// ✅ pending did-you-mean behavior
-// ✅ SQL sanitizer
+// Fixes (NO routing/intent trees; keeps your working flow):
+// ✅ Grain bag DOWN definition uses NULL/empty status correctly (matches your real data)
+// ✅ Prefer v_grainBag_open_remaining when available (bags still down / bags by field / bag bushels)
+// ✅ "Did you mean" follow-up now supports:
+//    - "yes" (first option)
+//    - option number ("1", "2", etc.)
+//    - prefix match ("0964") for options like "0964-Cinda 105"
+// ✅ "that tower" follow-up: if last assistant message named a tower, and user asks network/frequency,
+//    we bias the next turn toward that RTK tower (without hard-coded intents).
+// ✅ Keeps: SQL sanitizer, empty-response retry, pending did-you-mean, resolvers, OpenAI-led behavior.
 
 'use strict';
 
@@ -54,7 +54,14 @@ function getThread(threadId) {
   if (!threadId) return null;
   const cur = THREADS.get(threadId);
   if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
-  const fresh = { messages: [], pending: null, updatedAt: nowMs() };
+
+  // add a couple slots for follow-up coreference (no new files)
+  const fresh = {
+    messages: [],
+    pending: null,           // { kind, query, candidates:[{id,name,score}], originalText }
+    lastTowerName: "",       // last RTK tower named by assistant
+    updatedAt: nowMs()
+  };
   THREADS.set(threadId, fresh);
   return fresh;
 }
@@ -73,12 +80,8 @@ function setPending(thread, pending) {
 // --- SQL sanitizer (fixes "multi-statement" false positives) ---
 function cleanSql(raw) {
   let s = safeStr(raw || "").trim();
-  // Strip trailing semicolons (common LLM habit)
   s = s.replace(/;\s*$/g, "").trim();
-  // Disallow any remaining semicolons (would indicate multi-statement)
-  if (s.includes(";")) {
-    throw new Error("multi_statement_sql_not_allowed");
-  }
+  if (s.includes(";")) throw new Error("multi_statement_sql_not_allowed");
   return s;
 }
 
@@ -129,7 +132,7 @@ function formatDidYouMean(kind, candidates) {
   lines.push(`Did you mean (${kind}):`);
   for (const c of (candidates || []).slice(0, 8)) lines.push(`- ${c.name}`);
   lines.push("");
-  lines.push(`Reply with the exact name, or say "yes" to pick the first one.`);
+  lines.push(`Reply with the exact name, say "yes" to pick the first one, or reply with the option number (1–8).`);
   return lines.join("\n");
 }
 
@@ -173,20 +176,16 @@ DOWN BAG definition (matches our real data):
   AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
 
 Bag counting rules:
-- "How many grain bags are down?" means TOTAL BAGS DOWN:
+- Total bags down (full + partial) =
   SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
 - NEVER count rows as bags.
 
-If view exists (preferred for accuracy after pickups):
-- v_grainBag_open_remaining has remainingFull / remainingPartial / remainingPartialFeetSum per putDown.
+Prefer the view when available:
+- v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
 - Prefer it for:
   - "bags still down"
   - "bags by field"
   - "bushels in bags right now"
-
-Avoid resolver traps:
-- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
-- Use resolvers only when user clearly refers to a field/farm/tower/bin site by name.
 
 ========================
 GRAIN BUSHELS
@@ -199,8 +198,9 @@ Field grain bags:
 - Compute rated CORN bushels from productsGrainBags + bag data, then apply grain-capacity factors.
 - Factors: corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78.
 
-Important SQL note:
-- status comparisons MUST include NULL/empty status rows (see DOWN BAG rule).
+Avoid resolver traps:
+- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
+- Use resolvers only when user clearly refers to a field/farm/tower/bin site by name.
 
 SQL tool rule:
 - db_query must be a SINGLE statement with NO semicolons.
@@ -208,6 +208,63 @@ SQL tool rule:
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 `.trim();
+}
+
+// Try to capture the last tower name from assistant output (best-effort).
+function captureLastTowerNameFromAssistant(text) {
+  const t = safeStr(text);
+  // common phrasing: '... tower ... is named "Sharpsburg".'
+  let m = t.match(/tower[^.\n]*?\bis named\s+"([^"]+)"\b/i);
+  if (m && m[1]) return m[1].trim();
+
+  // alternate: '... tower ... is Sharpsburg.'
+  m = t.match(/tower[^.\n]*?\bis\s+"?([A-Za-z0-9][A-Za-z0-9 \-']{2,})"?\b/i);
+  if (m && m[1]) {
+    const name = m[1].trim();
+    // avoid capturing generic words
+    if (!/assigned|associated|information|details|network|frequency/i.test(name)) return name;
+  }
+  return "";
+}
+
+function userAsksTowerDetails(text) {
+  const t = norm(text);
+  // minimal: only for network/frequency follow-ups
+  return (
+    t.includes("network") ||
+    t.includes("frequency") ||
+    t.includes("freq") ||
+    t.includes("net id") ||
+    t.includes("network id")
+  );
+}
+
+// numeric or prefix selection from did-you-mean candidates
+function pickCandidateFromUserReply(userText, candidates) {
+  const t = safeStr(userText).trim();
+
+  // Option number (1-8)
+  const mNum = t.match(/^\s*(\d{1,2})\s*$/);
+  if (mNum) {
+    const n = parseInt(mNum[1], 10);
+    if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) {
+      return candidates[n - 1] || null;
+    }
+  }
+
+  // Prefix match: "0964" should match "0964-Cinda 105"
+  // Use start-of-name digits/letters match
+  const prefix = t.toLowerCase();
+  if (prefix && prefix.length >= 3) {
+    const hit = candidates.find(c => safeStr(c?.name).toLowerCase().startsWith(prefix));
+    if (hit) return hit;
+  }
+
+  // Exact name match
+  const exact = candidates.find(c => safeStr(c?.name).trim().toLowerCase() === prefix.toLowerCase());
+  if (exact) return exact;
+
+  return null;
 }
 
 export async function handleChatHttp(req, res) {
@@ -226,11 +283,13 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
-    // pending did-you-mean yes/no
+    // ---- Handle pending "Did you mean" (yes/no/number/prefix) ----
     if (thread && thread.pending) {
       const pend = thread.pending;
+      const cands = Array.isArray(pend.candidates) ? pend.candidates : [];
+
       if (isYesLike(userText)) {
-        const top = pend?.candidates?.[0] || null;
+        const top = cands[0] || null;
         if (top?.id && top?.name) {
           userText = `${pend.originalText}\n\nUser confirmed: ${top.name} (id=${top.id}). Use that.`;
           thread.pending = null;
@@ -244,6 +303,23 @@ export async function handleChatHttp(req, res) {
           text: "Okay — tell me the exact name you meant.",
           meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
         });
+      } else {
+        const pick = pickCandidateFromUserReply(userText, cands.slice(0, 8));
+        if (pick?.id && pick?.name && pend.originalText) {
+          userText = `${pend.originalText}\n\nUser selected: ${pick.name} (id=${pick.id}). Use that.`;
+          thread.pending = null;
+          thread.updatedAt = nowMs();
+        }
+      }
+    }
+
+    // ---- "that tower" follow-up helper (no intent routing; only helps pronoun resolution) ----
+    // If user is asking network/frequency and we have lastTowerName, prepend a clarification.
+    if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
+      const t = norm(userText);
+      // Only if they didn't already name a tower explicitly
+      if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
+        userText = `User is asking about RTK tower "${thread.lastTowerName}".\n\n${userText}`;
       }
     }
 
@@ -315,32 +391,68 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            if (thread) setPending(thread, {
+              kind: "field",
+              query: safeStr(args.query || ""),
+              candidates: result.candidates,
+              originalText: safeStr(body.text || body.message || body.q || "")
+            });
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("field", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
           }
 
         } else if (name === "resolve_farm") {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            if (thread) setPending(thread, {
+              kind: "farm",
+              query: safeStr(args.query || ""),
+              candidates: result.candidates,
+              originalText: safeStr(body.text || body.message || body.q || "")
+            });
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("farm", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
           }
 
         } else if (name === "resolve_rtk_tower") {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            if (thread) setPending(thread, {
+              kind: "rtk tower",
+              query: safeStr(args.query || ""),
+              candidates: result.candidates,
+              originalText: safeStr(body.text || body.message || body.q || "")
+            });
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("rtk tower", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
           }
 
         } else if (name === "resolve_binSite") {
           didAny = true;
           result = resolveBinSite(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            if (thread) setPending(thread, {
+              kind: "bin site",
+              query: safeStr(args.query || ""),
+              candidates: result.candidates,
+              originalText: safeStr(body.text || body.message || body.q || "")
+            });
+            return res.json({
+              ok: true,
+              text: formatDidYouMean("bin site", result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
           }
         }
 
@@ -366,12 +478,24 @@ export async function handleChatHttp(req, res) {
 
     const text = extractAssistantText(rsp) || "No answer.";
 
+    // ---- Save conversation + remember last tower name (for "that" follow-ups) ----
     if (thread) {
       pushMsg(thread, "user", userText);
       pushMsg(thread, "assistant", text);
+
+      const towerName = captureLastTowerNameFromAssistant(text);
+      if (towerName) {
+        thread.lastTowerName = towerName;
+        thread.updatedAt = nowMs();
+      }
     }
 
-    const meta = { usedOpenAI: true, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null };
+    const meta = {
+      usedOpenAI: true,
+      model: OPENAI_MODEL,
+      snapshot: dbStatus?.snapshot || null
+    };
+
     return res.json({ ok: true, text, meta: debugAI ? meta : undefined });
 
   } catch (e) {
