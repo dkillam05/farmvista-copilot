@@ -1,15 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-12-handleChat-sqlFirst30-sql-sanitize-bagcount-default
+// Rev: 2026-01-12-handleChat-sqlFirst31-grainbag-down-null-status-view
 //
-// Fixes:
-// ✅ Prevent "multi-statement SQL" false positives by stripping trailing semicolons,
-//    and rejecting internal semicolons before runSql().
-// ✅ Define "How many grain bags are there?" as TOTAL BAGS (full + partial), not entry rows.
+// Fixes (adds missing definitions; no trimming / no routing):
+// ✅ Define "bag DOWN" so NULL/empty status rows are INCLUDED (your real data)
+// ✅ Force bag counting to use SUM(countFull)+SUM(countPartial), never row counts
+// ✅ Prefer v_grainBag_open_remaining for "still down" after pickups (if the view exists)
 //
 // Keeps:
 // ✅ OpenAI-led (no routing/intent trees)
 // ✅ tool_choice:"auto" first call + empty-response retry (db_query only)
 // ✅ pending did-you-mean behavior
+// ✅ SQL sanitizer
 
 'use strict';
 
@@ -162,19 +163,44 @@ For DB facts you MUST use tools (no guessing). Do NOT show internal IDs.
 Active fields:
 - Active = (archived IS NULL OR archived = 0)
 
-Grain bag counting (IMPORTANT):
-- "How many grain bags are there?" means TOTAL BAGS DOWN (full + partial),
-  not the number of putDown entry rows.
-- "How many bag entries?" means number of open putDown rows.
+========================
+GRAIN BAGS — HARD DEFINITIONS (DO NOT GUESS)
+========================
+
+DOWN BAG definition (matches our real data):
+- A bag is DOWN if:
+  type = 'putDown'
+  AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
+
+Bag counting rules:
+- "How many grain bags are down?" means TOTAL BAGS DOWN:
+  SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
+- NEVER count rows as bags.
+
+If view exists (preferred for accuracy after pickups):
+- v_grainBag_open_remaining has remainingFull / remainingPartial / remainingPartialFeetSum per putDown.
+- Prefer it for:
+  - "bags still down"
+  - "bags by field"
+  - "bushels in bags right now"
 
 Avoid resolver traps:
 - Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
 - Use resolvers only when user clearly refers to a field/farm/tower/bin site by name.
 
-Grain bushels:
+========================
+GRAIN BUSHELS
+========================
+
+Bins:
 - Bin bushels: SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(crop).
-- Field bag bushels: compute rated corn bushels from productsGrainBags + grainBagEvents,
-  then apply grain-capacity factors (corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78).
+
+Field grain bags:
+- Compute rated CORN bushels from productsGrainBags + bag data, then apply grain-capacity factors.
+- Factors: corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78.
+
+Important SQL note:
+- status comparisons MUST include NULL/empty status rows (see DOWN BAG rule).
 
 SQL tool rule:
 - db_query must be a SINGLE statement with NO semicolons.
