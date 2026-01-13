@@ -1,17 +1,17 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite14-grainBags-status-partialFeetSum
+// Rev: 2026-01-12-snapshotBuild-firestore2sqlite15-grainBags-appliedTo-remaining
 //
-// Fix:
-// ✅ Add grainBagEvents.status column (prevents "no such column: status" SQL crashes)
-// ✅ Add grainBagEvents.partialFeetSum REAL (avoids JSON1 dependence for partials math)
+// Fixes:
+// ✅ Read partial feet + usage from counts.partialFeet / counts.partialUsage (correct source)
+// ✅ Add grainBagAppliedTo table from pickUp events appliedTo[] (refPutDownId, takeFull, takePartial)
+// ✅ Add view v_grainBag_open_remaining that subtracts pickups from putDown counts
+//    and applies your rule: if any partial picked up -> remainingPartialFeetSum = 0
 //
 // Keeps:
 // ✅ productsGrainBags (bushelsCorn baseline, lengthFt, diameterFt)
 // ✅ binSites + binSiteBins (onHand)
 // ✅ farms/fields/rtkTowers
-//
-// NOTE:
-// - This makes bag-bushel math match the app and makes SQL reliable.
+// ✅ grainBagEvents table with status + partialFeetSum
 
 'use strict';
 
@@ -115,12 +115,15 @@ function createSchema(sqlite) {
     PRAGMA journal_mode=WAL;
     PRAGMA synchronous=NORMAL;
 
+    DROP VIEW IF EXISTS v_grainBag_open_remaining;
+
     DROP TABLE IF EXISTS farms;
     DROP TABLE IF EXISTS rtkTowers;
     DROP TABLE IF EXISTS fields;
     DROP TABLE IF EXISTS binSites;
     DROP TABLE IF EXISTS binSiteBins;
     DROP TABLE IF EXISTS grainBagEvents;
+    DROP TABLE IF EXISTS grainBagAppliedTo;
     DROP TABLE IF EXISTS productsGrainBags;
 
     CREATE TABLE farms (
@@ -180,7 +183,6 @@ function createSchema(sqlite) {
       PRIMARY KEY (siteId, binNum)
     );
 
-    -- ✅ Fixed grain bag events schema (adds status + partialFeetSum)
     CREATE TABLE grainBagEvents (
       id TEXT PRIMARY KEY,
       type TEXT,
@@ -219,6 +221,22 @@ function createSchema(sqlite) {
       data TEXT
     );
 
+    -- ✅ PickUp appliedTo exploded rows (so we can subtract cleanly)
+    CREATE TABLE grainBagAppliedTo (
+      pickUpId TEXT,
+      refPutDownId TEXT,
+      takeFull INTEGER,
+      takePartial INTEGER,
+      cropType TEXT,
+      cropYear INTEGER,
+      fieldId TEXT,
+      fieldName TEXT,
+      pickedUpDate TEXT,
+      createdAtISO TEXT,
+      createdAtMs INTEGER,
+      PRIMARY KEY (pickUpId, refPutDownId)
+    );
+
     CREATE TABLE productsGrainBags (
       id TEXT PRIMARY KEY,
       brand TEXT,
@@ -242,17 +260,7 @@ function createSchema(sqlite) {
       data TEXT
     );
 
-    CREATE INDEX idx_farms_name ON farms(name);
-    CREATE INDEX idx_farms_archived ON farms(archived);
-
-    CREATE INDEX idx_rtk_name ON rtkTowers(name);
-
-    CREATE INDEX idx_fields_name ON fields(name);
-    CREATE INDEX idx_fields_farmId ON fields(farmId);
-    CREATE INDEX idx_fields_county ON fields(county);
     CREATE INDEX idx_fields_archived ON fields(archived);
-
-    CREATE INDEX idx_binSites_name ON binSites(name);
     CREATE INDEX idx_binSiteBins_crop ON binSiteBins(lastCropType);
 
     CREATE INDEX idx_gbe_type ON grainBagEvents(type);
@@ -261,8 +269,46 @@ function createSchema(sqlite) {
     CREATE INDEX idx_gbe_year ON grainBagEvents(cropYear);
     CREATE INDEX idx_gbe_field ON grainBagEvents(fieldId);
 
+    CREATE INDEX idx_gba_putdown ON grainBagAppliedTo(refPutDownId);
+    CREATE INDEX idx_gba_crop ON grainBagAppliedTo(cropType);
+    CREATE INDEX idx_gba_year ON grainBagAppliedTo(cropYear);
+
     CREATE INDEX idx_pgb_size ON productsGrainBags(diameterFt, lengthFt);
     CREATE INDEX idx_pgb_status ON productsGrainBags(status);
+
+    -- ✅ Open remaining view (your rule: any partial picked up -> partial feet remaining = 0)
+    CREATE VIEW v_grainBag_open_remaining AS
+      SELECT
+        p.id AS putDownId,
+        p.fieldId,
+        p.fieldName,
+        p.cropType,
+        p.cropYear,
+        p.bagDiameterFt,
+        p.bagSizeFeet,
+        p.bagSkuId,
+        p.countFull AS putFull,
+        p.countPartial AS putPartial,
+        p.partialFeetSum AS putPartialFeetSum,
+
+        COALESCE(SUM(a.takeFull), 0) AS pickedFull,
+        COALESCE(SUM(a.takePartial), 0) AS pickedPartial,
+
+        MAX(CASE WHEN COALESCE(a.takePartial,0) > 0 THEN 1 ELSE 0 END) AS anyPartialPicked,
+
+        MAX(0, COALESCE(p.countFull,0) - COALESCE(SUM(a.takeFull),0)) AS remainingFull,
+        MAX(0, COALESCE(p.countPartial,0) - COALESCE(SUM(a.takePartial),0)) AS remainingPartial,
+
+        CASE
+          WHEN MAX(CASE WHEN COALESCE(a.takePartial,0) > 0 THEN 1 ELSE 0 END) = 1 THEN 0
+          ELSE COALESCE(p.partialFeetSum,0)
+        END AS remainingPartialFeetSum
+
+      FROM grainBagEvents p
+      LEFT JOIN grainBagAppliedTo a ON a.refPutDownId = p.id
+      WHERE lower(p.type) = 'putdown'
+        AND (p.status IS NULL OR p.status = '' OR lower(p.status) <> 'pickedup')
+      GROUP BY p.id;
   `);
 }
 
@@ -410,25 +456,55 @@ export async function buildSnapshotToSqlite() {
     }
   }
 
-  // grain_bag_events (now includes status + partialFeetSum)
+  // grain_bag_events + appliedTo rows
+  const appliedToRows = [];
   const grainBagEvents = await fetchAllDocs(firestore, "grain_bag_events", (id, d) => {
     const bagSku = (d.bagSku && typeof d.bagSku === "object") ? d.bagSku : {};
     const counts = (d.counts && typeof d.counts === "object") ? d.counts : {};
     const field = (d.field && typeof d.field === "object") ? d.field : {};
     const submittedBy = (d.submittedBy && typeof d.submittedBy === "object") ? d.submittedBy : {};
 
-    const pf = Array.isArray(d.partialFeet) ? d.partialFeet : [];
+    // ✅ Correct sources for partials
+    const pf = Array.isArray(counts.partialFeet) ? counts.partialFeet : (Array.isArray(d.partialFeet) ? d.partialFeet : []);
+    const pu = Array.isArray(counts.partialUsage) ? counts.partialUsage : (Array.isArray(d.partialUsage) ? d.partialUsage : []);
+
     let pfSum = 0;
     for (const v of pf) {
       const n = Number(v);
       if (Number.isFinite(n) && n > 0) pfSum += n;
     }
 
+    const type = norm(d.type || "");
+    const status = norm(d.status || "");
+
+    // ✅ Explode appliedTo for pickUp events
+    if (type === "pickup") {
+      const applied = Array.isArray(d.appliedTo) ? d.appliedTo : [];
+      for (const a of applied) {
+        if (!a) continue;
+        const refPutDownId = norm(a.refPutDownId || "");
+        if (!refPutDownId) continue;
+        appliedToRows.push({
+          pickUpId: id,
+          refPutDownId,
+          takeFull: numOrNull(a.takeFull ?? 0) ?? 0,
+          takePartial: numOrNull(a.takePartial ?? 0) ?? 0,
+          cropType: norm(d.cropType || d.crop || ""),
+          cropYear: numOrNull(d.cropYear ?? null),
+          fieldId: norm(field.id || d.field?.id || ""),
+          fieldName: norm(field.name || d.field?.name || ""),
+          pickedUpDate: norm(d.pickedUpDate || d.datePickedUp || ""),
+          createdAtISO: toISO(d.createdAt),
+          createdAtMs: toMs(d.createdAt)
+        });
+      }
+    }
+
     return {
       id,
 
-      type: norm(d.type || ""),
-      status: norm(d.status || ""), // ✅
+      type,
+      status,
       datePlaced: norm(d.datePlaced || d.dateISO || ""),
       cropType: norm(d.cropType || ""),
       cropYear: numOrNull(d.cropYear ?? null),
@@ -446,8 +522,8 @@ export async function buildSnapshotToSqlite() {
       countPartial: numOrNull(counts.partial ?? null),
 
       partialFeetJson: JSON.stringify(pf),
-      partialFeetSum: numOrNull(pfSum), // ✅
-      partialUsageJson: JSON.stringify(Array.isArray(d.partialUsage) ? d.partialUsage : []),
+      partialFeetSum: numOrNull(pfSum),
+      partialUsageJson: JSON.stringify(pu),
 
       priority: numOrNull(d.priority ?? field.priority ?? null),
       priorityReason: norm(d.priorityReason || field.priorityReason || ""),
@@ -496,6 +572,7 @@ export async function buildSnapshotToSqlite() {
   insertRows(sqlite, "binSites", binSites);
   if (binSiteBins.length) insertRows(sqlite, "binSiteBins", binSiteBins);
   if (grainBagEvents.length) insertRows(sqlite, "grainBagEvents", grainBagEvents);
+  if (appliedToRows.length) insertRows(sqlite, "grainBagAppliedTo", appliedToRows);
   if (productsGrainBags.length) insertRows(sqlite, "productsGrainBags", productsGrainBags);
 
   const counts = {
@@ -505,6 +582,7 @@ export async function buildSnapshotToSqlite() {
     binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n,
     binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n,
     grainBagEvents: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagEvents").get().n,
+    grainBagAppliedTo: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagAppliedTo").get().n,
     productsGrainBags: sqlite.prepare("SELECT COUNT(1) AS n FROM productsGrainBags").get().n
   };
 
