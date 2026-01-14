@@ -1,9 +1,13 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst37-bagcount-never-rows-askback
+// Rev: 2026-01-13-handleChat-sqlFirst38-bagcount-never-rows-askback-bagFields
 //
 // FIX (per Dane, HARD):
 // ✅ "How many grain bags..." NEVER means entry rows. It ALWAYS means total BAGS (full+partial).
 // ✅ Force this by (1) system prompt hard rule + (2) tiny userText rewrite guardrail (no routing trees).
+//
+// ADDED (minimal, no routing):
+// ✅ Grain bags are tied to fields via grain bag data. For "what fields are the bags in?",
+//    group by fieldName from v_grainBag_open_remaining (preferred) or grainBagEvents (fallback).
 //
 // ALSO KEEPS (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
@@ -303,6 +307,22 @@ IMPORTANT: Grain bags DO have crop info:
 Prefer the view when available:
 - v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
 - Prefer it for: bags still down / bags by field / bags by crop / bushels in bags right now.
+
+========================
+GRAIN BAGS → FIELD LINK (HARD)
+========================
+- Grain bags ARE tied to fields through grain bag data.
+- For questions like:
+    "What fields are those corn bags in?"
+    "Which fields have corn bags?"
+    "List fields with bags"
+  DO NOT resolve fields via resolve_field.
+- Use bag data:
+  Preferred: v_grainBag_open_remaining.fieldName (and fieldId if present)
+  Fallback: grainBagEvents.fieldName / grainBagEvents.fieldId
+- Answer by GROUPING BY fieldName from bag data:
+  - bag counts = SUM(remainingFull + remainingPartial) (or SUM(countFull+countPartial))
+  - bushels (if asked) = apply Grain Bag Bushels math below per field group.
 
 ========================
 GRAIN BAG BUSHELS — REQUIRED MATH
