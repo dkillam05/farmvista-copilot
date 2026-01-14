@@ -308,17 +308,21 @@ Compute CORN-rated bushels first:
 - partialCornBu = (remainingPartialFeetSum / productsGrainBags.lengthFt) * productsGrainBags.bushelsCorn
 - totalCornBu  = fullCornBu + partialCornBu
 
-Then apply crop factor (same factors as the app's grain-capacity.js):
-- corn:      1.00
-- soybeans:  0.93
-- wheat:     1.07
-- milo:      1.02
-- oats:      0.78
+Then apply crop factor:
+- corn: 1.00
+- soybeans: 0.93
+- wheat: 1.07
+- milo: 1.02
+- oats: 0.78
 
 Final bushels:
 - totalBu = totalCornBu * cropFactor
 
-If crop is corn, factor = 1.00.
+⭐ **MANDATORY COMMIT RULE (ADDED)**
+If qualifying grain bag rows exist (row count > 0),
+YOU MUST return a numeric bushel total.
+Returning 0, null, or “not available” is ONLY valid when row count = 0.
+
 
 ========================
 RTK TOWERS — IMPORTANT
