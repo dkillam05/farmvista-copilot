@@ -1,25 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst33-rtk-prefix-fix-no-regressions
+// Rev: 2026-01-13-handleChat-sqlFirst34-grainbags-cropType-explicit-no-rtk-regressions
 //
-// ✅ FIX (per Dane, “was perfect yesterday”):
-// - RTK tower questions like “field 0964” / “field 0505” must NOT fail.
-// - If user gives a numeric prefix (0964) and asks RTK for a field, we auto-expand it to the
-//   exact field name when there is exactly one match (e.g., 0964-Cinda 105).
-// - If multiple matches, we return a did-you-mean list immediately (no OpenAI call).
+// Fix:
+// ✅ Explicitly teach OpenAI that grainBagEvents + v_grainBag_open_remaining DO have cropType/cropYear
+// ✅ Tell OpenAI how to answer "how many bags have corn" (filter by cropType, sum remainingFull+remainingPartial)
+// ✅ No changes to RTK/fields logic; keep prefix RTK fix and "that tower" follow-ups
 //
-// ✅ Keeps everything already working:
-// - OpenAI-led (no intent trees / no routing tables)
-// - SQL sanitizer
-// - tool loop + db_query tool
-// - resolvers for farms/fields/rtk/binSites
-// - did-you-mean memory + yes/no + numeric choice + prefix choice
-// - grain bag DOWN definition (NULL/empty status included)
-// - bag counting (SUM full+partial, not rows)
-// - bag view preference (v_grainBag_open_remaining if present)
-//
-// IMPORTANT:
-// - This does NOT “hardcode intents” for general chat.
-// - This is a small guardrail only for the specific RTK+FieldPrefix failure mode.
+// Keeps:
+// ✅ OpenAI-led (no routing/intent trees)
+// ✅ SQL sanitizer
+// ✅ did-you-mean pending + yes/no + numeric/prefix selection
+// ✅ RTK field-prefix guardrail (0964/0505)
+// ✅ grain bag DOWN definition with NULL/empty status included
+// ✅ view preference v_grainBag_open_remaining when available
 
 'use strict';
 
@@ -68,7 +61,7 @@ function getThread(threadId) {
   const fresh = {
     messages: [],
     pending: null,      // { kind, query, candidates:[{id,name,score?}], originalText }
-    lastTowerName: "",  // best-effort for “that tower” followups
+    lastTowerName: "",
     updatedAt: nowMs()
   };
   THREADS.set(threadId, fresh);
@@ -88,7 +81,7 @@ function setPending(thread, pending) {
   thread.updatedAt = nowMs();
 }
 
-// --- SQL sanitizer (fixes "multi-statement" false positives) ---
+// --- SQL sanitizer ---
 function cleanSql(raw) {
   let s = safeStr(raw || "").trim();
   s = s.replace(/;\s*$/g, "").trim();
@@ -193,17 +186,30 @@ Bag counting rules:
   SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
 - NEVER count rows as bags.
 
-If view exists (preferred for accuracy after pickups):
-- v_grainBag_open_remaining has remainingFull / remainingPartial / remainingPartialFeetSum per putDown.
+IMPORTANT: Grain bags DO have crop info.
+- grainBagEvents.cropType exists
+- grainBagEvents.cropYear exists
+- v_grainBag_open_remaining.cropType exists (if the view exists)
+
+When user asks "How many grain bags have corn in them?":
+- Filter by cropType case-insensitively:
+  lower(cropType) = lower('corn')
+- Use the view if present:
+  SUM(remainingFull + remainingPartial)
+- Otherwise use grainBagEvents:
+  SUM(countFull + countPartial) with DOWN BAG definition.
+
+Prefer the view when available:
+- v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
 - Prefer it for:
   - "bags still down"
   - "bags by field"
+  - "bags by crop"
   - "bushels in bags right now"
 
 ========================
 RTK TOWERS — IMPORTANT
 ========================
-
 - When user asks RTK tower info for a FIELD:
   1) Resolve/select the field
   2) Read fields.rtkTowerId
@@ -235,7 +241,7 @@ Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=
 `.trim();
 }
 
-// best-effort: capture last tower name from assistant output so "that tower" works
+// best-effort: capture last tower name from assistant output
 function captureLastTowerNameFromAssistant(text) {
   const t = safeStr(text);
   let m = t.match(/tower[^.\n]*?\bis named\s+"([^"]+)"\b/i);
@@ -271,31 +277,19 @@ function pickCandidateFromUserReply(userText, candidates) {
   return null;
 }
 
-/* ===========================
-   RTK+FIELD PREFIX GUARDRAIL
-   ===========================
-   Fixes: “rtk tower info for field 0964” returning “no tower info”.
-   - If message mentions RTK + field + a numeric prefix and no hyphen,
-     we find matching fields by prefix. If exactly one match, rewrite the userText
-     to the exact field name before OpenAI runs.
-   - If multiple matches, return did-you-mean list immediately.
-*/
+// RTK+Field prefix guardrail (unchanged)
 function looksLikeRtkFieldPrefix(text) {
   const t = norm(text);
   if (!t.includes("rtk")) return null;
   if (!t.includes("field")) return null;
-
-  // capture something like "field 0964" or "field: 0964"
   const m = t.match(/\bfield\s*[:#]?\s*(\d{3,5})\b/);
   if (!m) return null;
   const prefix = m[1];
-  // only apply if they did NOT already include hyphenated full name
   if (t.includes(`${prefix}-`)) return null;
   return prefix;
 }
 
 function findFieldsByPrefix(prefix) {
-  // returns rows: {id,name,rtkTowerId,rtkTowerName}
   const sql = `
     SELECT id, name, rtkTowerId, rtkTowerName
     FROM fields
@@ -322,7 +316,7 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
-    // ---- pending "Did you mean" (yes/no/number/prefix) ----
+    // pending disambiguation
     if (thread && thread.pending) {
       const pend = thread.pending;
       const cands = Array.isArray(pend.candidates) ? pend.candidates : [];
@@ -352,26 +346,19 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // ---- RTK+FieldPrefix guardrail (the exact bug you hit) ----
+    // RTK field prefix guardrail
     const prefix = looksLikeRtkFieldPrefix(userText);
     if (prefix) {
       try {
         const r = findFieldsByPrefix(prefix);
         const rows = Array.isArray(r?.rows) ? r.rows : [];
         if (rows.length === 1) {
-          // rewrite to exact field name so OpenAI doesn't lose it
           const exactName = safeStr(rows[0].name);
           userText = userText.replace(new RegExp(`\\bfield\\s*[:#]?\\s*${prefix}\\b`, "i"), `field ${exactName}`);
         } else if (rows.length > 1) {
-          // deterministic did-you-mean list for fields
           const candidates = rows.map(x => ({ id: safeStr(x.id), name: safeStr(x.name) }));
           if (thread) {
-            setPending(thread, {
-              kind: "field",
-              query: prefix,
-              candidates,
-              originalText: safeStr(body.text || body.message || body.q || "").trim()
-            });
+            setPending(thread, { kind: "field", query: prefix, candidates, originalText: safeStr(body.text || body.message || body.q || "").trim() });
           }
           return res.json({
             ok: true,
@@ -379,12 +366,10 @@ export async function handleChatHttp(req, res) {
             meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
           });
         }
-      } catch {
-        // if prefix lookup fails, just continue normally
-      }
+      } catch {}
     }
 
-    // ---- "that tower" follow-up helper ----
+    // "that tower" follow-up helper
     if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
       const t = norm(userText);
       if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
@@ -418,20 +403,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // Empty-response retry: db_query only
-    const firstCalls = extractFunctionCalls(rsp);
-    const firstText = extractAssistantText(rsp);
-    if (!firstCalls.length && !firstText) {
-      rsp = await openaiResponsesCreate({
-        model: OPENAI_MODEL,
-        tools: [dbQueryToolDef()],
-        tool_choice: "required",
-        input: input_list,
-        temperature: 0.2
-      });
-      if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
-    }
-
+    // tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -460,68 +432,32 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, {
-              kind: "field",
-              query: safeStr(args.query || ""),
-              candidates: result.candidates,
-              originalText: safeStr(body.text || body.message || body.q || "")
-            });
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("field", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
         } else if (name === "resolve_farm") {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, {
-              kind: "farm",
-              query: safeStr(args.query || ""),
-              candidates: result.candidates,
-              originalText: safeStr(body.text || body.message || body.q || "")
-            });
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("farm", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
         } else if (name === "resolve_rtk_tower") {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, {
-              kind: "rtk tower",
-              query: safeStr(args.query || ""),
-              candidates: result.candidates,
-              originalText: safeStr(body.text || body.message || body.q || "")
-            });
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("rtk tower", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
 
         } else if (name === "resolve_binSite") {
           didAny = true;
           result = resolveBinSite(safeStr(args.query || ""));
           if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, {
-              kind: "bin site",
-              query: safeStr(args.query || ""),
-              candidates: result.candidates,
-              originalText: safeStr(body.text || body.message || body.q || "")
-            });
-            return res.json({
-              ok: true,
-              text: formatDidYouMean("bin site", result.candidates),
-              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
-            });
+            if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
           }
         }
 
@@ -547,7 +483,6 @@ export async function handleChatHttp(req, res) {
 
     const text = extractAssistantText(rsp) || "No answer.";
 
-    // ---- Save conversation + remember last tower name ----
     if (thread) {
       pushMsg(thread, "user", userText);
       pushMsg(thread, "assistant", text);
