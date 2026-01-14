@@ -1,17 +1,20 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst36-askback-noanswer-uxcontract
+// Rev: 2026-01-13-handleChat-sqlFirst37-bagcount-never-rows-askback
 //
-// BASE: your current live file (Rev: 2026-01-13-handleChat-sqlFirst35-chatbot-aliases-crop-normalize)
+// FIX (per Dane, HARD):
+// ✅ "How many grain bags..." NEVER means entry rows. It ALWAYS means total BAGS (full+partial).
+// ✅ Force this by (1) system prompt hard rule + (2) tiny userText rewrite guardrail (no routing trees).
 //
-// CHANGE (per Dane, minimal + no rabbit holes):
-// ✅ Add a single global fallback UX contract: NEVER “No answer” if data exists; ask-back + show DB matches.
-// ✅ Keep OpenAI-led (no routing/intent trees).
-// ✅ Keep everything you already have: aliases, SQL sanitizer, pending did-you-mean + yes/no + numeric/prefix selection,
-//    RTK field-prefix guardrail, “that tower” followups, grain bag DOWN + view preference, grain bag bushel math rules.
-// ✅ Add one safe retry: if OpenAI returns empty/No answer, run one follow-up call that forces ask-back behavior.
-//
-// NOTE:
-// - This does NOT hardcode feature intents. It only changes what happens when the model is uncertain.
+// ALSO KEEPS (do not trim):
+// ✅ OpenAI-led (no routing/intent trees)
+// ✅ SQL sanitizer
+// ✅ did-you-mean pending + yes/no + numeric/prefix selection
+// ✅ RTK field-prefix guardrail (0964/0505)
+// ✅ grain bag DOWN definition with NULL/empty status included
+// ✅ view preference v_grainBag_open_remaining when available
+// ✅ grain bag bushel math rules (productsGrainBags join + crop factors)
+// ✅ chatbot aliases + crop normalize
+// ✅ global ask-back fallback contract (never "No answer")
 
 'use strict';
 
@@ -33,9 +36,6 @@ const THREADS = new Map();
 
 /* =====================================================================
    ✅ CHATBOT ALIASES (EDIT THIS ONE SECTION)
-   - Chatbot only (handleChat).
-   - Does NOT change Firestore.
-   - We normalize USER text + instruct OpenAI to treat these as equivalent.
 ===================================================================== */
 const CHATBOT_ALIASES = {
   cropType: {
@@ -47,7 +47,6 @@ const CHATBOT_ALIASES = {
   }
 };
 
-// build reverse lookup for fast normalization: alias -> canonical
 function buildAliasReverse(mapObj) {
   const out = new Map();
   for (const [canon, arr] of Object.entries(mapObj || {})) {
@@ -65,13 +64,11 @@ function buildAliasReverse(mapObj) {
 
 const CROP_ALIAS_TO_CANON = buildAliasReverse(CHATBOT_ALIASES.cropType);
 
-// Replace whole-word crop aliases in user text with canonical.
-// IMPORTANT: avoids changing embedded words (e.g., "Cornpile" stays "Cornpile")
 function normalizeUserText(userText) {
   let s = (userText || "").toString();
   if (!s) return s;
 
-  const parts = s.split(/(\b)/); // preserves boundaries
+  const parts = s.split(/(\b)/);
   for (let i = 0; i < parts.length; i++) {
     const tok = parts[i];
     if (!tok || !/^[A-Za-z]+$/.test(tok)) continue;
@@ -80,6 +77,39 @@ function normalizeUserText(userText) {
     if (canon && canon !== low) parts[i] = canon;
   }
   return parts.join("");
+}
+
+/* =====================================================================
+   ✅ BAG COUNT GUARDRAIL (TINY, NOT A ROUTING TREE)
+   - If user says "how many ... grain bags" we force interpretation as BAG COUNT (full+partial),
+     never event/entry rows.
+   - User can still ask for entries by saying: "how many bag entries" or "how many putDown events".
+===================================================================== */
+function looksLikeBagCountQuestion(text) {
+  const t = (text || "").toString().trim().toLowerCase();
+  if (!t) return false;
+
+  // Must be a "how many" count style question + mention bags
+  if (!t.includes("how many")) return false;
+  if (!t.includes("bag")) return false;
+
+  // Must refer to grain bags (or just "bags" with grain context)
+  const grainish = t.includes("grain bag") || t.includes("grain bags") || (t.includes("grain") && t.includes("bag")) || t.includes("field bag") || t.includes("field bags");
+  if (!grainish) return false;
+
+  // If they explicitly ask for entries/events/rows/records, do NOT rewrite.
+  const entryWords = ["entry", "entries", "event", "events", "row", "rows", "record", "records", "putdown event", "put down event"];
+  for (const w of entryWords) {
+    if (t.includes(w)) return false;
+  }
+
+  return true;
+}
+
+function rewriteBagCountQuestion(userText) {
+  if (!looksLikeBagCountQuestion(userText)) return userText;
+  // Minimal clarification appended; does not change meaning, only removes ambiguity.
+  return `${userText}\n\nIMPORTANT: interpret as TOTAL BAGS (full + partial), NOT entry rows.`;
 }
 
 function nowMs() { return Date.now(); }
@@ -170,6 +200,7 @@ function extractAssistantText(responseJson) {
 
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   const parts = [];
+
   for (const it of items) {
     if (it?.type !== "message") continue;
     const content = Array.isArray(it.content) ? it.content : [];
@@ -234,9 +265,8 @@ GLOBAL FALLBACK UX CONTRACT (HARD)
 - NEVER respond with: "No answer", "not available", "could not be retrieved", or empty.
 - If you are uncertain OR your first query returns 0 rows OR it looks mismatched:
   1) Ask a short clarifying question (1 sentence).
-  2) Provide a short rememberable option list (up to 5) pulled from the DB using tools.
-     Example: "Did you mean: A, B, C…?"
-- If user asks a broad storage question like "in storage" or "how much do I have":
+  2) Provide a short option list (up to 5) pulled from the DB using tools.
+- If user asks a broad storage question like "in storage" / "how much do I have":
   ask: "Do you mean bins, field bags, or total (bins + bags)?"
 - If cropYear matters (grainBagEvents) and multiple cropYear values exist for that crop,
   ask which year (or all years) BEFORE final totals.
@@ -250,10 +280,6 @@ For SQL crop filters, use case-insensitive IN lists.
 Crop aliases:
 ${cropAliasLines}
 
-Example:
-- If user says "kern", treat as cropType "corn".
-- Use: lower(cropType) IN ('corn','kern','cornn','maize') OR normalize to canonical before filtering.
-
 ========================
 GRAIN BAGS — HARD DEFINITIONS (DO NOT GUESS)
 ========================
@@ -263,68 +289,46 @@ DOWN BAG definition (matches our real data):
   type = 'putDown'
   AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
 
-Bag counting rules:
-- Total bags down (full + partial) =
-  SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
-- NEVER count rows as bags.
+HARD BAG COUNT RULE (THIS IS NOT AMBIGUOUS):
+- If the user asks "How many grain bags..." they ALWAYS mean TOTAL BAGS,
+  not event/entry rows.
+- TOTAL BAGS = SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
+- Only talk about entry rows if user explicitly says: entries / events / rows / records.
 
-IMPORTANT: Grain bags DO have crop info.
+IMPORTANT: Grain bags DO have crop info:
 - grainBagEvents.cropType exists
 - grainBagEvents.cropYear exists
 - v_grainBag_open_remaining.cropType exists (if the view exists)
 
-When user asks "How many grain bags have corn in them?":
-- Filter by cropType case-insensitively (and respect aliases)
-- Use the view if present:
-  SUM(remainingFull + remainingPartial)
-- Otherwise use grainBagEvents:
-  SUM(countFull + countPartial) with DOWN BAG definition.
-
 Prefer the view when available:
 - v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
-- Prefer it for:
-  - "bags still down"
-  - "bags by field"
-  - "bags by crop"
-  - "bushels in bags right now"
+- Prefer it for: bags still down / bags by field / bags by crop / bushels in bags right now.
 
 ========================
 GRAIN BAG BUSHELS — REQUIRED MATH
 ========================
-
-When user asks for BUSHELS in grain bags (corn/soybeans/etc.), you MUST compute bag bushels.
-NEVER return bag counts as bushels.
+When user asks for BUSHELS in grain bags, you MUST compute bag bushels.
 
 Preferred source (if view exists):
-- v_grainBag_open_remaining provides:
-  cropType, cropYear, bagSkuId, remainingFull, remainingPartial, remainingPartialFeetSum
+- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartial,remainingPartialFeetSum)
 
 Fallback source:
-- grainBagEvents provides:
-  cropType, cropYear, bagSkuId, countFull, countPartial, partialFeetSum
-  and DOWN BAG definition for "still down" rows
+- grainBagEvents(cropType,cropYear,bagSkuId,countFull,countPartial,partialFeetSum) with DOWN BAG definition
 
 You MUST JOIN productsGrainBags to get capacity:
 - productsGrainBags(id, bushelsCorn, lengthFt)
 
-Compute CORN-rated bushels first:
-- fullCornBu   = remainingFull * productsGrainBags.bushelsCorn
-- partialCornBu = (remainingPartialFeetSum / productsGrainBags.lengthFt) * productsGrainBags.bushelsCorn
-- totalCornBu  = fullCornBu + partialCornBu
+Compute CORN-rated bushels:
+- fullCornBu = remainingFull * bushelsCorn
+- partialCornBu = (remainingPartialFeetSum / lengthFt) * bushelsCorn
+- totalCornBu = fullCornBu + partialCornBu
 
-Then apply crop factor:
-- corn: 1.00
-- soybeans: 0.93
-- wheat: 1.07
-- milo: 1.02
-- oats: 0.78
-
-Final bushels:
+Apply crop factor (grain-capacity.js):
+- corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78
 - totalBu = totalCornBu * cropFactor
 
 MANDATORY COMMIT RULE (HARD):
-- If qualifying grain bag rows exist (row count > 0),
-  you MUST return a numeric bushel total.
+- If qualifying rows exist (row count > 0), you MUST return a numeric bushel total.
 - Returning 0/null/"not available" is ONLY allowed when row count = 0.
 
 ========================
@@ -333,11 +337,10 @@ RTK TOWERS — IMPORTANT
 - When user asks RTK tower info for a FIELD:
   1) Resolve/select the field
   2) Read fields.rtkTowerId
-  3) JOIN rtkTowers by id to get:
-     name, networkId, frequency
+  3) JOIN rtkTowers by id to get name, networkId, frequency
 
-- If user provides a numeric field prefix like "0964":
-  treat it as a prefix for field.name (e.g., 0964-...)
+- If user provides numeric field prefix like "0964":
+  treat as prefix for field.name (0964-...)
 
 Avoid resolver traps:
 - Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
@@ -345,12 +348,11 @@ Avoid resolver traps:
 ========================
 GRAIN BUSHELS
 ========================
-
 Bins:
-- Bin bushels: SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(crop).
+- SUM(binSiteBins.onHandBushels) filter by lower(lastCropType)=lower(crop)
 
 Field grain bags:
-- Use the Grain Bag Bushels math above (do not shortcut).
+- Use grain bag bushels math above
 
 SQL tool rule:
 - db_query must be a SINGLE statement with NO semicolons.
@@ -424,7 +426,7 @@ function isEmptyOrNoAnswer(text) {
   if (!t) return true;
   const low = t.toLowerCase();
   if (low === "no answer.") return true;
-  if (low === "no answer" ) return true;
+  if (low === "no answer") return true;
   return false;
 }
 
@@ -444,6 +446,9 @@ export async function handleChatHttp(req, res) {
 
     // normalize slang/typos for chatbot only
     let userText = normalizeUserText(userTextRaw);
+
+    // HARD: rewrite bag-count questions so the model cannot interpret as entry rows
+    userText = rewriteBagCountQuestion(userText);
 
     const thread = getThread(threadId);
 
@@ -619,11 +624,10 @@ export async function handleChatHttp(req, res) {
     if (isEmptyOrNoAnswer(text)) {
       input_list.push({
         role: "user",
-        content:
-          "You returned no answer. Follow the GLOBAL FALLBACK UX CONTRACT: ask one clarifying question and show up to 5 DB-backed matches/options. Do not refuse."
+        content: "You returned no answer. Follow GLOBAL FALLBACK UX CONTRACT: ask one clarifying question and show up to 5 DB-backed options. Do not refuse."
       });
 
-      const rsp2 = await openaiResponsesCreate({
+      let rsp2 = await openaiResponsesCreate({
         model: OPENAI_MODEL,
         tools,
         tool_choice: "required",
@@ -633,10 +637,9 @@ export async function handleChatHttp(req, res) {
 
       if (Array.isArray(rsp2.output)) input_list.push(...rsp2.output);
 
-      // Run any tool calls from retry
-      let r2 = rsp2;
+      // Run db_query tool calls from retry
       for (let i = 0; i < 6; i++) {
-        const calls = extractFunctionCalls(r2);
+        const calls = extractFunctionCalls(rsp2);
         if (!calls.length) break;
 
         for (const call of calls) {
@@ -660,7 +663,7 @@ export async function handleChatHttp(req, res) {
           });
         }
 
-        r2 = await openaiResponsesCreate({
+        rsp2 = await openaiResponsesCreate({
           model: OPENAI_MODEL,
           tools,
           tool_choice: "auto",
@@ -668,10 +671,10 @@ export async function handleChatHttp(req, res) {
           temperature: 0.2
         });
 
-        if (Array.isArray(r2.output)) input_list.push(...r2.output);
+        if (Array.isArray(rsp2.output)) input_list.push(...rsp2.output);
       }
 
-      const t2 = extractAssistantText(r2);
+      const t2 = extractAssistantText(rsp2);
       if (t2) text = t2;
     }
 
