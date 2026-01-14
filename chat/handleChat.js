@@ -1,19 +1,17 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst35-chatbot-aliases-crop-normalize
+// Rev: 2026-01-13-handleChat-sqlFirst36-askback-noanswer-uxcontract
 //
-// CHANGE (per Dane):
-// ✅ Add a single “CHATBOT ALIASES” section INSIDE handleChat for chatbot-only slang/typos.
-// ✅ Normalize user messages for crop words (whole-word only) before sending to OpenAI.
-// ✅ Tell OpenAI to treat these aliases as equivalent in SQL (lower(col) IN (...)).
+// BASE: your current live file (Rev: 2026-01-13-handleChat-sqlFirst35-chatbot-aliases-crop-normalize)
 //
-// KEEPS (do not trim):
-// ✅ OpenAI-led (no routing/intent trees)
-// ✅ SQL sanitizer
-// ✅ did-you-mean pending + yes/no + numeric/prefix selection
-// ✅ RTK field-prefix guardrail (0964/0505)
-// ✅ grain bag DOWN definition with NULL/empty status included
-// ✅ view preference v_grainBag_open_remaining when available
-// ✅ grain bag bushel math rules (productsGrainBags join + crop factors)
+// CHANGE (per Dane, minimal + no rabbit holes):
+// ✅ Add a single global fallback UX contract: NEVER “No answer” if data exists; ask-back + show DB matches.
+// ✅ Keep OpenAI-led (no routing/intent trees).
+// ✅ Keep everything you already have: aliases, SQL sanitizer, pending did-you-mean + yes/no + numeric/prefix selection,
+//    RTK field-prefix guardrail, “that tower” followups, grain bag DOWN + view preference, grain bag bushel math rules.
+// ✅ Add one safe retry: if OpenAI returns empty/No answer, run one follow-up call that forces ask-back behavior.
+//
+// NOTE:
+// - This does NOT hardcode feature intents. It only changes what happens when the model is uncertain.
 
 'use strict';
 
@@ -35,12 +33,11 @@ const THREADS = new Map();
 
 /* =====================================================================
    ✅ CHATBOT ALIASES (EDIT THIS ONE SECTION)
-   - This is ONLY for the chatbot (handleChat).
-   - This does NOT change Firestore data.
+   - Chatbot only (handleChat).
+   - Does NOT change Firestore.
    - We normalize USER text + instruct OpenAI to treat these as equivalent.
 ===================================================================== */
 const CHATBOT_ALIASES = {
-  // Canonical -> aliases (all lower-case preferred)
   cropType: {
     corn: ["corn", "kern", "cornn", "maize"],
     soybeans: ["soybeans", "soy", "beans", "sb", "soys"],
@@ -74,19 +71,13 @@ function normalizeUserText(userText) {
   let s = (userText || "").toString();
   if (!s) return s;
 
-  // Tokenize with word boundaries; only swap standalone words.
-  // Example: "kern" -> "corn", but "cornpile" unchanged.
-  // NOTE: keep original casing as-is except replaced token becomes canonical.
   const parts = s.split(/(\b)/); // preserves boundaries
   for (let i = 0; i < parts.length; i++) {
     const tok = parts[i];
-    // Only consider simple word tokens
     if (!tok || !/^[A-Za-z]+$/.test(tok)) continue;
     const low = tok.toLowerCase();
     const canon = CROP_ALIAS_TO_CANON.get(low);
-    if (canon && canon !== low) {
-      parts[i] = canon; // canonical is lower-case; that's fine for chat
-    }
+    if (canon && canon !== low) parts[i] = canon;
   }
   return parts.join("");
 }
@@ -114,6 +105,7 @@ function pruneThreads() {
 
 function getThread(threadId) {
   if (!threadId) return null;
+
   const cur = THREADS.get(threadId);
   if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
 
@@ -178,7 +170,6 @@ function extractAssistantText(responseJson) {
 
   const items = Array.isArray(responseJson?.output) ? responseJson.output : [];
   const parts = [];
-
   for (const it of items) {
     if (it?.type !== "message") continue;
     const content = Array.isArray(it.content) ? it.content : [];
@@ -234,8 +225,21 @@ You are FarmVista Copilot.
 OpenAI-led: you decide what to query and how to answer.
 For DB facts you MUST use tools (no guessing). Do NOT show internal IDs.
 
-Active fields:
+ACTIVE DEFAULT:
 - Active = (archived IS NULL OR archived = 0)
+
+========================
+GLOBAL FALLBACK UX CONTRACT (HARD)
+========================
+- NEVER respond with: "No answer", "not available", "could not be retrieved", or empty.
+- If you are uncertain OR your first query returns 0 rows OR it looks mismatched:
+  1) Ask a short clarifying question (1 sentence).
+  2) Provide a short rememberable option list (up to 5) pulled from the DB using tools.
+     Example: "Did you mean: A, B, C…?"
+- If user asks a broad storage question like "in storage" or "how much do I have":
+  ask: "Do you mean bins, field bags, or total (bins + bags)?"
+- If cropYear matters (grainBagEvents) and multiple cropYear values exist for that crop,
+  ask which year (or all years) BEFORE final totals.
 
 ========================
 CHATBOT ALIASES (USE THESE)
@@ -318,11 +322,10 @@ Then apply crop factor:
 Final bushels:
 - totalBu = totalCornBu * cropFactor
 
-⭐ **MANDATORY COMMIT RULE (ADDED)**
-If qualifying grain bag rows exist (row count > 0),
-YOU MUST return a numeric bushel total.
-Returning 0, null, or “not available” is ONLY valid when row count = 0.
-
+MANDATORY COMMIT RULE (HARD):
+- If qualifying grain bag rows exist (row count > 0),
+  you MUST return a numeric bushel total.
+- Returning 0/null/"not available" is ONLY allowed when row count = 0.
 
 ========================
 RTK TOWERS — IMPORTANT
@@ -416,6 +419,15 @@ function findFieldsByPrefix(prefix) {
   return runSql({ sql, params: [`${prefix}-%`], limit: 8 });
 }
 
+function isEmptyOrNoAnswer(text) {
+  const t = safeStr(text).trim();
+  if (!t) return true;
+  const low = t.toLowerCase();
+  if (low === "no answer.") return true;
+  if (low === "no answer" ) return true;
+  return false;
+}
+
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -424,14 +436,13 @@ export async function handleChatHttp(req, res) {
     const dbStatus = await getDbStatus();
 
     const body = req.body || {};
-    let userTextRaw = safeStr(body.text || body.message || body.q || "").trim();
+    const userTextRaw = safeStr(body.text || body.message || body.q || "").trim();
     const debugAI = !!body.debugAI;
     const threadId = safeStr(body.threadId || "").trim();
 
     if (!userTextRaw) return res.status(400).json({ ok: false, error: "missing_text" });
 
-    // ✅ Normalize slang/typos for the chatbot ONLY
-    // (whole-word crop tokens only; does not touch embedded words like “Cornpile”)
+    // normalize slang/typos for chatbot only
     let userText = normalizeUserText(userTextRaw);
 
     const thread = getThread(threadId);
@@ -513,6 +524,7 @@ export async function handleChatHttp(req, res) {
       resolveBinSiteTool
     ];
 
+    // First call (OpenAI-led)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -523,7 +535,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // tool loop
+    // Tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -601,7 +613,67 @@ export async function handleChatHttp(req, res) {
       if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
     }
 
-    const text = extractAssistantText(rsp) || "No answer.";
+    let text = extractAssistantText(rsp) || "No answer.";
+
+    // ONE SAFE RETRY: force ask-back behavior if model still returns empty/no-answer
+    if (isEmptyOrNoAnswer(text)) {
+      input_list.push({
+        role: "user",
+        content:
+          "You returned no answer. Follow the GLOBAL FALLBACK UX CONTRACT: ask one clarifying question and show up to 5 DB-backed matches/options. Do not refuse."
+      });
+
+      const rsp2 = await openaiResponsesCreate({
+        model: OPENAI_MODEL,
+        tools,
+        tool_choice: "required",
+        input: input_list,
+        temperature: 0.2
+      });
+
+      if (Array.isArray(rsp2.output)) input_list.push(...rsp2.output);
+
+      // Run any tool calls from retry
+      let r2 = rsp2;
+      for (let i = 0; i < 6; i++) {
+        const calls = extractFunctionCalls(r2);
+        if (!calls.length) break;
+
+        for (const call of calls) {
+          if (safeStr(call?.name) !== "db_query") continue;
+          const args = jsonTryParse(call.arguments) || {};
+          let result;
+          try {
+            const sql = cleanSql(args.sql || "");
+            result = runSql({
+              sql,
+              params: Array.isArray(args.params) ? args.params : [],
+              limit: Number.isFinite(args.limit) ? args.limit : 50
+            });
+          } catch (e) {
+            result = { ok: false, error: e?.message || String(e) };
+          }
+          input_list.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify(result)
+          });
+        }
+
+        r2 = await openaiResponsesCreate({
+          model: OPENAI_MODEL,
+          tools,
+          tool_choice: "auto",
+          input: input_list,
+          temperature: 0.2
+        });
+
+        if (Array.isArray(r2.output)) input_list.push(...r2.output);
+      }
+
+      const t2 = extractAssistantText(r2);
+      if (t2) text = t2;
+    }
 
     if (thread) {
       pushMsg(thread, "user", userText);
