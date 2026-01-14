@@ -176,70 +176,86 @@ Active fields:
 GRAIN BAGS — HARD DEFINITIONS (DO NOT GUESS)
 ========================
 
-DOWN BAG definition (matches our real data):
-- A bag is DOWN if:
-  type = 'putDown'
-  AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
+DOWN BAG definition (matches real data):
+- type = 'putDown'
+- AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
 
-Bag counting rules:
-- Total bags down (full + partial) =
+Bag counting:
+- Bags are NEVER rows.
+- Total bags down =
   SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
-- NEVER count rows as bags.
 
-IMPORTANT: Grain bags DO have crop info.
-- grainBagEvents.cropType exists
-- grainBagEvents.cropYear exists
-- v_grainBag_open_remaining.cropType exists (if the view exists)
-
-When user asks "How many grain bags have corn in them?":
-- Filter by cropType case-insensitively:
-  lower(cropType) = lower('corn')
-- Use the view if present:
-  SUM(remainingFull + remainingPartial)
-- Otherwise use grainBagEvents:
-  SUM(countFull + countPartial) with DOWN BAG definition.
-
-Prefer the view when available:
-- v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
-- Prefer it for:
-  - "bags still down"
-  - "bags by field"
-  - "bags by crop"
-  - "bushels in bags right now"
+IMPORTANT:
+- grainBagEvents.cropType EXISTS
+- grainBagEvents.cropYear EXISTS
+- v_grainBag_open_remaining.cropType EXISTS (if view exists)
 
 ========================
-RTK TOWERS — IMPORTANT
-========================
-- When user asks RTK tower info for a FIELD:
-  1) Resolve/select the field
-  2) Read fields.rtkTowerId
-  3) JOIN rtkTowers by id to get:
-     name, networkId, frequency
-
-- If user provides a numeric field prefix like "0964":
-  treat it as a prefix for field.name (e.g., 0964-...)
-
-Avoid resolver traps:
-- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
-
-========================
-GRAIN BUSHELS
+🔧 ADDED — GRAIN BAG BUSHEL MATH (THIS FIXES THE 46-BUSHEL BUG)
 ========================
 
-Bins:
-- Bin bushels: SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(crop).
+When a user asks for BUSHELS in grain bags:
 
-Field grain bags:
-- Compute rated CORN bushels from productsGrainBags + bag data, then apply grain-capacity factors.
-- Factors: corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78.
+You MUST do the following steps — no shortcuts:
 
-SQL tool rule:
-- db_query must be a SINGLE statement with NO semicolons.
+STEP 1 — Identify bags still down
+- Prefer v_grainBag_open_remaining if it exists
+- Otherwise use grainBagEvents with DOWN BAG definition
+
+STEP 2 — Join bag SKU
+- JOIN productsGrainBags ON bagSkuId = productsGrainBags.id
+
+STEP 3 — Compute CORN bushels FIRST
+
+Full bags:
+  fullCornBushels =
+    remainingFull * productsGrainBags.bushelsCorn
+
+Partial bags:
+  partialCornBushels =
+    (remainingPartialFeetSum / productsGrainBags.lengthFt)
+    * productsGrainBags.bushelsCorn
+
+TotalCornBushels =
+  fullCornBushels + partialCornBushels
+
+STEP 4 — Apply crop factor AFTER corn math
+- corn:      1.00
+- soybeans:  0.93
+- wheat:     1.07
+- milo:      1.02
+- oats:      0.78
+
+FinalBushels =
+  TotalCornBushels * cropFactor
+
+CRITICAL RULE:
+- NEVER return bag counts as bushels
+- If you skip the productsGrainBags join, the answer is WRONG
+
+========================
+BINS (UNCHANGED)
+========================
+- SUM(binSiteBins.onHandBushels)
+- filter lower(lastCropType)=lower(crop)
+
+========================
+RTK TOWERS (UNCHANGED)
+========================
+- Resolve field → fields.rtkTowerId
+- JOIN rtkTowers for name, networkId, frequency
+
+========================
+SQL RULE
+========================
+- Single SELECT only
+- No semicolons
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 `.trim();
 }
+
 
 // best-effort: capture last tower name from assistant output
 function captureLastTowerNameFromAssistant(text) {
