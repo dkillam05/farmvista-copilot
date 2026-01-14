@@ -1,18 +1,19 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst34-grainbags-cropType-explicit-no-rtk-regressions
+// Rev: 2026-01-13-handleChat-sqlFirst35-chatbot-aliases-crop-normalize
 //
-// Fix:
-// ✅ Explicitly teach OpenAI that grainBagEvents + v_grainBag_open_remaining DO have cropType/cropYear
-// ✅ Tell OpenAI how to answer "how many bags have corn" (filter by cropType, sum remainingFull+remainingPartial)
-// ✅ No changes to RTK/fields logic; keep prefix RTK fix and "that tower" follow-ups
+// CHANGE (per Dane):
+// ✅ Add a single “CHATBOT ALIASES” section INSIDE handleChat for chatbot-only slang/typos.
+// ✅ Normalize user messages for crop words (whole-word only) before sending to OpenAI.
+// ✅ Tell OpenAI to treat these aliases as equivalent in SQL (lower(col) IN (...)).
 //
-// Keeps:
+// KEEPS (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
 // ✅ SQL sanitizer
 // ✅ did-you-mean pending + yes/no + numeric/prefix selection
 // ✅ RTK field-prefix guardrail (0964/0505)
 // ✅ grain bag DOWN definition with NULL/empty status included
 // ✅ view preference v_grainBag_open_remaining when available
+// ✅ grain bag bushel math rules (productsGrainBags join + crop factors)
 
 'use strict';
 
@@ -31,6 +32,64 @@ const OPENAI_BASE = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1")
 const TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_TURNS = 24;
 const THREADS = new Map();
+
+/* =====================================================================
+   ✅ CHATBOT ALIASES (EDIT THIS ONE SECTION)
+   - This is ONLY for the chatbot (handleChat).
+   - This does NOT change Firestore data.
+   - We normalize USER text + instruct OpenAI to treat these as equivalent.
+===================================================================== */
+const CHATBOT_ALIASES = {
+  // Canonical -> aliases (all lower-case preferred)
+  cropType: {
+    corn: ["corn", "kern", "cornn", "maize"],
+    soybeans: ["soybeans", "soy", "beans", "sb", "soys"],
+    wheat: ["wheat", "hrw", "srw"],
+    milo: ["milo", "sorghum"],
+    oats: ["oats"]
+  }
+};
+
+// build reverse lookup for fast normalization: alias -> canonical
+function buildAliasReverse(mapObj) {
+  const out = new Map();
+  for (const [canon, arr] of Object.entries(mapObj || {})) {
+    const c = String(canon || "").trim().toLowerCase();
+    if (!c) continue;
+    out.set(c, c);
+    for (const a of (Array.isArray(arr) ? arr : [])) {
+      const k = String(a || "").trim().toLowerCase();
+      if (!k) continue;
+      out.set(k, c);
+    }
+  }
+  return out;
+}
+
+const CROP_ALIAS_TO_CANON = buildAliasReverse(CHATBOT_ALIASES.cropType);
+
+// Replace whole-word crop aliases in user text with canonical.
+// IMPORTANT: avoids changing embedded words (e.g., "Cornpile" stays "Cornpile")
+function normalizeUserText(userText) {
+  let s = (userText || "").toString();
+  if (!s) return s;
+
+  // Tokenize with word boundaries; only swap standalone words.
+  // Example: "kern" -> "corn", but "cornpile" unchanged.
+  // NOTE: keep original casing as-is except replaced token becomes canonical.
+  const parts = s.split(/(\b)/); // preserves boundaries
+  for (let i = 0; i < parts.length; i++) {
+    const tok = parts[i];
+    // Only consider simple word tokens
+    if (!tok || !/^[A-Za-z]+$/.test(tok)) continue;
+    const low = tok.toLowerCase();
+    const canon = CROP_ALIAS_TO_CANON.get(low);
+    if (canon && canon !== low) {
+      parts[i] = canon; // canonical is lower-case; that's fine for chat
+    }
+  }
+  return parts.join("");
+}
 
 function nowMs() { return Date.now(); }
 function safeStr(v) { return (v == null ? "" : String(v)); }
@@ -163,6 +222,12 @@ function buildSystemPrompt(dbStatus) {
   const counts = dbStatus?.counts || {};
   const snapshotId = dbStatus?.snapshot?.id || "unknown";
 
+  const cropAliases = CHATBOT_ALIASES.cropType || {};
+  const cropAliasLines = Object.entries(cropAliases).map(([canon, arr]) => {
+    const a = (Array.isArray(arr) ? arr : []).map(x => String(x)).join(", ");
+    return `- ${canon}: ${a}`;
+  }).join("\n");
+
   return `
 You are FarmVista Copilot.
 
@@ -173,89 +238,120 @@ Active fields:
 - Active = (archived IS NULL OR archived = 0)
 
 ========================
+CHATBOT ALIASES (USE THESE)
+========================
+When user uses slang/typos, treat as canonical.
+For SQL crop filters, use case-insensitive IN lists.
+
+Crop aliases:
+${cropAliasLines}
+
+Example:
+- If user says "kern", treat as cropType "corn".
+- Use: lower(cropType) IN ('corn','kern','cornn','maize') OR normalize to canonical before filtering.
+
+========================
 GRAIN BAGS — HARD DEFINITIONS (DO NOT GUESS)
 ========================
 
-DOWN BAG definition (matches real data):
-- type = 'putDown'
-- AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
+DOWN BAG definition (matches our real data):
+- A bag is DOWN if:
+  type = 'putDown'
+  AND (status IS NULL OR status = '' OR lower(status) <> 'pickedup')
 
-Bag counting:
-- Bags are NEVER rows.
-- Total bags down =
+Bag counting rules:
+- Total bags down (full + partial) =
   SUM(COALESCE(countFull,0)) + SUM(COALESCE(countPartial,0))
+- NEVER count rows as bags.
 
-IMPORTANT:
-- grainBagEvents.cropType EXISTS
-- grainBagEvents.cropYear EXISTS
-- v_grainBag_open_remaining.cropType EXISTS (if view exists)
+IMPORTANT: Grain bags DO have crop info.
+- grainBagEvents.cropType exists
+- grainBagEvents.cropYear exists
+- v_grainBag_open_remaining.cropType exists (if the view exists)
+
+When user asks "How many grain bags have corn in them?":
+- Filter by cropType case-insensitively (and respect aliases)
+- Use the view if present:
+  SUM(remainingFull + remainingPartial)
+- Otherwise use grainBagEvents:
+  SUM(countFull + countPartial) with DOWN BAG definition.
+
+Prefer the view when available:
+- v_grainBag_open_remaining gives remainingFull/remainingPartial after pickups.
+- Prefer it for:
+  - "bags still down"
+  - "bags by field"
+  - "bags by crop"
+  - "bushels in bags right now"
 
 ========================
-🔧 ADDED — GRAIN BAG BUSHEL MATH (THIS FIXES THE 46-BUSHEL BUG)
+GRAIN BAG BUSHELS — REQUIRED MATH
 ========================
 
-When a user asks for BUSHELS in grain bags:
+When user asks for BUSHELS in grain bags (corn/soybeans/etc.), you MUST compute bag bushels.
+NEVER return bag counts as bushels.
 
-You MUST do the following steps — no shortcuts:
+Preferred source (if view exists):
+- v_grainBag_open_remaining provides:
+  cropType, cropYear, bagSkuId, remainingFull, remainingPartial, remainingPartialFeetSum
 
-STEP 1 — Identify bags still down
-- Prefer v_grainBag_open_remaining if it exists
-- Otherwise use grainBagEvents with DOWN BAG definition
+Fallback source:
+- grainBagEvents provides:
+  cropType, cropYear, bagSkuId, countFull, countPartial, partialFeetSum
+  and DOWN BAG definition for "still down" rows
 
-STEP 2 — Join bag SKU
-- JOIN productsGrainBags ON bagSkuId = productsGrainBags.id
+You MUST JOIN productsGrainBags to get capacity:
+- productsGrainBags(id, bushelsCorn, lengthFt)
 
-STEP 3 — Compute CORN bushels FIRST
+Compute CORN-rated bushels first:
+- fullCornBu   = remainingFull * productsGrainBags.bushelsCorn
+- partialCornBu = (remainingPartialFeetSum / productsGrainBags.lengthFt) * productsGrainBags.bushelsCorn
+- totalCornBu  = fullCornBu + partialCornBu
 
-Full bags:
-  fullCornBushels =
-    remainingFull * productsGrainBags.bushelsCorn
-
-Partial bags:
-  partialCornBushels =
-    (remainingPartialFeetSum / productsGrainBags.lengthFt)
-    * productsGrainBags.bushelsCorn
-
-TotalCornBushels =
-  fullCornBushels + partialCornBushels
-
-STEP 4 — Apply crop factor AFTER corn math
+Then apply crop factor (same factors as the app's grain-capacity.js):
 - corn:      1.00
 - soybeans:  0.93
 - wheat:     1.07
 - milo:      1.02
 - oats:      0.78
 
-FinalBushels =
-  TotalCornBushels * cropFactor
+Final bushels:
+- totalBu = totalCornBu * cropFactor
 
-CRITICAL RULE:
-- NEVER return bag counts as bushels
-- If you skip the productsGrainBags join, the answer is WRONG
+If crop is corn, factor = 1.00.
 
 ========================
-BINS (UNCHANGED)
+RTK TOWERS — IMPORTANT
 ========================
-- SUM(binSiteBins.onHandBushels)
-- filter lower(lastCropType)=lower(crop)
+- When user asks RTK tower info for a FIELD:
+  1) Resolve/select the field
+  2) Read fields.rtkTowerId
+  3) JOIN rtkTowers by id to get:
+     name, networkId, frequency
+
+- If user provides a numeric field prefix like "0964":
+  treat it as a prefix for field.name (e.g., 0964-...)
+
+Avoid resolver traps:
+- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
 
 ========================
-RTK TOWERS (UNCHANGED)
+GRAIN BUSHELS
 ========================
-- Resolve field → fields.rtkTowerId
-- JOIN rtkTowers for name, networkId, frequency
 
-========================
-SQL RULE
-========================
-- Single SELECT only
-- No semicolons
+Bins:
+- Bin bushels: SUM(binSiteBins.onHandBushels), filter by lower(lastCropType)=lower(crop).
+
+Field grain bags:
+- Use the Grain Bag Bushels math above (do not shortcut).
+
+SQL tool rule:
+- db_query must be a SINGLE statement with NO semicolons.
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
 `.trim();
 }
-
 
 // best-effort: capture last tower name from assistant output
 function captureLastTowerNameFromAssistant(text) {
@@ -293,7 +389,7 @@ function pickCandidateFromUserReply(userText, candidates) {
   return null;
 }
 
-// RTK+Field prefix guardrail (unchanged)
+// RTK+Field prefix guardrail
 function looksLikeRtkFieldPrefix(text) {
   const t = norm(text);
   if (!t.includes("rtk")) return null;
@@ -324,11 +420,15 @@ export async function handleChatHttp(req, res) {
     const dbStatus = await getDbStatus();
 
     const body = req.body || {};
-    let userText = safeStr(body.text || body.message || body.q || "").trim();
+    let userTextRaw = safeStr(body.text || body.message || body.q || "").trim();
     const debugAI = !!body.debugAI;
     const threadId = safeStr(body.threadId || "").trim();
 
-    if (!userText) return res.status(400).json({ ok: false, error: "missing_text" });
+    if (!userTextRaw) return res.status(400).json({ ok: false, error: "missing_text" });
+
+    // ✅ Normalize slang/typos for the chatbot ONLY
+    // (whole-word crop tokens only; does not touch embedded words like “Cornpile”)
+    let userText = normalizeUserText(userTextRaw);
 
     const thread = getThread(threadId);
 
