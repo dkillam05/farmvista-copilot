@@ -1,15 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-13-handleChat-sqlFirst38-bagcount-never-rows-askback-bagFields
+// Rev: 2026-01-14-handleChat-sqlFirst39-bushelCommit-enforced
 //
 // FIX (per Dane, HARD):
-// ✅ "How many grain bags..." NEVER means entry rows. It ALWAYS means total BAGS (full+partial).
-// ✅ Force this by (1) system prompt hard rule + (2) tiny userText rewrite guardrail (no routing trees).
+// ✅ ENFORCE MANDATORY COMMIT RULE for grain bag BUSHELS:
+//    - If user requests bushels AND qualifying grain bag rows exist -> Copilot MUST complete bushel math
+//      (JOIN productsGrainBags + partial feet + crop factor) and return numeric bushel totals.
+//    - Prevent early exits after bag counts.
+//    - Keep everything else exactly as-is (no routing trees, no snapshot changes).
 //
-// ADDED (minimal, no routing):
-// ✅ Grain bags are tied to fields via grain bag data. For "what fields are the bags in?",
-//    group by fieldName from v_grainBag_open_remaining (preferred) or grainBagEvents (fallback).
-//
-// ALSO KEEPS (do not trim):
+// KEEPS (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
 // ✅ SQL sanitizer
 // ✅ did-you-mean pending + yes/no + numeric/prefix selection
@@ -450,6 +449,68 @@ function isEmptyOrNoAnswer(text) {
   return false;
 }
 
+/* =====================================================================
+   ✅ BUSHEL COMMIT ENFORCEMENT (TINY, NOT A ROUTING TREE)
+   - Detect when user requested bushels and grain bag rows exist.
+   - If model stops early (counts only), force a continuation pass requiring bushel math.
+===================================================================== */
+function userAsksBagBushels(text) {
+  const t = (text || "").toString().toLowerCase();
+  if (!t) return false;
+
+  // "bushel(s)" or shorthand "bu"
+  const hasBushelWord = /\bbushels?\b/.test(t);
+  const hasBu = /\bbu\b/.test(t) || /\bbu\.\b/.test(t);
+
+  if (!(hasBushelWord || hasBu)) return false;
+
+  // Only enforce for grain bag context (bags / field bags / grain bags)
+  const bagContext = t.includes("bag") && (t.includes("grain") || t.includes("field") || t.includes("bags"));
+  return !!bagContext;
+}
+
+function userAsksGroupedByField(text) {
+  const t = (text || "").toString().toLowerCase();
+  if (!t) return false;
+  return (
+    t.includes("by field") ||
+    t.includes("grouped by field") ||
+    t.includes("per field") ||
+    t.includes("each field") ||
+    (t.includes("fields") && (t.includes("bushel") || /\bbu\b/.test(t)))
+  );
+}
+
+function assistantHasBushelNumber(text) {
+  const s = safeStr(text);
+  if (!s) return false;
+
+  // Any numeric value followed by "bu" or "bushel(s)"
+  // Examples:
+  //  - 12,345 bu
+  //  - 12345.67 bushels
+  //  - 1,234 bu. (period)
+  const re = /\b\d[\d,]*\.?\d*\s*(bu|bushels?)\b/i;
+  return re.test(s);
+}
+
+function sqlLooksLikeBagRows(sqlLower) {
+  if (!sqlLower) return false;
+  return (
+    sqlLower.includes("v_grainbag_open_remaining") ||
+    sqlLower.includes("grainbagevents")
+  );
+}
+
+function sqlLooksLikeProductsJoin(sqlLower) {
+  if (!sqlLower) return false;
+  return (
+    sqlLower.includes("productsgrainbags") ||
+    sqlLower.includes("bushelscorn") ||
+    sqlLower.includes("lengthft")
+  );
+}
+
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -549,6 +610,12 @@ export async function handleChatHttp(req, res) {
       resolveBinSiteTool
     ];
 
+    // --- enforcement trackers (request-scope) ---
+    const wantsBagBushels = userAsksBagBushels(userTextRaw) || userAsksBagBushels(userText);
+    const wantsGroupedByField = userAsksGroupedByField(userTextRaw) || userAsksGroupedByField(userText);
+    let sawQualifyingBagRows = false;      // bag data rows exist (view/events) for this question path
+    let sawProductsJoinEvidence = false;   // query touched productsGrainBags or bushelsCorn/lengthFt
+
     // First call (OpenAI-led)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
@@ -576,11 +643,24 @@ export async function handleChatHttp(req, res) {
           didAny = true;
           try {
             const sql = cleanSql(args.sql || "");
+            const sqlLower = sql.toLowerCase();
+
             result = runSql({
               sql,
               params: Array.isArray(args.params) ? args.params : [],
               limit: Number.isFinite(args.limit) ? args.limit : 200
             });
+
+            // Track whether we have qualifying grain bag rows, and whether the capacity join evidence occurred.
+            try {
+              const rows = Array.isArray(result?.rows) ? result.rows : [];
+              if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
+                sawQualifyingBagRows = true;
+              }
+              if (!sawProductsJoinEvidence && sqlLooksLikeProductsJoin(sqlLower)) {
+                sawProductsJoinEvidence = true;
+              }
+            } catch {}
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
@@ -639,6 +719,157 @@ export async function handleChatHttp(req, res) {
     }
 
     let text = extractAssistantText(rsp) || "No answer.";
+
+    /* =====================================================================
+       ✅ MANDATORY BUSHEL COMMIT (ENFORCEMENT PASS)
+       - If user asked for grain bag bushels AND we saw qualifying bag rows,
+         then we do NOT allow "counts-only" final answers.
+       - Force a continuation pass that MUST complete the bushel math pipeline.
+    ===================================================================== */
+    if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
+      input_list.push({
+        role: "user",
+        content: [
+          "MANDATORY COMMIT RULE ENFORCEMENT:",
+          "You have qualifying grain bag rows (rowCount > 0). The user asked for BUSHELS.",
+          "Do NOT stop after bag counts. You MUST compute and return numeric bushel totals by completing the full bag bushel pipeline:",
+          "- Prefer v_grainBag_open_remaining when available (remainingFull, remainingPartialFeetSum, cropType, cropYear, bagSkuId).",
+          "- JOIN productsGrainBags to get (bushelsCorn, lengthFt).",
+          "- Compute corn-rated bushels (full + partial feet) then apply crop factor.",
+          "- Return a numeric total in bushels (bu).",
+          wantsGroupedByField ? "- ALSO group by fieldName and return bushels per field (and a grand total)." : "",
+          "",
+          "IMPORTANT: Returning counts-only is not allowed for this question. Continue until bushels are computed.",
+          "Use db_query as needed."
+        ].filter(Boolean).join("\n")
+      });
+
+      // Require tools so it cannot “handwave” the join/math.
+      let rspB = await openaiResponsesCreate({
+        model: OPENAI_MODEL,
+        tools,
+        tool_choice: "required",
+        input: input_list,
+        temperature: 0.2
+      });
+
+      if (Array.isArray(rspB.output)) input_list.push(...rspB.output);
+
+      // Run tool calls from enforcement pass
+      for (let i = 0; i < 10; i++) {
+        const calls = extractFunctionCalls(rspB);
+        if (!calls.length) break;
+
+        let didAny = false;
+
+        for (const call of calls) {
+          const name = safeStr(call?.name);
+          const args = jsonTryParse(call.arguments) || {};
+          let result = null;
+
+          if (name === "db_query") {
+            didAny = true;
+            try {
+              const sql = cleanSql(args.sql || "");
+              const sqlLower = sql.toLowerCase();
+
+              result = runSql({
+                sql,
+                params: Array.isArray(args.params) ? args.params : [],
+                limit: Number.isFinite(args.limit) ? args.limit : 200
+              });
+
+              // Track join evidence (helpful for debugging / future guardrails)
+              try {
+                const rows = Array.isArray(result?.rows) ? result.rows : [];
+                if (!sawProductsJoinEvidence && sqlLooksLikeProductsJoin(sqlLower)) {
+                  sawProductsJoinEvidence = true;
+                }
+                if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
+                  sawQualifyingBagRows = true;
+                }
+              } catch {}
+            } catch (e) {
+              result = { ok: false, error: e?.message || String(e) };
+            }
+
+          } else if (name === "resolve_field") {
+            didAny = true;
+            result = resolveField(safeStr(args.query || ""));
+            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+              if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+              return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            }
+
+          } else if (name === "resolve_farm") {
+            didAny = true;
+            result = resolveFarm(safeStr(args.query || ""));
+            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+              if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+              return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            }
+
+          } else if (name === "resolve_rtk_tower") {
+            didAny = true;
+            result = resolveRtkTower(safeStr(args.query || ""));
+            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+              if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+              return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            }
+
+          } else if (name === "resolve_binSite") {
+            didAny = true;
+            result = resolveBinSite(safeStr(args.query || ""));
+            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
+              if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+              return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
+            }
+          }
+
+          input_list.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify(result ?? { ok: false, error: "no_result" })
+          });
+        }
+
+        if (!didAny) break;
+
+        rspB = await openaiResponsesCreate({
+          model: OPENAI_MODEL,
+          tools,
+          tool_choice: "auto",
+          input: input_list,
+          temperature: 0.2
+        });
+
+        if (Array.isArray(rspB.output)) input_list.push(...rspB.output);
+      }
+
+      const tb = extractAssistantText(rspB);
+      if (tb) text = tb;
+
+      // Final safety: if it STILL didn't include a numeric bushel, force one more direct instruction (no loops).
+      if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
+        input_list.push({
+          role: "user",
+          content: "You still did not return numeric bushels. Return the final bushel totals now (include 'bu') based on your computed results. Do not restate counts-only."
+        });
+
+        let rspB2 = await openaiResponsesCreate({
+          model: OPENAI_MODEL,
+          tools,
+          tool_choice: "auto",
+          input: input_list,
+          temperature: 0.2
+        });
+
+        if (Array.isArray(rspB2.output)) input_list.push(...rspB2.output);
+
+        const tb2 = extractAssistantText(rspB2);
+        if (tb2) text = tb2;
+      }
+    }
 
     // ONE SAFE RETRY: force ask-back behavior if model still returns empty/no-answer
     if (isEmptyOrNoAnswer(text)) {
