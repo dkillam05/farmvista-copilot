@@ -5,7 +5,7 @@
 // ✅ ENFORCE MANDATORY COMMIT RULE for grain bag BUSHELS:
 //    - If user requests bushels AND qualifying grain bag rows exist -> Copilot MUST complete bushel math
 //      (JOIN productsGrainBags + partial feet + crop factor) and return numeric bushel totals.
-//    - Prevent early exits after bag counts.
+//    - Prevent early exit after bag counts.
 //
 // FIX (per Dane, HARD - STATUS IS NOT TRUSTED):
 // ✅ Do NOT treat "status" as authoritative for whether a bag is down.
