@@ -1,14 +1,18 @@
 // /context/snapshot-build.js  (FULL FILE)
-// Rev: 2026-01-12-snapshotBuild-firestore2sqlite16-grainBags-appliedTo-partials-fix
+// Rev: 2026-01-15-snapshotBuild-firestore2sqlite17-grainBags-inventorySkuJoin-noStatus
 //
 // FIX (per Dane):
-// ✅ Correct partials source: counts.partialFeet / counts.partialUsage (fallback to legacy top-level)
-// ✅ Add grainBagAppliedTo table (pickUp.appliedTo exploded: refPutDownId / takeFull / takePartial)
-// ✅ Add view v_grainBag_open_remaining to compute TRUE remaining full/partial/partialFeet after pickups
-//    - Your rule: if any partial is picked up for a putDown, remaining partial feet = 0
-// ✅ Keep grainBagEvents.status + partialFeetSum (reliable SQL; no json_each required)
+// ✅ Add inventoryGrainBagMovements table
+//    - bagSkuId in grainBagEvents maps to inventoryGrainBagMovements.id
+//    - inventoryGrainBagMovements.productRef => productsGrainBags/<productId>
+// ✅ Parse productId from productRef.__ref__
+// ✅ Update v_grainBag_open_remaining to NOT depend on status at all
+//    - "down now" is computed by putDown minus appliedTo pickups (TRUE remaining)
 //
 // Keeps:
+// ✅ Correct partials source: counts.partialFeet / counts.partialUsage (fallback to legacy top-level)
+// ✅ grainBagAppliedTo table (pickUp.appliedTo exploded)
+// ✅ Keep grainBagEvents.status column stored (but NOT used for logic)
 // ✅ productsGrainBags table (bushelsCorn baseline from doc.bushels, lengthFt, diameterFt)
 // ✅ binSites + binSiteBins (onHand)
 // ✅ farms/fields/rtkTowers
@@ -85,6 +89,25 @@ function toMs(ts) {
   return null;
 }
 
+function parseProductIdFromRef(refLike) {
+  // Firefoo export style: { "__ref__": "productsGrainBags/<id>" }
+  try {
+    if (!refLike) return "";
+    if (typeof refLike === "string") {
+      const s = refLike.trim();
+      const m = s.match(/productsGrainBags\/([^\/\s]+)\s*$/i);
+      return m ? norm(m[1]) : "";
+    }
+    if (typeof refLike === "object") {
+      const r = norm(refLike.__ref__ || refLike.path || "");
+      if (!r) return "";
+      const m = r.match(/productsGrainBags\/([^\/\s]+)\s*$/i);
+      return m ? norm(m[1]) : "";
+    }
+  } catch {}
+  return "";
+}
+
 async function fetchAllDocs(db, collectionName, pickFn) {
   const col = db.collection(collectionName);
 
@@ -125,6 +148,7 @@ function createSchema(sqlite) {
     DROP TABLE IF EXISTS grainBagEvents;
     DROP TABLE IF EXISTS grainBagAppliedTo;
     DROP TABLE IF EXISTS productsGrainBags;
+    DROP TABLE IF EXISTS inventoryGrainBagMovements;
 
     CREATE TABLE farms (
       id TEXT PRIMARY KEY,
@@ -262,6 +286,40 @@ function createSchema(sqlite) {
       data TEXT
     );
 
+    -- Inventory: Bag SKUs stored on-farm (shed inventory)
+    -- IMPORTANT: grainBagEvents.bagSkuId refers to inventoryGrainBagMovements.id
+    -- productId is parsed from productRef ("productsGrainBags/<id>")
+    CREATE TABLE inventoryGrainBagMovements (
+      id TEXT PRIMARY KEY,
+
+      brand TEXT,
+      diameterFt REAL,
+      lengthFt REAL,
+      thicknessMil REAL,
+      location TEXT,
+
+      qty REAL,
+      onHand REAL,
+      type TEXT,
+      status TEXT,
+
+      productId TEXT,
+      productRefPath TEXT,
+
+      lastManualAdjustmentISO TEXT,
+      lastManualAdjustmentMs INTEGER,
+      lastManualAdjustmentReason TEXT,
+      lastManualAdjustmentRemoveQty REAL,
+      lastManualAdjustmentUser TEXT,
+
+      createdAtISO TEXT,
+      createdAtMs INTEGER,
+      updatedAtISO TEXT,
+      updatedAtMs INTEGER,
+
+      data TEXT
+    );
+
     CREATE INDEX idx_fields_archived ON fields(archived);
 
     CREATE INDEX idx_binSites_name ON binSites(name);
@@ -272,6 +330,7 @@ function createSchema(sqlite) {
     CREATE INDEX idx_gbe_crop ON grainBagEvents(cropType);
     CREATE INDEX idx_gbe_year ON grainBagEvents(cropYear);
     CREATE INDEX idx_gbe_field ON grainBagEvents(fieldId);
+    CREATE INDEX idx_gbe_sku ON grainBagEvents(bagSkuId);
 
     CREATE INDEX idx_gba_putdown ON grainBagAppliedTo(refPutDownId);
     CREATE INDEX idx_gba_crop ON grainBagAppliedTo(cropType);
@@ -281,7 +340,12 @@ function createSchema(sqlite) {
     CREATE INDEX idx_pgb_brand ON productsGrainBags(brand);
     CREATE INDEX idx_pgb_status ON productsGrainBags(status);
 
+    CREATE INDEX idx_inv_product ON inventoryGrainBagMovements(productId);
+    CREATE INDEX idx_inv_brand ON inventoryGrainBagMovements(brand);
+    CREATE INDEX idx_inv_size ON inventoryGrainBagMovements(diameterFt, lengthFt);
+
     -- Open remaining view (TRUE remaining after pickUps)
+    -- NOTE: per Dane, this view MUST NOT depend on "status".
     CREATE VIEW v_grainBag_open_remaining AS
       SELECT
         p.id AS putDownId,
@@ -314,8 +378,9 @@ function createSchema(sqlite) {
       FROM grainBagEvents p
       LEFT JOIN grainBagAppliedTo a ON a.refPutDownId = p.id
       WHERE lower(p.type)='putdown'
-        AND (p.status IS NULL OR p.status='' OR lower(p.status) <> 'pickedup')
-      GROUP BY p.id;
+      GROUP BY p.id
+      HAVING (MAX(0, COALESCE(p.countFull,0) - COALESCE(SUM(a.takeFull),0)) > 0)
+          OR (MAX(0, COALESCE(p.countPartial,0) - COALESCE(SUM(a.takePartial),0)) > 0);
   `);
 }
 
@@ -447,6 +512,43 @@ export async function buildSnapshotToSqlite() {
     }
   }
 
+  // inventoryGrainBagMovements (SKU inventory -> productId)
+  const inventoryGrainBagMovements = await fetchAllDocs(firestore, "inventoryGrainBagMovements", (id, d) => {
+    const productRefPath = norm((d.productRef && typeof d.productRef === "object") ? (d.productRef.__ref__ || "") : (d.productRef || ""));
+    const productId = parseProductIdFromRef(d.productRef);
+
+    return {
+      id,
+
+      brand: norm(d.brand || ""),
+      diameterFt: numOrNull(d.diameterFt ?? null),
+      lengthFt: numOrNull(d.lengthFt ?? null),
+      thicknessMil: numOrNull(d.thicknessMil ?? null),
+      location: norm(d.location || ""),
+
+      qty: numOrNull(d.qty ?? null),
+      onHand: numOrNull(d.onHand ?? null),
+      type: norm(d.type || ""),
+      status: norm(d.status || ""),
+
+      productId: norm(productId || ""),
+      productRefPath,
+
+      lastManualAdjustmentISO: toISO(d.lastManualAdjustment),
+      lastManualAdjustmentMs: toMs(d.lastManualAdjustment),
+      lastManualAdjustmentReason: norm(d.lastManualAdjustmentReason || ""),
+      lastManualAdjustmentRemoveQty: numOrNull(d.lastManualAdjustmentRemoveQty ?? null),
+      lastManualAdjustmentUser: norm(d.lastManualAdjustmentUser || ""),
+
+      createdAtISO: toISO(d.createdAt),
+      createdAtMs: toMs(d.createdAt),
+      updatedAtISO: toISO(d.updatedAt),
+      updatedAtMs: toMs(d.updatedAt),
+
+      data: JSON.stringify(d)
+    };
+  });
+
   // grain_bag_events + appliedTo rows
   const appliedToRows = [];
 
@@ -512,6 +614,7 @@ export async function buildSnapshotToSqlite() {
       fieldId: norm(field.id || ""),
       fieldName: norm(field.name || ""),
 
+      // IMPORTANT: bagSku.id is the INVENTORY SKU id (inventoryGrainBagMovements.id)
       bagSkuId: norm(bagSku.id || ""),
       bagBrand: norm(bagSku.brand || ""),
       bagDiameterFt: numOrNull(bagSku.diameterFt ?? null),
@@ -549,6 +652,7 @@ export async function buildSnapshotToSqlite() {
     status: norm(d.status || ""),
     notes: norm(d.notes || ""),
 
+    // baseline: Firestore "bushels" stored as corn-rated capacity
     bushelsCorn: numOrNull(d.bushels ?? null),
 
     soyPct: numOrNull(d.soyPct ?? d.soybeanPct ?? null),
@@ -570,6 +674,9 @@ export async function buildSnapshotToSqlite() {
   insertRows(sqlite, "fields", fields);
   insertRows(sqlite, "binSites", binSites);
   if (binSiteBins.length) insertRows(sqlite, "binSiteBins", binSiteBins);
+
+  if (inventoryGrainBagMovements.length) insertRows(sqlite, "inventoryGrainBagMovements", inventoryGrainBagMovements);
+
   if (grainBagEvents.length) insertRows(sqlite, "grainBagEvents", grainBagEvents);
   if (appliedToRows.length) insertRows(sqlite, "grainBagAppliedTo", appliedToRows);
   if (productsGrainBags.length) insertRows(sqlite, "productsGrainBags", productsGrainBags);
@@ -580,6 +687,7 @@ export async function buildSnapshotToSqlite() {
     fields: sqlite.prepare("SELECT COUNT(1) AS n FROM fields").get().n,
     binSites: sqlite.prepare("SELECT COUNT(1) AS n FROM binSites").get().n,
     binSiteBins: sqlite.prepare("SELECT COUNT(1) AS n FROM binSiteBins").get().n,
+    inventoryGrainBagMovements: sqlite.prepare("SELECT COUNT(1) AS n FROM inventoryGrainBagMovements").get().n,
     grainBagEvents: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagEvents").get().n,
     grainBagAppliedTo: sqlite.prepare("SELECT COUNT(1) AS n FROM grainBagAppliedTo").get().n,
     productsGrainBags: sqlite.prepare("SELECT COUNT(1) AS n FROM productsGrainBags").get().n
