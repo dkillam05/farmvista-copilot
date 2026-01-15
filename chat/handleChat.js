@@ -1,7 +1,11 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-15-handleChat-sqlFirst41-bushelCommit-inventorySkuChain-noStatus
+// Rev: 2026-01-15-handleChat-sqlFirst42-bushelCommit-inventorySkuChain-partialCap-noStatus
 //
 // FIX (per Dane, HARD):
+// ✅ Partial bag calculator fix (IN HANDLE CHAT; no DB schema change required):
+//    - Partial feet must be capped by countPartial * lengthFt
+//    - effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * lengthFt)
+//    - partialCornBu = (effectiveFeet / lengthFt) * bushelsCorn
 // ✅ MANDATORY COMMIT RULE:
 //    If grain bag rows exist AND user asks for bushels -> MUST compute bushels.
 // ✅ NO STATUS:
@@ -9,7 +13,6 @@
 // ✅ Correct bushel capacity chain:
 //    v_grainBag_open_remaining.bagSkuId -> inventoryGrainBagMovements.id
 //    inventoryGrainBagMovements.productId -> productsGrainBags.id
-//    productsGrainBags.bushelsCorn + productsGrainBags.lengthFt for full + partial feet math
 //
 // Keeps (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
@@ -285,25 +288,12 @@ Prefer:
 - v_grainBag_open_remaining
 
 ========================
-GRAIN BAGS — HARD BAG COUNT RULE
-========================
-- If the user asks "How many grain bags..." they ALWAYS mean TOTAL BAGS (full+partial), not entry rows.
-- TOTAL BAGS (view) = SUM(remainingFull) + SUM(remainingPartial)
-- Only talk about entry rows if user explicitly says: entries / events / rows / records.
-
-========================
-GRAIN BAGS → FIELD LINK (HARD)
-========================
-- For "what fields are the bags in?" GROUP BY v_grainBag_open_remaining.fieldName.
-- Do NOT resolve fields via resolve_field for this.
-
-========================
 GRAIN BAG BUSHELS — REQUIRED MATH (HARD)
 ========================
 When user asks for BUSHELS in grain bags, you MUST compute.
 
 Preferred source:
-- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartialFeetSum,fieldName)
+- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartial,remainingPartialFeetSum,fieldName)
 
 IMPORTANT: bagSkuId is NOT a productsGrainBags id.
 bagSkuId maps to inventoryGrainBagMovements.id (the SKU inventory doc).
@@ -319,7 +309,14 @@ Capacity fields:
 
 Compute CORN-rated bushels:
 - fullCornBu = remainingFull * pgb.bushelsCorn
-- partialCornBu = (remainingPartialFeetSum / pgb.lengthFt) * pgb.bushelsCorn
+
+PARTIALS (HARD — DO NOT OVERCOUNT):
+- remainingPartial is the count of partial bags remaining.
+- remainingPartialFeetSum is the total filled feet across partial bags.
+- You MUST cap feet by the number of partial bags:
+  effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)
+- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn
+
 - totalCornBu = fullCornBu + partialCornBu
 
 Apply crop factor:
@@ -349,7 +346,7 @@ function captureLastTowerNameFromAssistant(text) {
   const t = safeStr(text);
   let m = t.match(/tower[^.\n]*?\bis named\s+"([^"]+)"\b/i);
   if (m && m[1]) return m[1].trim();
-  m = t.match(/rtk tower[^.\n]*?\b([A-Za-z0-9][A-Za-z0-9 \-']{2,})\b/i);
+  m = t.match(/rtk tower[^.\n]*?\b([A-Za-z0-9][A-Za-z0-9 \\-']{2,})\b/i);
   if (m && m[1]) return m[1].trim();
   return "";
 }
@@ -359,7 +356,7 @@ function captureLastBagCtxFromAssistant(text) {
   const s = safeStr(text || "");
   if (!s) return null;
 
-  const re = /\b(?:found|there are|i found)\s+(\d{1,6})\s+([a-z]+)\s+(?:grain\s+)?bags?\b/i;
+  const re = /\\b(?:found|there are|i found)\\s+(\\d{1,6})\\s+([a-z]+)\\s+(?:grain\\s+)?bags?\\b/i;
   const m = s.match(re);
   if (!m) return null;
 
@@ -382,7 +379,7 @@ function userAsksTowerDetails(text) {
 function pickCandidateFromUserReply(userText, candidates) {
   const t = safeStr(userText).trim();
 
-  const mNum = t.match(/^\s*(\d{1,2})\s*$/);
+  const mNum = t.match(/^\\s*(\\d{1,2})\\s*$/);
   if (mNum) {
     const n = parseInt(mNum[1], 10);
     if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) return candidates[n - 1] || null;
@@ -405,7 +402,7 @@ function looksLikeRtkFieldPrefix(text) {
   const t = norm(text);
   if (!t.includes("rtk")) return null;
   if (!t.includes("field")) return null;
-  const m = t.match(/\bfield\s*[:#]?\s*(\d{3,5})\b/);
+  const m = t.match(/\\bfield\\s*[:#]?\\s*(\\d{3,5})\\b/);
   if (!m) return null;
   const prefix = m[1];
   if (t.includes(`${prefix}-`)) return null;
@@ -439,8 +436,8 @@ function userAsksBagBushels(text) {
   const t = (text || "").toString().toLowerCase();
   if (!t) return false;
 
-  const hasBushelWord = /\bbushels?\b/.test(t);
-  const hasBu = /\bbu\b/.test(t) || /\bbu\.\b/.test(t);
+  const hasBushelWord = /\\bbushels?\\b/.test(t);
+  const hasBu = /\\bbu\\b/.test(t) || /\\bbu\\.\\b/.test(t);
   if (!(hasBushelWord || hasBu)) return false;
 
   const bagContext = t.includes("bag") && (t.includes("grain") || t.includes("field") || t.includes("bags") || t.includes("those"));
@@ -455,23 +452,20 @@ function userAsksGroupedByField(text) {
     t.includes("grouped by field") ||
     t.includes("per field") ||
     t.includes("each field") ||
-    (t.includes("fields") && (t.includes("bushel") || /\bbu\b/.test(t)))
+    (t.includes("fields") && (t.includes("bushel") || /\\bbu\\b/.test(t)))
   );
 }
 
 function assistantHasBushelNumber(text) {
   const s = safeStr(text);
   if (!s) return false;
-  const re = /\b\d[\d,]*\.?\d*\s*(bu|bushels?)\b/i;
+  const re = /\\b\\d[\\d,]*\\.?\\d*\\s*(bu|bushels?)\\b/i;
   return re.test(s);
 }
 
 function sqlLooksLikeBagRows(sqlLower) {
   if (!sqlLower) return false;
-  return (
-    sqlLower.includes("v_grainbag_open_remaining") ||
-    sqlLower.includes("grainbagevents")
-  );
+  return (sqlLower.includes("v_grainbag_open_remaining") || sqlLower.includes("grainbagevents"));
 }
 
 function sqlLooksLikeCapacityChain(sqlLower) {
@@ -481,7 +475,8 @@ function sqlLooksLikeCapacityChain(sqlLower) {
     sqlLower.includes("productsgrainbags") ||
     sqlLower.includes("bushelscorn") ||
     sqlLower.includes("lengthft") ||
-    sqlLower.includes("productid")
+    sqlLower.includes("productid") ||
+    sqlLower.includes("remainingpartial")
   );
 }
 
@@ -493,7 +488,7 @@ function userReferencesThoseBags(text) {
 
 function extractExplicitBagNumber(text) {
   const t = (text || "").toString().toLowerCase();
-  const m = t.match(/\bthose\s+(\d{1,6})\s+bags?\b/);
+  const m = t.match(/\\bthose\\s+(\\d{1,6})\\s+bags?\\b/);
   if (!m) return null;
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) ? n : null;
@@ -548,7 +543,7 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // Carry "those 46 bags" context across turns (NO STATUS; must compute bushels)
+    // Carry "those 46 bags" context across turns
     if (thread && thread.lastBagCtx && userReferencesThoseBags(userTextRaw)) {
       const n = extractExplicitBagNumber(userTextRaw);
       if (!n || n === thread.lastBagCtx.bagCount) {
@@ -560,6 +555,7 @@ export async function handleChatHttp(req, res) {
           `JOIN inventoryGrainBagMovements (inv.id = v.bagSkuId)`,
           `JOIN productsGrainBags (pgb.id = inv.productId)`,
           `then full + partial-feet math + crop factor.`,
+          `PARTIALS MUST BE CAPPED: effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt).`,
           `Do NOT use or mention any status concept.`
         ].join("\n");
       }
@@ -732,14 +728,17 @@ export async function handleChatHttp(req, res) {
           "Do NOT stop after bag counts. You MUST compute and return numeric bushel totals by completing the full bag bushel pipeline.",
           "",
           "Use the REAL capacity chain (no status):",
-          "- Start from v_grainBag_open_remaining (remainingFull, remainingPartialFeetSum, cropType, cropYear, bagSkuId, fieldName).",
+          "- Start from v_grainBag_open_remaining (remainingFull, remainingPartial, remainingPartialFeetSum, cropType, cropYear, bagSkuId, fieldName).",
           "- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId.",
           "- JOIN productsGrainBags pgb ON pgb.id = inv.productId.",
           "- Use pgb.bushelsCorn and pgb.lengthFt for capacity math.",
           "",
+          "PARTIALS MUST BE CAPPED (HARD):",
+          "- effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)",
+          "- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn",
+          "",
           "Compute:",
           "- fullCornBu = remainingFull * pgb.bushelsCorn",
-          "- partialCornBu = (remainingPartialFeetSum / pgb.lengthFt) * pgb.bushelsCorn",
           "- totalCornBu = fullCornBu + partialCornBu",
           "- totalBu = totalCornBu * cropFactor",
           "",
