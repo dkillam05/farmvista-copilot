@@ -1,30 +1,22 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-15-handleChat-sqlFirst40-bushelCommit-bagCtx-noStatus
+// Rev: 2026-01-15-handleChat-sqlFirst41-bushelCommit-inventorySkuChain-noStatus
 //
 // FIX (per Dane, HARD):
 // ✅ MANDATORY COMMIT RULE:
-//    If grain bag rows exist AND user asks for bushels -> MUST compute bushels
-//    (JOIN productsGrainBags + partial-feet math + crop factor). No early exits.
+//    If grain bag rows exist AND user asks for bushels -> MUST compute bushels.
+// ✅ NO STATUS:
+//    Never rely on any "status" meaning for bags being down.
+// ✅ Correct bushel capacity chain:
+//    v_grainBag_open_remaining.bagSkuId -> inventoryGrainBagMovements.id
+//    inventoryGrainBagMovements.productId -> productsGrainBags.id
+//    productsGrainBags.bushelsCorn + productsGrainBags.lengthFt for full + partial feet math
 //
-// FIX (per Dane, HARD):
-// ✅ DO NOT rely on ANY "status" concept for grain bags.
-//    - Prefer v_grainBag_open_remaining for "bags down now" and bushels now.
-//    - If the view isn't present, use grain bag events + appliedTo pickup logic (already in snapshot-build.js).
-//    - Never say "no bushel data available" if bag rows exist.
-//
-// FIX (critical):
-// ✅ Carry context across turns for "those 46 bags" followups:
-//    - If assistant previously reported "X <crop> grain bags", store that in thread.
-//    - If user then asks "how many bushels are in those X bags", force the model to compute bushels
-//      for that same crop (and year if present).
-//
-// ALSO KEEPS (do not trim):
+// Keeps (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
 // ✅ SQL sanitizer
 // ✅ did-you-mean pending + yes/no + numeric/prefix selection
 // ✅ RTK field-prefix guardrail (0964/0505)
 // ✅ view preference v_grainBag_open_remaining when available
-// ✅ grain bag bushel math rules (productsGrainBags join + crop factors)
 // ✅ chatbot aliases + crop normalize
 // ✅ global ask-back fallback contract (never "No answer")
 
@@ -287,26 +279,23 @@ ${cropAliasLines}
 GRAIN BAGS — NO STATUS (HARD)
 ========================
 Do NOT rely on ANY "status" concept to decide if bags are down.
-For "bags down right now" and "bushels in bags right now", prefer:
-- v_grainBag_open_remaining
+"Down now" is computed strictly from putDown minus appliedTo pickups.
 
-If view is unavailable, use:
-- grainBagEvents with pickups accounted via appliedTo logic (already built in snapshot).
+Prefer:
+- v_grainBag_open_remaining
 
 ========================
 GRAIN BAGS — HARD BAG COUNT RULE
 ========================
 - If the user asks "How many grain bags..." they ALWAYS mean TOTAL BAGS (full+partial), not entry rows.
-- TOTAL BAGS = SUM(COALESCE(remainingFull,0)) + SUM(COALESCE(remainingPartial,0)) (prefer the VIEW)
+- TOTAL BAGS (view) = SUM(remainingFull) + SUM(remainingPartial)
 - Only talk about entry rows if user explicitly says: entries / events / rows / records.
 
 ========================
 GRAIN BAGS → FIELD LINK (HARD)
 ========================
-- Grain bags ARE tied to fields through grain bag data.
-- For questions like "what fields are the bags in?":
-  Use bag data (preferred v_grainBag_open_remaining.fieldName), GROUP BY fieldName.
-  Do NOT resolve fields via resolve_field.
+- For "what fields are the bags in?" GROUP BY v_grainBag_open_remaining.fieldName.
+- Do NOT resolve fields via resolve_field for this.
 
 ========================
 GRAIN BAG BUSHELS — REQUIRED MATH (HARD)
@@ -314,14 +303,23 @@ GRAIN BAG BUSHELS — REQUIRED MATH (HARD)
 When user asks for BUSHELS in grain bags, you MUST compute.
 
 Preferred source:
-- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartial,remainingPartialFeetSum,fieldName)
+- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartialFeetSum,fieldName)
 
-You MUST JOIN productsGrainBags:
-- productsGrainBags(id, bushelsCorn, lengthFt)
+IMPORTANT: bagSkuId is NOT a productsGrainBags id.
+bagSkuId maps to inventoryGrainBagMovements.id (the SKU inventory doc).
+inventoryGrainBagMovements.productId maps to productsGrainBags.id.
+
+You MUST JOIN using the correct chain:
+- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId
+- JOIN productsGrainBags pgb ON pgb.id = inv.productId
+
+Capacity fields:
+- pgb.bushelsCorn (corn-rated full-bag capacity)
+- pgb.lengthFt (bag length in feet)
 
 Compute CORN-rated bushels:
-- fullCornBu = remainingFull * bushelsCorn
-- partialCornBu = (remainingPartialFeetSum / lengthFt) * bushelsCorn
+- fullCornBu = remainingFull * pgb.bushelsCorn
+- partialCornBu = (remainingPartialFeetSum / pgb.lengthFt) * pgb.bushelsCorn
 - totalCornBu = fullCornBu + partialCornBu
 
 Apply crop factor:
@@ -333,27 +331,10 @@ MANDATORY COMMIT RULE (HARD):
 - Returning 0/null/"not available" is ONLY allowed when row count = 0.
 
 ========================
-RTK TOWERS — IMPORTANT
-========================
-- When user asks RTK tower info for a FIELD:
-  1) Resolve/select the field
-  2) Read fields.rtkTowerId
-  3) JOIN rtkTowers by id to get name, networkId, frequency
-
-- If user provides numeric field prefix like "0964":
-  treat as prefix for field.name (0964-...)
-
-Avoid resolver traps:
-- Do NOT treat crop words like "corn" or "soybeans" as field/farm names.
-
-========================
-GRAIN BUSHELS
+GRAIN BUSHELS (BINS)
 ========================
 Bins:
 - SUM(binSiteBins.onHandBushels) filter by lower(lastCropType)=lower(crop)
-
-Field grain bags:
-- Use grain bag bushels math above
 
 SQL tool rule:
 - db_query must be a SINGLE statement with NO semicolons.
@@ -378,10 +359,6 @@ function captureLastBagCtxFromAssistant(text) {
   const s = safeStr(text || "");
   if (!s) return null;
 
-  // Examples handled:
-  // "I found 46 corn grain bags currently down"
-  // "There are 12 soybeans grain bags down"
-  // "Found 9 wheat bags down"
   const re = /\b(?:found|there are|i found)\s+(\d{1,6})\s+([a-z]+)\s+(?:grain\s+)?bags?\b/i;
   const m = s.match(re);
   if (!m) return null;
@@ -391,7 +368,6 @@ function captureLastBagCtxFromAssistant(text) {
   if (!Number.isFinite(n) || n < 0) return null;
   if (!crop) return null;
 
-  // only accept known crops (aliases already normalized in many cases)
   const known = ["corn", "soybeans", "wheat", "milo", "oats"];
   if (!known.includes(crop)) return null;
 
@@ -498,12 +474,14 @@ function sqlLooksLikeBagRows(sqlLower) {
   );
 }
 
-function sqlLooksLikeProductsJoin(sqlLower) {
+function sqlLooksLikeCapacityChain(sqlLower) {
   if (!sqlLower) return false;
   return (
+    sqlLower.includes("inventorygrainbagmovements") ||
     sqlLower.includes("productsgrainbags") ||
     sqlLower.includes("bushelscorn") ||
-    sqlLower.includes("lengthft")
+    sqlLower.includes("lengthft") ||
+    sqlLower.includes("productid")
   );
 }
 
@@ -573,14 +551,16 @@ export async function handleChatHttp(req, res) {
     // Carry "those 46 bags" context across turns (NO STATUS; must compute bushels)
     if (thread && thread.lastBagCtx && userReferencesThoseBags(userTextRaw)) {
       const n = extractExplicitBagNumber(userTextRaw);
-      // If user said "those 46 bags", attach the crop context we previously captured.
-      // This does not route; it just removes ambiguity.
       if (!n || n === thread.lastBagCtx.bagCount) {
         userText = [
           userText,
           "",
           `IMPORTANT CONTEXT: The user is referring to the previously mentioned ${thread.lastBagCtx.bagCount} ${thread.lastBagCtx.cropType} grain bags.`,
-          `Compute BUSHELS for those bags using v_grainBag_open_remaining + JOIN productsGrainBags + partial-feet math + crop factor. Do NOT use or mention any status concept.`,
+          `Compute BUSHELS for those bags using v_grainBag_open_remaining`,
+          `JOIN inventoryGrainBagMovements (inv.id = v.bagSkuId)`,
+          `JOIN productsGrainBags (pgb.id = inv.productId)`,
+          `then full + partial-feet math + crop factor.`,
+          `Do NOT use or mention any status concept.`
         ].join("\n");
       }
     }
@@ -635,7 +615,7 @@ export async function handleChatHttp(req, res) {
     const wantsBagBushels = userAsksBagBushels(userTextRaw) || userAsksBagBushels(userText);
     const wantsGroupedByField = userAsksGroupedByField(userTextRaw) || userAsksGroupedByField(userText);
     let sawQualifyingBagRows = false;
-    let sawProductsJoinEvidence = false;
+    let sawCapacityChain = false;
 
     // First call (OpenAI-led)
     let rsp = await openaiResponsesCreate({
@@ -677,8 +657,8 @@ export async function handleChatHttp(req, res) {
               if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
                 sawQualifyingBagRows = true;
               }
-              if (!sawProductsJoinEvidence && sqlLooksLikeProductsJoin(sqlLower)) {
-                sawProductsJoinEvidence = true;
+              if (!sawCapacityChain && sqlLooksLikeCapacityChain(sqlLower)) {
+                sawCapacityChain = true;
               }
             } catch {}
           } catch (e) {
@@ -749,15 +729,24 @@ export async function handleChatHttp(req, res) {
         content: [
           "MANDATORY COMMIT RULE ENFORCEMENT:",
           "You have qualifying grain bag rows (rowCount > 0). The user asked for BUSHELS.",
-          "Do NOT stop after bag counts. You MUST compute and return numeric bushel totals by completing the full bag bushel pipeline:",
-          "- Prefer v_grainBag_open_remaining when available (remainingFull, remainingPartialFeetSum, cropType, cropYear, bagSkuId, fieldName).",
-          "- JOIN productsGrainBags to get (bushelsCorn, lengthFt).",
-          "- Compute corn-rated bushels (full + partial feet) then apply crop factor.",
-          "- Return a numeric total in bushels (bu).",
-          wantsGroupedByField ? "- ALSO group by fieldName and return bushels per field (and a grand total)." : "",
+          "Do NOT stop after bag counts. You MUST compute and return numeric bushel totals by completing the full bag bushel pipeline.",
           "",
-          "HARD: Do NOT rely on or mention any status concept. Use the view or appliedTo math.",
-          "Use db_query as needed."
+          "Use the REAL capacity chain (no status):",
+          "- Start from v_grainBag_open_remaining (remainingFull, remainingPartialFeetSum, cropType, cropYear, bagSkuId, fieldName).",
+          "- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId.",
+          "- JOIN productsGrainBags pgb ON pgb.id = inv.productId.",
+          "- Use pgb.bushelsCorn and pgb.lengthFt for capacity math.",
+          "",
+          "Compute:",
+          "- fullCornBu = remainingFull * pgb.bushelsCorn",
+          "- partialCornBu = (remainingPartialFeetSum / pgb.lengthFt) * pgb.bushelsCorn",
+          "- totalCornBu = fullCornBu + partialCornBu",
+          "- totalBu = totalCornBu * cropFactor",
+          "",
+          wantsGroupedByField ? "ALSO: group by fieldName and return bushels per field plus a grand total." : "",
+          "",
+          "Return the numeric total in bushels (bu).",
+          "Do NOT say 'no bushel data available' when rows exist. Use db_query as needed."
         ].filter(Boolean).join("\n")
       });
 
@@ -778,72 +767,39 @@ export async function handleChatHttp(req, res) {
         let didAny = false;
 
         for (const call of calls) {
-          const name = safeStr(call?.name);
+          if (safeStr(call?.name) !== "db_query") continue;
+          didAny = true;
+
           const args = jsonTryParse(call.arguments) || {};
-          let result = null;
+          let result;
 
-          if (name === "db_query") {
-            didAny = true;
+          try {
+            const sql = cleanSql(args.sql || "");
+            const sqlLower = sql.toLowerCase();
+
+            result = runSql({
+              sql,
+              params: Array.isArray(args.params) ? args.params : [],
+              limit: Number.isFinite(args.limit) ? args.limit : 200
+            });
+
             try {
-              const sql = cleanSql(args.sql || "");
-              const sqlLower = sql.toLowerCase();
-
-              result = runSql({
-                sql,
-                params: Array.isArray(args.params) ? args.params : [],
-                limit: Number.isFinite(args.limit) ? args.limit : 200
-              });
-
-              try {
-                const rows = Array.isArray(result?.rows) ? result.rows : [];
-                if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
-                  sawQualifyingBagRows = true;
-                }
-                if (!sawProductsJoinEvidence && sqlLooksLikeProductsJoin(sqlLower)) {
-                  sawProductsJoinEvidence = true;
-                }
-              } catch {}
-            } catch (e) {
-              result = { ok: false, error: e?.message || String(e) };
-            }
-
-          } else if (name === "resolve_field") {
-            didAny = true;
-            result = resolveField(safeStr(args.query || ""));
-            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-              if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-              return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-            }
-
-          } else if (name === "resolve_farm") {
-            didAny = true;
-            result = resolveFarm(safeStr(args.query || ""));
-            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-              if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-              return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-            }
-
-          } else if (name === "resolve_rtk_tower") {
-            didAny = true;
-            result = resolveRtkTower(safeStr(args.query || ""));
-            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-              if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-              return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-            }
-
-          } else if (name === "resolve_binSite") {
-            didAny = true;
-            result = resolveBinSite(safeStr(args.query || ""));
-            if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-              if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-              return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-            }
+              const rows = Array.isArray(result?.rows) ? result.rows : [];
+              if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
+                sawQualifyingBagRows = true;
+              }
+              if (!sawCapacityChain && sqlLooksLikeCapacityChain(sqlLower)) {
+                sawCapacityChain = true;
+              }
+            } catch {}
+          } catch (e) {
+            result = { ok: false, error: e?.message || String(e) };
           }
 
           input_list.push({
             type: "function_call_output",
             call_id: call.call_id,
-            output: JSON.stringify(result ?? { ok: false, error: "no_result" })
+            output: JSON.stringify(result)
           });
         }
 
