@@ -71,27 +71,6 @@ function buildAliasReverse(mapObj) {
     const c = String(canon || "").trim().toLowerCase();
     if (!c) continue;
     out.set(c, c);
-    for (const a of (Array.isArray(arr) ? arr : [])) {
-      const k = String(a || "").trim().toLowerCase();
-      if (!k) continue;
-      out.set(k, c);
-    }
-  }
-  return out;
-}
-
-const CROP_ALIAS_TO_CANON = buildAliasReverse(CHATBOT_ALIASES.cropType);
-
-function normalizeUserText(userText) {
-  let s = (userText || "").toString();
-  if (!s) return s;
-
-  const parts = s.split(/(\b)/);
-  for (let i = 0; i < parts.length; i++) {
-    const tok = parts[i];
-    if (!tok || !/^[A-Za-z]+$/.test(tok)) continue;
-    const low = tok.toLowerCase();
-    const canon = CROP_ALIAS_TO_CANON.get(low);
     if (canon && canon !== low) parts[i] = canon;
   }
   return parts.join("");
@@ -287,6 +266,32 @@ GLOBAL FALLBACK UX CONTRACT (HARD)
   ask which year (or all years) BEFORE final totals.
 
 ========================
+FIELDS — FULL SUMMARY BY DEFAULT (HARD)
+========================
+When the user asks for “field information”, “tell me about field ___”, “everything about ___”, etc:
+- You MUST return a full field profile (not just IDs).
+- You MUST include RTK tower info if the field has rtkTowerId / rtkTowerName.
+- You MUST include the farm name (not farmId) when available.
+
+Tool behavior (HARD):
+- Use db_query for facts (no guessing).
+- If you are unsure what columns exist, run:
+  SELECT name FROM pragma_table_info('fields') ORDER BY cid
+  (and similarly for 'rtkTowers' / 'farms') then query using the columns that exist.
+- NEVER tell the user “the DB does not have column X”. Just omit missing fields and continue.
+
+Output format (HARD):
+- Start with: Field: <field name>
+- Then a short bullet list of key attributes found on the row (only what exists):
+  (examples: county/state, tillableAcres, hel/crp flags, notes, archived, boundaries, etc.)
+- Then an “RTK Tower” section:
+  - Tower name
+  - Network ID (if present)
+  - Frequency (if present)
+  - Any other tower identifiers present in rtkTowers row
+- Then a “Farm” line with farm name (and location if present)
+
+========================
 CHATBOT ALIASES (USE THESE)
 ========================
 Crop aliases:
@@ -327,8 +332,8 @@ Compute:
 
 PARTIALS (HARD — NEVER COUNT PICKED-UP PARTIALS):
 - If remainingPartial <= 0 then effectiveFeet MUST be 0 (even if remainingPartialFeetSum > 0)
-- Else effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)
-- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn
+- Else effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * lengthFt)
+- partialCornBu = (effectiveFeet / lengthFt) * pgb.bushelsCorn
 
 - totalCornBu = fullCornBu + partialCornBu
 
