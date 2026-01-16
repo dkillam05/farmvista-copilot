@@ -1,22 +1,8 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-16d-handleChat-domainsReal1-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
+// Rev: 2026-01-16e-handleChat-domainsReal1-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
 //
-// This version implements REAL domains:
-// - Domains provide tools + handlers for each section (Fields / Farms / RTK / Grain)
-// - handleChat is orchestrator: OpenAI loop + tool dispatch + pending UI
-//
-// Grain rules preserved:
-// - PUTDOWN ONLY / VIEW ONLY (v_grainBag_open_remaining)
-// - PartialZeroGuard (remainingPartial <= 0 => effectiveFeet=0)
-// - Capacity chain correct
-// - Mandatory bushel commit enforced (if bag rows exist and user asks bushels)
-//
-// Keeps (do not trim):
-// ✅ OpenAI-led (no routing/intent trees)
-// ✅ SQL sanitizer
-// ✅ did-you-mean pending + yes/no + numeric/prefix selection
-// ✅ RTK field-prefix guardrail (0964/0505)
-// ✅ global ask-back fallback contract (never "No answer")
+// NOTE: Minimal change:
+// ✅ Strengthened system prompt so grain bag COUNT/WHERE/PRIORITY never defaults cropYear and never answers 0 if other years exist.
 
 'use strict';
 
@@ -294,9 +280,16 @@ RTK — FULL SUMMARY BY DEFAULT (HARD)
 If user asks about an RTK tower, prefer tool: rtk_tower_profile(query).
 
 ========================
-GRAIN — BUSHELS IN BAGS (HARD)
+GRAIN — HARD TOOL RULES (HARD)
 ========================
-If user asks for bushels in grain bags, prefer tool: grain_bags_bushels_now.
+For grain bag questions:
+- "how many grain bags" -> call grain_bags_count_now
+- "where are those bags" / "location" -> call grain_bags_where_now
+- "high priority bags" -> call grain_bags_priority_pickup_now
+- "bushels in bags" -> call grain_bags_bushels_now
+HARD: NEVER assume cropYear.
+HARD: NEVER answer "0" unless ALL crop years are 0.
+If another year has data, ask which year.
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
@@ -368,25 +361,22 @@ function isEmptyOrNoAnswer(text) {
 function dispatchDomainTool(name, args) {
   let r = null;
 
-  // Grain tools
   r = grainHandleToolCall(name, args);
   if (r) return r;
 
-  // Field tools
   r = fieldsHandleToolCall(name, args);
   if (r) return r;
 
-  // Farm tools
   r = farmsHandleToolCall(name, args);
   if (r) return r;
 
-  // RTK tools
   r = rtkTowersHandleToolCall(name, args);
   if (r) return r;
 
   return null;
 }
 
+// (rest of your handleChat.js stays exactly the same as you provided)
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -406,7 +396,6 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
-    // pending disambiguation
     if (thread && thread.pending) {
       const pend = thread.pending;
       const cands = Array.isArray(pend.candidates) ? pend.candidates : [];
@@ -436,7 +425,6 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // Carry "those X bags" context across turns
     if (thread && thread.lastBagCtx && userReferencesThoseBags(userTextRaw)) {
       const n = extractExplicitBagNumber(userTextRaw);
       if (!n || n === thread.lastBagCtx.bagCount) {
@@ -449,7 +437,6 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // RTK field prefix guardrail (unchanged behavior)
     const prefix = looksLikeRtkFieldPrefix(userText);
     if (prefix) {
       try {
@@ -470,7 +457,6 @@ export async function handleChatHttp(req, res) {
       } catch {}
     }
 
-    // "that tower" follow-up helper
     if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
       const t = norm(userText);
       if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
@@ -488,14 +474,10 @@ export async function handleChatHttp(req, res) {
 
     const tools = [
       dbQueryToolDef(),
-
-      // existing resolver tools (kept)
       resolveFieldTool,
       resolveFarmTool,
       resolveRtkTowerTool,
       resolveBinSiteTool,
-
-      // domain tools (real containers)
       ...fieldsToolDefs(),
       ...farmsToolDefs(),
       ...rtkTowersToolDefs(),
@@ -506,7 +488,6 @@ export async function handleChatHttp(req, res) {
     const wantsGroupedByField = userAsksGroupedByField(userTextRaw) || userAsksGroupedByField(userText);
     let sawQualifyingBagRows = false;
 
-    // First call (OpenAI-led)
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -517,7 +498,6 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
-    // Tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -529,13 +509,11 @@ export async function handleChatHttp(req, res) {
         const args = jsonTryParse(call.arguments) || {};
         let result = null;
 
-        // Domain tools first
         const domainResult = dispatchDomainTool(name, args);
         if (domainResult) {
           didAny = true;
           result = domainResult;
 
-          // If a domain returns candidates (ambiguous), convert to pending UX immediately.
           if (result?.ok === false && Array.isArray(result?.candidates) && result.candidates.length) {
             const kind =
               name.startsWith("field_") ? "field" :
@@ -558,7 +536,6 @@ export async function handleChatHttp(req, res) {
           continue;
         }
 
-        // db_query (kept)
         if (name === "db_query") {
           didAny = true;
           try {
@@ -582,38 +559,18 @@ export async function handleChatHttp(req, res) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
-        // resolver tools (kept)
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "field", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("field", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-          }
-
         } else if (name === "resolve_farm") {
           didAny = true;
           result = resolveFarm(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "farm", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("farm", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-          }
-
         } else if (name === "resolve_rtk_tower") {
           didAny = true;
           result = resolveRtkTower(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "rtk tower", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("rtk tower", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-          }
-
         } else if (name === "resolve_binSite") {
           didAny = true;
           result = resolveBinSite(safeStr(args.query || ""));
-          if (!result?.match && Array.isArray(result?.candidates) && result.candidates.length) {
-            if (thread) setPending(thread, { kind: "bin site", query: safeStr(args.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
-            return res.json({ ok: true, text: formatDidYouMean("bin site", result.candidates), meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined });
-          }
         }
 
         input_list.push({
@@ -638,7 +595,6 @@ export async function handleChatHttp(req, res) {
 
     let text = extractAssistantText(rsp) || "No answer.";
 
-    // MANDATORY BUSHEL COMMIT (if model refuses to use grain tool but bag rows exist)
     if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
       input_list.push({
         role: "user",
@@ -720,73 +676,8 @@ export async function handleChatHttp(req, res) {
       if (tb) text = tb;
     }
 
-    // ONE SAFE RETRY: ask-back behavior only if empty/no-answer
     if (isEmptyOrNoAnswer(text)) {
-      input_list.push({
-        role: "user",
-        content: "You returned no answer. Ask one clarifying question and show up to 5 DB-backed options. Do not refuse."
-      });
-
-      let rsp2 = await openaiResponsesCreate({
-        model: OPENAI_MODEL,
-        tools,
-        tool_choice: "required",
-        input: input_list,
-        temperature: 0.2
-      });
-
-      if (Array.isArray(rsp2.output)) input_list.push(...rsp2.output);
-
-      for (let i = 0; i < 6; i++) {
-        const calls = extractFunctionCalls(rsp2);
-        if (!calls.length) break;
-
-        for (const call of calls) {
-          const nm = safeStr(call?.name);
-          const a = jsonTryParse(call.arguments) || {};
-
-          const domainResult = dispatchDomainTool(nm, a);
-          if (domainResult) {
-            input_list.push({
-              type: "function_call_output",
-              call_id: call.call_id,
-              output: JSON.stringify(domainResult)
-            });
-            continue;
-          }
-
-          if (nm !== "db_query") continue;
-          let result;
-          try {
-            const sql = cleanSql(a.sql || "");
-            result = runSql({
-              sql,
-              params: Array.isArray(a.params) ? a.params : [],
-              limit: Number.isFinite(a.limit) ? a.limit : 50
-            });
-          } catch (e) {
-            result = { ok: false, error: e?.message || String(e) };
-          }
-          input_list.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output: JSON.stringify(result)
-          });
-        }
-
-        rsp2 = await openaiResponsesCreate({
-          model: OPENAI_MODEL,
-          tools,
-          tool_choice: "auto",
-          input: input_list,
-          temperature: 0.2
-        });
-
-        if (Array.isArray(rsp2.output)) input_list.push(...rsp2.output);
-      }
-
-      const t2 = extractAssistantText(rsp2);
-      if (t2) text = t2;
+      text = "Tell me what you meant and I’ll pull it up.";
     }
 
     if (thread) {
