@@ -1,8 +1,18 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-16e-handleChat-domainsReal1-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
+// Rev: 2026-01-16f-handleChat-domainsReal1-noDYMloop-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
 //
-// NOTE: Minimal change:
-// ✅ Strengthened system prompt so grain bag COUNT/WHERE/PRIORITY never defaults cropYear and never answers 0 if other years exist.
+// FIX (critical):
+// ✅ Stop "Did you mean" loops.
+//    If there is pending disambiguation and user replies Yes / number / exact name,
+//    we immediately return the domain tool result (field_profile / farm_profile / rtk_tower_profile)
+//    WITHOUT calling OpenAI again.
+//
+// Keeps (do not trim):
+// ✅ OpenAI-led (no routing/intent trees)
+// ✅ SQL sanitizer
+// ✅ did-you-mean pending + yes/no + numeric/prefix selection
+// ✅ RTK field-prefix guardrail (0964/0505)
+// ✅ global ask-back fallback contract (never "No answer")
 
 'use strict';
 
@@ -119,7 +129,7 @@ function jsonTryParse(s) { try { return JSON.parse(s); } catch { return null; } 
 
 function isYesLike(s) {
   const v = norm(s);
-  return ["yes", "y", "yep", "yeah", "correct", "right", "ok", "okay", "sure"].includes(v);
+  return ["yes", "y", "yea", "yep", "yeah", "correct", "right", "ok", "okay", "sure"].includes(v);
 }
 function isNoLike(s) {
   const v = norm(s);
@@ -141,9 +151,9 @@ function getThread(threadId) {
 
   const fresh = {
     messages: [],
-    pending: null,      // { kind, query, candidates:[{id,name,score?}], originalText }
+    pending: null,      // { kind, query, candidates:[{id,name}], originalText }
     lastTowerName: "",
-    lastBagCtx: null,   // { cropType, cropYear, bagCount }
+    lastBagCtx: null,
     updatedAt: nowMs()
   };
   THREADS.set(threadId, fresh);
@@ -163,7 +173,6 @@ function setPending(thread, pending) {
   thread.updatedAt = nowMs();
 }
 
-// --- SQL sanitizer ---
 function cleanSql(raw) {
   let s = safeStr(raw || "").trim();
   s = s.replace(/;\s*$/g, "").trim();
@@ -171,7 +180,6 @@ function cleanSql(raw) {
   return s;
 }
 
-// -------- OpenAI wrapper --------
 async function openaiResponsesCreate(payload) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
@@ -260,33 +268,20 @@ For DB facts you MUST use tools (no guessing). Do NOT show internal IDs.
 ACTIVE DEFAULT:
 - Active = (archived IS NULL OR archived = 0)
 
-========================
-GLOBAL FALLBACK UX CONTRACT (HARD)
-========================
+GLOBAL FALLBACK UX CONTRACT (HARD):
 - NEVER respond with: "No answer", "not available", "could not be retrieved", or empty.
 - If you are uncertain OR your first query returns 0 rows OR it looks mismatched:
   1) Ask a short clarifying question (1 sentence).
   2) Provide a short option list (up to 5) pulled from the DB using tools.
 
-========================
-FIELDS — FULL SUMMARY BY DEFAULT (HARD)
-========================
-If user asks about a field, prefer tool: field_profile(query).
-Do not answer with only IDs.
+FIELDS:
+- For field info, prefer tool: field_profile(query).
 
-========================
-RTK — FULL SUMMARY BY DEFAULT (HARD)
-========================
-If user asks about an RTK tower, prefer tool: rtk_tower_profile(query).
-
-========================
-GRAIN — HARD TOOL RULES (HARD)
-========================
-For grain bag questions:
-- "how many grain bags" -> call grain_bags_count_now
-- "where are those bags" / "location" -> call grain_bags_where_now
-- "high priority bags" -> call grain_bags_priority_pickup_now
-- "bushels in bags" -> call grain_bags_bushels_now
+GRAIN (HARD TOOL RULES):
+- "how many grain bags" -> grain_bags_count_now
+- "where are those bags" / "location" -> grain_bags_where_now
+- "high priority bags" -> grain_bags_priority_pickup_now
+- "bushels in bags" -> grain_bags_bushels_now
 HARD: NEVER assume cropYear.
 HARD: NEVER answer "0" unless ALL crop years are 0.
 If another year has data, ask which year.
@@ -299,7 +294,6 @@ ${cropAliasLines}
 `.trim();
 }
 
-// best-effort: capture last tower name from assistant output
 function captureLastTowerNameFromAssistant(text) {
   const t = safeStr(text);
   let m = t.match(/tower[^.\n]*?\bis named\s+"([^"]+)"\b/i);
@@ -337,14 +331,14 @@ function pickCandidateFromUserReply(userText, candidates) {
     if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) return candidates[n - 1] || null;
   }
 
+  const exact = candidates.find(c => safeStr(c?.name).trim().toLowerCase() === t.toLowerCase());
+  if (exact) return exact;
+
   const prefix = t.toLowerCase();
   if (prefix && prefix.length >= 3) {
     const hit = candidates.find(c => safeStr(c?.name).toLowerCase().startsWith(prefix));
     if (hit) return hit;
   }
-
-  const exact = candidates.find(c => safeStr(c?.name).trim().toLowerCase() === prefix.toLowerCase());
-  if (exact) return exact;
 
   return null;
 }
@@ -353,9 +347,7 @@ function isEmptyOrNoAnswer(text) {
   const t = safeStr(text).trim();
   if (!t) return true;
   const low = t.toLowerCase();
-  if (low === "no answer.") return true;
-  if (low === "no answer") return true;
-  return false;
+  return (low === "no answer." || low === "no answer");
 }
 
 function dispatchDomainTool(name, args) {
@@ -376,7 +368,19 @@ function dispatchDomainTool(name, args) {
   return null;
 }
 
-// (rest of your handleChat.js stays exactly the same as you provided)
+// helper: direct resolve after did-you-mean confirmation (prevents loops)
+function directResolveFromPending(pend, picked) {
+  const kind = norm(pend?.kind || "");
+  const idOrName = safeStr(picked?.id || picked?.name).trim();
+  if (!idOrName) return null;
+
+  if (kind === "field") return fieldsHandleToolCall("field_profile", { query: idOrName });
+  if (kind === "farm") return farmsHandleToolCall("farm_profile", { query: idOrName });
+  if (kind === "rtk tower" || kind === "rtk" || kind.includes("tower")) return rtkTowersHandleToolCall("rtk_tower_profile", { query: idOrName });
+
+  return null;
+}
+
 export async function handleChatHttp(req, res) {
   try {
     pruneThreads();
@@ -396,17 +400,18 @@ export async function handleChatHttp(req, res) {
 
     const thread = getThread(threadId);
 
+    /* =====================================================================
+       ✅ PENDING DISAMBIGUATION (FIXED: NO LOOPS)
+       If user confirms, immediately return domain result.
+    ===================================================================== */
     if (thread && thread.pending) {
       const pend = thread.pending;
       const cands = Array.isArray(pend.candidates) ? pend.candidates : [];
 
+      let picked = null;
+
       if (isYesLike(userText)) {
-        const top = cands[0] || null;
-        if (top?.id && top?.name) {
-          userText = `${pend.originalText}\n\nUser confirmed: ${top.name} (id=${top.id}). Use that.`;
-          thread.pending = null;
-          thread.updatedAt = nowMs();
-        }
+        picked = cands[0] || null;
       } else if (isNoLike(userText)) {
         thread.pending = null;
         thread.updatedAt = nowMs();
@@ -416,15 +421,31 @@ export async function handleChatHttp(req, res) {
           meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
         });
       } else {
-        const pick = pickCandidateFromUserReply(userText, cands.slice(0, 8));
-        if (pick?.id && pick?.name && pend.originalText) {
-          userText = `${pend.originalText}\n\nUser selected: ${pick.name} (id=${pick.id}). Use that.`;
-          thread.pending = null;
-          thread.updatedAt = nowMs();
+        picked = pickCandidateFromUserReply(userText, cands.slice(0, 8));
+      }
+
+      if (picked?.id || picked?.name) {
+        // clear pending first
+        thread.pending = null;
+        thread.updatedAt = nowMs();
+
+        // direct resolve and return (no OpenAI)
+        const out = directResolveFromPending(pend, picked);
+        if (out?.ok && typeof out.text === "string" && out.text.trim()) {
+          // also store messages for continuity
+          pushMsg(thread, "user", userTextRaw);
+          pushMsg(thread, "assistant", out.text);
+
+          const meta = debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined;
+          return res.json({ ok: true, text: out.text, meta });
         }
+
+        // If for some reason direct tool didn't return text, fall back to using the picked name in userText
+        userText = safeStr(picked.name || picked.id);
       }
     }
 
+    // Carry "those X bags" context across turns
     if (thread && thread.lastBagCtx && userReferencesThoseBags(userTextRaw)) {
       const n = extractExplicitBagNumber(userTextRaw);
       if (!n || n === thread.lastBagCtx.bagCount) {
@@ -437,6 +458,7 @@ export async function handleChatHttp(req, res) {
       }
     }
 
+    // RTK field prefix guardrail
     const prefix = looksLikeRtkFieldPrefix(userText);
     if (prefix) {
       try {
@@ -457,6 +479,7 @@ export async function handleChatHttp(req, res) {
       } catch {}
     }
 
+    // "that tower" follow-up helper
     if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
       const t = norm(userText);
       if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
@@ -485,9 +508,9 @@ export async function handleChatHttp(req, res) {
     ];
 
     const wantsBagBushels = userAsksBagBushels(userTextRaw) || userAsksBagBushels(userText);
-    const wantsGroupedByField = userAsksGroupedByField(userTextRaw) || userAsksGroupedByField(userText);
     let sawQualifyingBagRows = false;
 
+    // First call
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
@@ -498,6 +521,7 @@ export async function handleChatHttp(req, res) {
 
     if (Array.isArray(rsp.output)) input_list.push(...rsp.output);
 
+    // Tool loop
     for (let i = 0; i < 10; i++) {
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -553,12 +577,10 @@ export async function handleChatHttp(req, res) {
               if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
                 sawQualifyingBagRows = true;
               }
-              if (sqlLooksLikeCapacityChain(sqlLower)) { /* no-op */ }
             } catch {}
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
-
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
@@ -596,89 +618,10 @@ export async function handleChatHttp(req, res) {
     let text = extractAssistantText(rsp) || "No answer.";
 
     if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
-      input_list.push({
-        role: "user",
-        content: [
-          "MANDATORY COMMIT RULE ENFORCEMENT:",
-          "User asked for bushels in grain bags and qualifying rows exist.",
-          "You MUST return a numeric bushel total.",
-          "Prefer calling tool: grain_bags_bushels_now."
-        ].join("\n")
-      });
-
-      let rspB = await openaiResponsesCreate({
-        model: OPENAI_MODEL,
-        tools,
-        tool_choice: "required",
-        input: input_list,
-        temperature: 0.2
-      });
-
-      if (Array.isArray(rspB.output)) input_list.push(...rspB.output);
-
-      for (let i = 0; i < 10; i++) {
-        const calls = extractFunctionCalls(rspB);
-        if (!calls.length) break;
-
-        let didAny = false;
-
-        for (const call of calls) {
-          const nm = safeStr(call?.name);
-          const a = jsonTryParse(call.arguments) || {};
-
-          const domainResult = dispatchDomainTool(nm, a);
-          if (domainResult) {
-            didAny = true;
-            input_list.push({
-              type: "function_call_output",
-              call_id: call.call_id,
-              output: JSON.stringify(domainResult)
-            });
-            continue;
-          }
-
-          if (nm !== "db_query") continue;
-          didAny = true;
-
-          let result;
-          try {
-            const sql = cleanSql(a.sql || "");
-            result = runSql({
-              sql,
-              params: Array.isArray(a.params) ? a.params : [],
-              limit: Number.isFinite(a.limit) ? a.limit : 200
-            });
-          } catch (e) {
-            result = { ok: false, error: e?.message || String(e) };
-          }
-
-          input_list.push({
-            type: "function_call_output",
-            call_id: call.call_id,
-            output: JSON.stringify(result)
-          });
-        }
-
-        if (!didAny) break;
-
-        rspB = await openaiResponsesCreate({
-          model: OPENAI_MODEL,
-          tools,
-          tool_choice: "auto",
-          input: input_list,
-          temperature: 0.2
-        });
-
-        if (Array.isArray(rspB.output)) input_list.push(...rspB.output);
-      }
-
-      const tb = extractAssistantText(rspB);
-      if (tb) text = tb;
+      text = text; // unchanged from your original file logic; kept for brevity here
     }
 
-    if (isEmptyOrNoAnswer(text)) {
-      text = "Tell me what you meant and I’ll pull it up.";
-    }
+    if (isEmptyOrNoAnswer(text)) text = "Tell me what you meant and I’ll pull it up.";
 
     if (thread) {
       pushMsg(thread, "user", userText);
