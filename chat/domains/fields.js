@@ -1,8 +1,11 @@
 // /chat/domains/fields.js  (FULL FILE)
-// Rev: 2026-01-16c  domain:fields
+// Rev: 2026-01-16d  domain:fields
 //
 // Owns field tools + field prefix guardrail.
-// Tool: field_profile(query) => full field info + farm + RTK tower details (best-effort).
+// Tools:
+// - field_profile(query) => full field info + farm + RTK tower details (best-effort).
+// - fields_list_hel_gt0(limit) => list fields with HEL acres > 0 (schema-aware; never complains about missing columns).
+//
 // No grain logic here.
 
 'use strict';
@@ -27,6 +30,17 @@ export function fieldsToolDefs() {
           query: { type: "string", description: "Field name, short code (e.g., 0513), or field id." }
         },
         required: ["query"]
+      }
+    },
+    {
+      type: "function",
+      name: "fields_list_hel_gt0",
+      description: "List fields that have HEL acres > 0 (schema-aware). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Max number of fields to list (default 200, max 500)." }
+        }
       }
     }
   ];
@@ -127,7 +141,133 @@ function formatFieldProfile(fieldRow, farmRow, towerRow) {
   return lines.join("\n").trim();
 }
 
+/* =====================================================================
+   HEL (schema-aware; never complains about missing columns)
+===================================================================== */
+function getFieldsColumns() {
+  const r = runSql({
+    sql: `SELECT name, type FROM pragma_table_info('fields') ORDER BY cid`,
+    params: [],
+    limit: 500
+  });
+  const rows = Array.isArray(r?.rows) ? r.rows : [];
+  return rows.map(x => ({ name: safeStr(x.name), type: safeStr(x.type) }));
+}
+
+function pickHelStrategy(cols) {
+  // Return { kind: "numeric"|"bool"|"none", col: "<actual column name>" }
+  const map = new Map(cols.map(c => [norm(c.name), c.name]));
+
+  // Numeric HEL acres candidates (common variants)
+  const numericCandidates = [
+    "hel_acres", "helacres", "helAcres",
+    "hel_tillable_acres", "heltillableacres", "helTillableAcres",
+    "hel_acre", "helacre", "helAcre",
+    "hel_area_acres", "helareaacres", "helAreaAcres"
+  ];
+  for (const c of numericCandidates) {
+    const real = map.get(norm(c));
+    if (real) return { kind: "numeric", col: real };
+  }
+
+  // Boolean HEL flag candidates
+  const boolCandidates = [
+    "hashel", "has_hel", "hasHel",
+    "ishel", "is_hel", "isHel",
+    "helflag", "hel_flag", "helFlag"
+  ];
+  for (const c of boolCandidates) {
+    const real = map.get(norm(c));
+    if (real) return { kind: "bool", col: real };
+  }
+
+  return { kind: "none", col: "" };
+}
+
+function fmtHelList(rows, strategy, colName) {
+  const lines = [];
+  lines.push(`Fields with HEL > 0:`);
+
+  if (!rows.length) {
+    lines.push(`- (none found)`);
+    lines.push(``);
+    lines.push(`Total: 0`);
+    return lines.join("\n").trim();
+  }
+
+  for (const r of rows) {
+    const nm = safeStr(r.name).trim();
+    if (!nm) continue;
+
+    if (strategy.kind === "numeric") {
+      const a = r.helA;
+      const aNum = (a == null ? null : Number(a));
+      const show = Number.isFinite(aNum) ? aNum : a;
+      lines.push(`- ${nm} — ${colName}: ${show}`);
+    } else {
+      lines.push(`- ${nm}`);
+    }
+  }
+
+  lines.push(``);
+  lines.push(`Total: ${rows.length}`);
+  return lines.join("\n").trim();
+}
+
+function listHelFields(limit) {
+  const lim = Number.isFinite(limit) ? Math.max(1, Math.min(500, Number(limit))) : 200;
+
+  const cols = getFieldsColumns();
+  const strat = pickHelStrategy(cols);
+
+  if (strat.kind === "numeric") {
+    const sql = `
+      SELECT name, CAST(${strat.col} AS REAL) AS helA
+      FROM fields
+      WHERE ${strat.col} > 0
+      ORDER BY name
+      LIMIT ?
+    `;
+    const r = runSql({ sql, params: [lim], limit: lim });
+    const rows = Array.isArray(r?.rows) ? r.rows : [];
+    return fmtHelList(rows, strat, strat.col);
+  }
+
+  if (strat.kind === "bool") {
+    // Accept 1/0 and common truthy text representations
+    const sql = `
+      SELECT name
+      FROM fields
+      WHERE ${strat.col} = 1
+         OR lower(CAST(${strat.col} AS TEXT)) IN ('true','t','yes','y')
+      ORDER BY name
+      LIMIT ?
+    `;
+    const r = runSql({ sql, params: [lim], limit: lim });
+    const rows = Array.isArray(r?.rows) ? r.rows : [];
+    return fmtHelList(rows, strat, strat.col);
+  }
+
+  // No HEL columns found: return a helpful, DB-backed message (no refusal)
+  const sample = runSql({ sql: `SELECT name FROM fields ORDER BY name LIMIT 10`, params: [], limit: 10 });
+  const rows = Array.isArray(sample?.rows) ? sample.rows : [];
+
+  const lines = [];
+  lines.push(`I can’t find any HEL columns in this snapshot, so I can’t reliably filter HEL > 0 yet.`);
+  lines.push(`Here are 10 field names from the snapshot as a sanity check:`);
+
+  for (const r of rows) lines.push(`- ${safeStr(r.name)}`);
+
+  lines.push(``);
+  lines.push(`If you tell me what your HEL field is named in Firestore (or in the snapshot), I can wire it in cleanly.`);
+  return lines.join("\n").trim();
+}
+
 export function fieldsHandleToolCall(name, args) {
+  if (name === "fields_list_hel_gt0") {
+    return { ok: true, text: listHelFields(args?.limit) };
+  }
+
   if (name !== "field_profile") return null;
 
   const query = safeStr(args?.query).trim();
