@@ -1,5 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-15-handleChat-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
+// Rev: 2026-01-16-handleChat-sqlFirst44-domainsWired1-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
+//
+// NOTE (per Dane):
+// ✅ This update is ONLY to wire the new domain files so sections can evolve independently.
+// ✅ NO grain bin/bag logic changes. Same rules, same math, same enforcement.
+// ✅ We now import these from domains so you don't break RTK while working grain, etc.
+//
+// Domains wired (helpers only, no new tools yet):
+// - domains/grain.js      -> bag/bushel detection + sql pattern helpers + "those bags" helpers
+// - domains/fields.js     -> RTK field-prefix guardrail helpers
+// - domains/rtkTowers.js  -> "tower details" follow-up helper
+// - domains/farms.js      -> (present but not used yet)
 //
 // FIX (per Dane, HARD):
 // ✅ PUTDOWN ONLY / VIEW ONLY:
@@ -43,6 +54,21 @@ import { resolveFieldTool, resolveField } from "./resolve-fields.js";
 import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
 import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 import { resolveBinSiteTool, resolveBinSite } from "./resolve-binSites.js";
+
+// ✅ Domain helpers (so we stop breaking unrelated sections)
+import { looksLikeRtkFieldPrefix, findFieldsByPrefix } from "./domains/fields.js";
+import { userAsksTowerDetails } from "./domains/rtkTowers.js";
+import {
+  userAsksBagBushels,
+  userAsksGroupedByField,
+  assistantHasBushelNumber,
+  sqlLooksLikeBagRows,
+  sqlLooksLikeCapacityChain,
+  userReferencesThoseBags,
+  extractExplicitBagNumber
+} from "./domains/grain.js";
+// farms domain exists but not used yet (by design)
+// import { farmsToolDefs, farmsHandleToolCall } from "./domains/farms.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
@@ -384,11 +410,6 @@ function captureLastBagCtxFromAssistant(text) {
   return { bagCount: n, cropType: crop, cropYear: null };
 }
 
-function userAsksTowerDetails(text) {
-  const t = norm(text);
-  return (t.includes("network") || t.includes("frequency") || t.includes("freq") || t.includes("net id") || t.includes("network id"));
-}
-
 function pickCandidateFromUserReply(userText, candidates) {
   const t = safeStr(userText).trim();
 
@@ -410,29 +431,6 @@ function pickCandidateFromUserReply(userText, candidates) {
   return null;
 }
 
-// RTK+Field prefix guardrail
-function looksLikeRtkFieldPrefix(text) {
-  const t = norm(text);
-  if (!t.includes("rtk")) return null;
-  if (!t.includes("field")) return null;
-  const m = t.match(/\bfield\s*[:#]?\s*(\d{3,5})\b/);
-  if (!m) return null;
-  const prefix = m[1];
-  if (t.includes(`${prefix}-`)) return null;
-  return prefix;
-}
-
-function findFieldsByPrefix(prefix) {
-  const sql = `
-    SELECT id, name, rtkTowerId, rtkTowerName
-    FROM fields
-    WHERE name LIKE ?
-    ORDER BY name
-    LIMIT 8
-  `;
-  return runSql({ sql, params: [`${prefix}-%`], limit: 8 });
-}
-
 function isEmptyOrNoAnswer(text) {
   const t = safeStr(text).trim();
   if (!t) return true;
@@ -440,72 +438,6 @@ function isEmptyOrNoAnswer(text) {
   if (low === "no answer.") return true;
   if (low === "no answer") return true;
   return false;
-}
-
-/* =====================================================================
-   ✅ BUSHEL COMMIT ENFORCEMENT (TINY, NOT A ROUTING TREE)
-===================================================================== */
-function userAsksBagBushels(text) {
-  const t = (text || "").toString().toLowerCase();
-  if (!t) return false;
-
-  const hasBushelWord = /\bbushels?\b/.test(t);
-  const hasBu = /\bbu\b/.test(t) || /\bbu\.\b/.test(t);
-  if (!(hasBushelWord || hasBu)) return false;
-
-  const bagContext = t.includes("bag") && (t.includes("grain") || t.includes("field") || t.includes("bags") || t.includes("those"));
-  return !!bagContext;
-}
-
-function userAsksGroupedByField(text) {
-  const t = (text || "").toString().toLowerCase();
-  if (!t) return false;
-  return (
-    t.includes("by field") ||
-    t.includes("grouped by field") ||
-    t.includes("per field") ||
-    t.includes("each field") ||
-    (t.includes("fields") && (t.includes("bushel") || /\bbu\b/.test(t)))
-  );
-}
-
-function assistantHasBushelNumber(text) {
-  const s = safeStr(text);
-  if (!s) return false;
-  const re = /\b\d[\d,]*\.?\d*\s*(bu|bushels?)\b/i;
-  return re.test(s);
-}
-
-function sqlLooksLikeBagRows(sqlLower) {
-  if (!sqlLower) return false;
-  // PutDown-only truth must come from the view.
-  return sqlLower.includes("v_grainbag_open_remaining");
-}
-
-function sqlLooksLikeCapacityChain(sqlLower) {
-  if (!sqlLower) return false;
-  return (
-    sqlLower.includes("inventorygrainbagmovements") ||
-    sqlLower.includes("productsgrainbags") ||
-    sqlLower.includes("bushelscorn") ||
-    sqlLower.includes("lengthft") ||
-    sqlLower.includes("productid") ||
-    sqlLower.includes("remainingpartial")
-  );
-}
-
-function userReferencesThoseBags(text) {
-  const t = (text || "").toString().toLowerCase();
-  if (!t) return false;
-  return t.includes("those") && t.includes("bag");
-}
-
-function extractExplicitBagNumber(text) {
-  const t = (text || "").toString().toLowerCase();
-  const m = t.match(/\bthose\s+(\d{1,6})\s+bags?\b/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  return Number.isFinite(n) ? n : null;
 }
 
 export async function handleChatHttp(req, res) {
@@ -572,7 +504,7 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // RTK field prefix guardrail
+    // RTK field prefix guardrail (now lives in domains/fields.js)
     const prefix = looksLikeRtkFieldPrefix(userText);
     if (prefix) {
       try {
@@ -595,7 +527,7 @@ export async function handleChatHttp(req, res) {
       } catch {}
     }
 
-    // "that tower" follow-up helper
+    // "that tower" follow-up helper (now lives in domains/rtkTowers.js)
     if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
       const t = norm(userText);
       if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
@@ -663,6 +595,9 @@ export async function handleChatHttp(req, res) {
               if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
                 sawQualifyingBagRows = true;
               }
+              // NOTE: sqlLooksLikeCapacityChain is intentionally kept (domain helper) for future enforcement expansions.
+              // We do not change behavior here.
+              if (sqlLooksLikeCapacityChain(sqlLower)) { /* no-op */ }
             } catch {}
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
