@@ -1,11 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-15-handleChat-sqlFirst42-bushelCommit-inventorySkuChain-partialCap-noStatus
+// Rev: 2026-01-15-handleChat-sqlFirst43-putDownOnly-viewOnly-partialCap-noStatus
 //
 // FIX (per Dane, HARD):
-// ✅ Partial bag calculator fix (IN HANDLE CHAT; no DB schema change required):
-//    - Partial feet must be capped by countPartial * lengthFt
+// ✅ Suggestion enforced: ONLY look at PUT DOWN bags.
+//    - Pickups NEVER represent inventory directly.
+//    - Pickups ONLY adjust putDown via appliedTo.
+//    - For “bags down now” + bushels now, ALWAYS use v_grainBag_open_remaining (putDown-adjusted truth).
+//    - Do NOT query grainBagEvents where type='pickUp' to compute totals.
+// ✅ Partial bag calculator fix (IN HANDLE CHAT; no DB storage required):
 //    - effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * lengthFt)
-//    - partialCornBu = (effectiveFeet / lengthFt) * bushelsCorn
 // ✅ MANDATORY COMMIT RULE:
 //    If grain bag rows exist AND user asks for bushels -> MUST compute bushels.
 // ✅ NO STATUS:
@@ -279,20 +282,25 @@ Crop aliases:
 ${cropAliasLines}
 
 ========================
+GRAIN BAGS — PUTDOWN ONLY (HARD)
+========================
+- ONLY putDown bags count as inventory.
+- pickUp entries NEVER represent inventory; they ONLY adjust putDown via appliedTo.
+- Therefore: for "bags down now" and "bushels in bags now", ALWAYS query:
+  v_grainBag_open_remaining (this is putDown-adjusted truth).
+- DO NOT query grainBagEvents where type='pickUp' for totals.
+
+========================
 GRAIN BAGS — NO STATUS (HARD)
 ========================
 Do NOT rely on ANY "status" concept to decide if bags are down.
-"Down now" is computed strictly from putDown minus appliedTo pickups.
-
-Prefer:
-- v_grainBag_open_remaining
 
 ========================
 GRAIN BAG BUSHELS — REQUIRED MATH (HARD)
 ========================
 When user asks for BUSHELS in grain bags, you MUST compute.
 
-Preferred source:
+Preferred source (PUTDOWN-adjusted truth):
 - v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartial,remainingPartialFeetSum,fieldName)
 
 IMPORTANT: bagSkuId is NOT a productsGrainBags id.
@@ -311,12 +319,8 @@ Compute CORN-rated bushels:
 - fullCornBu = remainingFull * pgb.bushelsCorn
 
 PARTIALS (HARD — DO NOT OVERCOUNT):
-- remainingPartial is the count of partial bags remaining.
-- remainingPartialFeetSum is the total filled feet across partial bags.
-- You MUST cap feet by the number of partial bags:
-  effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)
+- effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)
 - partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn
-
 - totalCornBu = fullCornBu + partialCornBu
 
 Apply crop factor:
@@ -346,7 +350,7 @@ function captureLastTowerNameFromAssistant(text) {
   const t = safeStr(text);
   let m = t.match(/tower[^.\n]*?\bis named\s+"([^"]+)"\b/i);
   if (m && m[1]) return m[1].trim();
-  m = t.match(/rtk tower[^.\n]*?\b([A-Za-z0-9][A-Za-z0-9 \\-']{2,})\b/i);
+  m = t.match(/rtk tower[^.\n]*?\b([A-Za-z0-9][A-Za-z0-9 \-']{2,})\b/i);
   if (m && m[1]) return m[1].trim();
   return "";
 }
@@ -356,7 +360,7 @@ function captureLastBagCtxFromAssistant(text) {
   const s = safeStr(text || "");
   if (!s) return null;
 
-  const re = /\\b(?:found|there are|i found)\\s+(\\d{1,6})\\s+([a-z]+)\\s+(?:grain\\s+)?bags?\\b/i;
+  const re = /\b(?:found|there are|i found)\s+(\d{1,6})\s+([a-z]+)\s+(?:grain\s+)?bags?\b/i;
   const m = s.match(re);
   if (!m) return null;
 
@@ -379,7 +383,7 @@ function userAsksTowerDetails(text) {
 function pickCandidateFromUserReply(userText, candidates) {
   const t = safeStr(userText).trim();
 
-  const mNum = t.match(/^\\s*(\\d{1,2})\\s*$/);
+  const mNum = t.match(/^\s*(\d{1,2})\s*$/);
   if (mNum) {
     const n = parseInt(mNum[1], 10);
     if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) return candidates[n - 1] || null;
@@ -402,7 +406,7 @@ function looksLikeRtkFieldPrefix(text) {
   const t = norm(text);
   if (!t.includes("rtk")) return null;
   if (!t.includes("field")) return null;
-  const m = t.match(/\\bfield\\s*[:#]?\\s*(\\d{3,5})\\b/);
+  const m = t.match(/\bfield\s*[:#]?\s*(\d{3,5})\b/);
   if (!m) return null;
   const prefix = m[1];
   if (t.includes(`${prefix}-`)) return null;
@@ -436,8 +440,8 @@ function userAsksBagBushels(text) {
   const t = (text || "").toString().toLowerCase();
   if (!t) return false;
 
-  const hasBushelWord = /\\bbushels?\\b/.test(t);
-  const hasBu = /\\bbu\\b/.test(t) || /\\bbu\\.\\b/.test(t);
+  const hasBushelWord = /\bbushels?\b/.test(t);
+  const hasBu = /\bbu\b/.test(t) || /\bbu\.\b/.test(t);
   if (!(hasBushelWord || hasBu)) return false;
 
   const bagContext = t.includes("bag") && (t.includes("grain") || t.includes("field") || t.includes("bags") || t.includes("those"));
@@ -452,20 +456,21 @@ function userAsksGroupedByField(text) {
     t.includes("grouped by field") ||
     t.includes("per field") ||
     t.includes("each field") ||
-    (t.includes("fields") && (t.includes("bushel") || /\\bbu\\b/.test(t)))
+    (t.includes("fields") && (t.includes("bushel") || /\bbu\b/.test(t)))
   );
 }
 
 function assistantHasBushelNumber(text) {
   const s = safeStr(text);
   if (!s) return false;
-  const re = /\\b\\d[\\d,]*\\.?\\d*\\s*(bu|bushels?)\\b/i;
+  const re = /\b\d[\d,]*\.?\d*\s*(bu|bushels?)\b/i;
   return re.test(s);
 }
 
 function sqlLooksLikeBagRows(sqlLower) {
   if (!sqlLower) return false;
-  return (sqlLower.includes("v_grainbag_open_remaining") || sqlLower.includes("grainbagevents"));
+  // We ONLY want the view for "bags down now" totals.
+  return sqlLower.includes("v_grainbag_open_remaining");
 }
 
 function sqlLooksLikeCapacityChain(sqlLower) {
@@ -488,7 +493,7 @@ function userReferencesThoseBags(text) {
 
 function extractExplicitBagNumber(text) {
   const t = (text || "").toString().toLowerCase();
-  const m = t.match(/\\bthose\\s+(\\d{1,6})\\s+bags?\\b/);
+  const m = t.match(/\bthose\s+(\d{1,6})\s+bags?\b/);
   if (!m) return null;
   const n = parseInt(m[1], 10);
   return Number.isFinite(n) ? n : null;
@@ -551,12 +556,10 @@ export async function handleChatHttp(req, res) {
           userText,
           "",
           `IMPORTANT CONTEXT: The user is referring to the previously mentioned ${thread.lastBagCtx.bagCount} ${thread.lastBagCtx.cropType} grain bags.`,
-          `Compute BUSHELS for those bags using v_grainBag_open_remaining`,
-          `JOIN inventoryGrainBagMovements (inv.id = v.bagSkuId)`,
-          `JOIN productsGrainBags (pgb.id = inv.productId)`,
-          `then full + partial-feet math + crop factor.`,
-          `PARTIALS MUST BE CAPPED: effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt).`,
-          `Do NOT use or mention any status concept.`
+          `Compute BUSHELS using ONLY v_grainBag_open_remaining (PUTDOWN-adjusted truth).`,
+          `Do NOT query pickUp rows for totals.`,
+          `Capacity chain: v.bagSkuId -> inventoryGrainBagMovements.id -> productsGrainBags.id.`,
+          `PARTIALS MUST BE CAPPED: effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt).`
         ].join("\n");
       }
     }
@@ -717,7 +720,7 @@ export async function handleChatHttp(req, res) {
     let text = extractAssistantText(rsp) || "No answer.";
 
     /* =====================================================================
-       ✅ MANDATORY BUSHEL COMMIT (ENFORCEMENT PASS)
+       ✅ MANDATORY BUSHEL COMMIT (ENFORCEMENT PASS) — PUTDOWN ONLY / VIEW ONLY
     ===================================================================== */
     if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
       input_list.push({
@@ -725,27 +728,24 @@ export async function handleChatHttp(req, res) {
         content: [
           "MANDATORY COMMIT RULE ENFORCEMENT:",
           "You have qualifying grain bag rows (rowCount > 0). The user asked for BUSHELS.",
-          "Do NOT stop after bag counts. You MUST compute and return numeric bushel totals by completing the full bag bushel pipeline.",
           "",
-          "Use the REAL capacity chain (no status):",
-          "- Start from v_grainBag_open_remaining (remainingFull, remainingPartial, remainingPartialFeetSum, cropType, cropYear, bagSkuId, fieldName).",
-          "- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId.",
-          "- JOIN productsGrainBags pgb ON pgb.id = inv.productId.",
-          "- Use pgb.bushelsCorn and pgb.lengthFt for capacity math.",
+          "HARD: ONLY use v_grainBag_open_remaining (PUTDOWN-adjusted truth).",
+          "Do NOT compute totals from pickUp rows.",
           "",
-          "PARTIALS MUST BE CAPPED (HARD):",
-          "- effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)",
+          "Capacity chain:",
+          "- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId",
+          "- JOIN productsGrainBags pgb ON pgb.id = inv.productId",
+          "",
+          "Compute with partial cap:",
+          "- effectiveFeet = MIN(v.remainingPartialFeetSum, v.remainingPartial * pgb.lengthFt)",
           "- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn",
-          "",
-          "Compute:",
-          "- fullCornBu = remainingFull * pgb.bushelsCorn",
+          "- fullCornBu = v.remainingFull * pgb.bushelsCorn",
           "- totalCornBu = fullCornBu + partialCornBu",
           "- totalBu = totalCornBu * cropFactor",
           "",
-          wantsGroupedByField ? "ALSO: group by fieldName and return bushels per field plus a grand total." : "",
+          wantsGroupedByField ? "ALSO: group by v.fieldName and return bushels per field plus a grand total." : "",
           "",
-          "Return the numeric total in bushels (bu).",
-          "Do NOT say 'no bushel data available' when rows exist. Use db_query as needed."
+          "Return numeric bushels (bu). Use db_query as needed."
         ].filter(Boolean).join("\n")
       });
 
@@ -774,23 +774,11 @@ export async function handleChatHttp(req, res) {
 
           try {
             const sql = cleanSql(args.sql || "");
-            const sqlLower = sql.toLowerCase();
-
             result = runSql({
               sql,
               params: Array.isArray(args.params) ? args.params : [],
               limit: Number.isFinite(args.limit) ? args.limit : 200
             });
-
-            try {
-              const rows = Array.isArray(result?.rows) ? result.rows : [];
-              if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
-                sawQualifyingBagRows = true;
-              }
-              if (!sawCapacityChain && sqlLooksLikeCapacityChain(sqlLower)) {
-                sawCapacityChain = true;
-              }
-            } catch {}
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
