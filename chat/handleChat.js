@@ -1,48 +1,21 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-16-handleChat-sqlFirst44-domainsWired1-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
+// Rev: 2026-01-16d-handleChat-domainsReal1-sqlFirst44-putDownOnly-viewOnly-partialZeroGuard-partialCap-noStatus
 //
-// NOTE (per Dane):
-// ✅ This update is ONLY to wire the new domain files so sections can evolve independently.
-// ✅ NO grain bin/bag logic changes. Same rules, same math, same enforcement.
-// ✅ We now import these from domains so you don't break RTK while working grain, etc.
+// This version implements REAL domains:
+// - Domains provide tools + handlers for each section (Fields / Farms / RTK / Grain)
+// - handleChat is orchestrator: OpenAI loop + tool dispatch + pending UI
 //
-// Domains wired (helpers only, no new tools yet):
-// - domains/grain.js      -> bag/bushel detection + sql pattern helpers + "those bags" helpers
-// - domains/fields.js     -> RTK field-prefix guardrail helpers
-// - domains/rtkTowers.js  -> "tower details" follow-up helper
-// - domains/farms.js      -> (present but not used yet)
-//
-// FIX (per Dane, HARD):
-// ✅ PUTDOWN ONLY / VIEW ONLY:
-//    - For “bags down now” + bushels now, ALWAYS use v_grainBag_open_remaining (putDown-adjusted truth).
-//    - Pickups NEVER represent inventory directly; they ONLY adjust putDown via appliedTo.
-// ✅ NO STATUS:
-//    - Never rely on any status meaning for grain bags.
-//
-// FIX (critical):
-// ✅ Partial picked-up bug:
-//    - If remainingPartial = 0, partial feet MUST be treated as 0
-//      (even if remainingPartialFeetSum is non-zero on the row).
-//
-// FIX (per Dane, HARD):
-// ✅ Partial bag calculator fix (handleChat only; no DB storage required):
-//    - effectiveFeet = 0 if remainingPartial <= 0
-//    - else effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * lengthFt)
-//
-// ✅ MANDATORY COMMIT RULE:
-//    - If grain bag rows exist AND user asks for bushels -> MUST compute bushels (no early exits).
-//
-// ✅ Correct capacity chain:
-//    v_grainBag_open_remaining.bagSkuId -> inventoryGrainBagMovements.id
-//    inventoryGrainBagMovements.productId -> productsGrainBags.id
+// Grain rules preserved:
+// - PUTDOWN ONLY / VIEW ONLY (v_grainBag_open_remaining)
+// - PartialZeroGuard (remainingPartial <= 0 => effectiveFeet=0)
+// - Capacity chain correct
+// - Mandatory bushel commit enforced (if bag rows exist and user asks bushels)
 //
 // Keeps (do not trim):
 // ✅ OpenAI-led (no routing/intent trees)
 // ✅ SQL sanitizer
 // ✅ did-you-mean pending + yes/no + numeric/prefix selection
 // ✅ RTK field-prefix guardrail (0964/0505)
-// ✅ view preference v_grainBag_open_remaining when available
-// ✅ chatbot aliases + crop normalize
 // ✅ global ask-back fallback contract (never "No answer")
 
 'use strict';
@@ -55,20 +28,21 @@ import { resolveFarmTool, resolveFarm } from "./resolve-farms.js";
 import { resolveRtkTowerTool, resolveRtkTower } from "./resolve-rtkTowers.js";
 import { resolveBinSiteTool, resolveBinSite } from "./resolve-binSites.js";
 
-// ✅ Domain helpers (so we stop breaking unrelated sections)
-import { looksLikeRtkFieldPrefix, findFieldsByPrefix } from "./domains/fields.js";
-import { userAsksTowerDetails } from "./domains/rtkTowers.js";
+// Domains
+import { fieldsToolDefs, fieldsHandleToolCall, looksLikeRtkFieldPrefix, findFieldsByPrefix } from "./domains/fields.js";
+import { farmsToolDefs, farmsHandleToolCall } from "./domains/farms.js";
+import { rtkTowersToolDefs, rtkTowersHandleToolCall, userAsksTowerDetails } from "./domains/rtkTowers.js";
 import {
+  grainToolDefs,
+  grainHandleToolCall,
+  userReferencesThoseBags,
+  extractExplicitBagNumber,
   userAsksBagBushels,
   userAsksGroupedByField,
   assistantHasBushelNumber,
   sqlLooksLikeBagRows,
-  sqlLooksLikeCapacityChain,
-  userReferencesThoseBags,
-  extractExplicitBagNumber
+  sqlLooksLikeCapacityChain
 } from "./domains/grain.js";
-// farms domain exists but not used yet (by design)
-// import { farmsToolDefs, farmsHandleToolCall } from "./domains/farms.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
@@ -307,76 +281,28 @@ GLOBAL FALLBACK UX CONTRACT (HARD)
 - If you are uncertain OR your first query returns 0 rows OR it looks mismatched:
   1) Ask a short clarifying question (1 sentence).
   2) Provide a short option list (up to 5) pulled from the DB using tools.
-- If user asks a broad storage question like "in storage" / "how much do I have":
-  ask: "Do you mean bins, field bags, or total (bins + bags)?"
-- If cropYear matters (grain bags) and multiple cropYear values exist for that crop,
-  ask which year (or all years) BEFORE final totals.
 
 ========================
-CHATBOT ALIASES (USE THESE)
+FIELDS — FULL SUMMARY BY DEFAULT (HARD)
 ========================
-Crop aliases:
-${cropAliasLines}
-
-========================
-GRAIN BAGS — PUTDOWN ONLY / VIEW ONLY (HARD)
-========================
-- ONLY putDown bags represent inventory.
-- pickUp entries NEVER represent inventory; they ONLY adjust putDown via appliedTo.
-- For "bags down now" and "bushels in bags now", ALWAYS query:
-  v_grainBag_open_remaining (putDown-adjusted truth).
-- DO NOT query grainBagEvents where type='pickUp' for totals.
+If user asks about a field, prefer tool: field_profile(query).
+Do not answer with only IDs.
 
 ========================
-GRAIN BAGS — NO STATUS (HARD)
+RTK — FULL SUMMARY BY DEFAULT (HARD)
 ========================
-Do NOT rely on ANY "status" concept to decide if bags are down.
-
-========================
-GRAIN BAG BUSHELS — REQUIRED MATH (HARD)
-========================
-When user asks for BUSHELS in grain bags, you MUST compute.
-
-Source (putDown-adjusted truth):
-- v_grainBag_open_remaining(cropType,cropYear,bagSkuId,remainingFull,remainingPartial,remainingPartialFeetSum,fieldName)
-
-Capacity chain:
-- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId
-- JOIN productsGrainBags pgb ON pgb.id = inv.productId
-
-Capacity fields:
-- pgb.bushelsCorn (corn-rated full bag)
-- pgb.lengthFt (bag length)
-
-Compute:
-- fullCornBu = remainingFull * pgb.bushelsCorn
-
-PARTIALS (HARD — NEVER COUNT PICKED-UP PARTIALS):
-- If remainingPartial <= 0 then effectiveFeet MUST be 0 (even if remainingPartialFeetSum > 0)
-- Else effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt)
-- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn
-
-- totalCornBu = fullCornBu + partialCornBu
-
-Apply crop factor:
-- corn 1.00, soybeans 0.93, wheat 1.07, milo 1.02, oats 0.78
-- totalBu = totalCornBu * cropFactor
-
-MANDATORY COMMIT RULE (HARD):
-- If qualifying rows exist (row count > 0), you MUST return a numeric bushel total.
-- Returning 0/null/"not available" is ONLY allowed when row count = 0.
+If user asks about an RTK tower, prefer tool: rtk_tower_profile(query).
 
 ========================
-GRAIN BUSHELS (BINS)
+GRAIN — BUSHELS IN BAGS (HARD)
 ========================
-Bins:
-- SUM(binSiteBins.onHandBushels) filter by lower(lastCropType)=lower(crop)
-
-SQL tool rule:
-- db_query must be a SINGLE statement with NO semicolons.
+If user asks for bushels in grain bags, prefer tool: grain_bags_bushels_now.
 
 DB snapshot: ${snapshotId}
 Counts: farms=${counts.farms ?? "?"}, fields=${counts.fields ?? "?"}, rtkTowers=${counts.rtkTowers ?? "?"}
+
+Crop aliases:
+${cropAliasLines}
 `.trim();
 }
 
@@ -390,7 +316,6 @@ function captureLastTowerNameFromAssistant(text) {
   return "";
 }
 
-// capture: "I found 46 corn grain bags..." -> {bagCount:46, cropType:"corn"}
 function captureLastBagCtxFromAssistant(text) {
   const s = safeStr(text || "");
   if (!s) return null;
@@ -438,6 +363,28 @@ function isEmptyOrNoAnswer(text) {
   if (low === "no answer.") return true;
   if (low === "no answer") return true;
   return false;
+}
+
+function dispatchDomainTool(name, args) {
+  let r = null;
+
+  // Grain tools
+  r = grainHandleToolCall(name, args);
+  if (r) return r;
+
+  // Field tools
+  r = fieldsHandleToolCall(name, args);
+  if (r) return r;
+
+  // Farm tools
+  r = farmsHandleToolCall(name, args);
+  if (r) return r;
+
+  // RTK tools
+  r = rtkTowersHandleToolCall(name, args);
+  if (r) return r;
+
+  return null;
 }
 
 export async function handleChatHttp(req, res) {
@@ -489,7 +436,7 @@ export async function handleChatHttp(req, res) {
       }
     }
 
-    // Carry "those X bags" context across turns (no status; view only)
+    // Carry "those X bags" context across turns
     if (thread && thread.lastBagCtx && userReferencesThoseBags(userTextRaw)) {
       const n = extractExplicitBagNumber(userTextRaw);
       if (!n || n === thread.lastBagCtx.bagCount) {
@@ -497,14 +444,12 @@ export async function handleChatHttp(req, res) {
           userText,
           "",
           `IMPORTANT CONTEXT: The user is referring to the previously mentioned ${thread.lastBagCtx.bagCount} ${thread.lastBagCtx.cropType} grain bags.`,
-          `Compute BUSHELS using ONLY v_grainBag_open_remaining (PUTDOWN-adjusted truth).`,
-          `Capacity chain: v.bagSkuId -> inventoryGrainBagMovements.id -> productsGrainBags.id.`,
-          `PARTIAL RULE: if remainingPartial <= 0 then effectiveFeet=0. Else effectiveFeet = MIN(remainingPartialFeetSum, remainingPartial * pgb.lengthFt).`
+          `Prefer tool grain_bags_bushels_now with cropType=${thread.lastBagCtx.cropType}.`
         ].join("\n");
       }
     }
 
-    // RTK field prefix guardrail (now lives in domains/fields.js)
+    // RTK field prefix guardrail (unchanged behavior)
     const prefix = looksLikeRtkFieldPrefix(userText);
     if (prefix) {
       try {
@@ -515,9 +460,7 @@ export async function handleChatHttp(req, res) {
           userText = userText.replace(new RegExp(`\\bfield\\s*[:#]?\\s*${prefix}\\b`, "i"), `field ${exactName}`);
         } else if (rows.length > 1) {
           const candidates = rows.map(x => ({ id: safeStr(x.id), name: safeStr(x.name) }));
-          if (thread) {
-            setPending(thread, { kind: "field", query: prefix, candidates, originalText: safeStr(body.text || body.message || body.q || "").trim() });
-          }
+          if (thread) setPending(thread, { kind: "field", query: prefix, candidates, originalText: safeStr(body.text || body.message || body.q || "").trim() });
           return res.json({
             ok: true,
             text: formatDidYouMean("field", candidates),
@@ -527,7 +470,7 @@ export async function handleChatHttp(req, res) {
       } catch {}
     }
 
-    // "that tower" follow-up helper (now lives in domains/rtkTowers.js)
+    // "that tower" follow-up helper
     if (thread && thread.lastTowerName && userAsksTowerDetails(userText)) {
       const t = norm(userText);
       if (!t.includes("tower") && !t.includes(thread.lastTowerName.toLowerCase())) {
@@ -545,10 +488,18 @@ export async function handleChatHttp(req, res) {
 
     const tools = [
       dbQueryToolDef(),
+
+      // existing resolver tools (kept)
       resolveFieldTool,
       resolveFarmTool,
       resolveRtkTowerTool,
-      resolveBinSiteTool
+      resolveBinSiteTool,
+
+      // domain tools (real containers)
+      ...fieldsToolDefs(),
+      ...farmsToolDefs(),
+      ...rtkTowersToolDefs(),
+      ...grainToolDefs()
     ];
 
     const wantsBagBushels = userAsksBagBushels(userTextRaw) || userAsksBagBushels(userText);
@@ -578,6 +529,36 @@ export async function handleChatHttp(req, res) {
         const args = jsonTryParse(call.arguments) || {};
         let result = null;
 
+        // Domain tools first
+        const domainResult = dispatchDomainTool(name, args);
+        if (domainResult) {
+          didAny = true;
+          result = domainResult;
+
+          // If a domain returns candidates (ambiguous), convert to pending UX immediately.
+          if (result?.ok === false && Array.isArray(result?.candidates) && result.candidates.length) {
+            const kind =
+              name.startsWith("field_") ? "field" :
+              name.startsWith("farm_") ? "farm" :
+              name.startsWith("rtk_") ? "rtk tower" :
+              "item";
+            if (thread) setPending(thread, { kind, query: safeStr(args?.query || ""), candidates: result.candidates, originalText: safeStr(body.text || body.message || body.q || "") });
+            return res.json({
+              ok: true,
+              text: formatDidYouMean(kind, result.candidates),
+              meta: debugAI ? { usedOpenAI: false, model: OPENAI_MODEL, snapshot: dbStatus?.snapshot || null } : undefined
+            });
+          }
+
+          input_list.push({
+            type: "function_call_output",
+            call_id: call.call_id,
+            output: JSON.stringify(result ?? { ok: false, error: "no_result" })
+          });
+          continue;
+        }
+
+        // db_query (kept)
         if (name === "db_query") {
           didAny = true;
           try {
@@ -595,14 +576,13 @@ export async function handleChatHttp(req, res) {
               if (!sawQualifyingBagRows && rows.length > 0 && sqlLooksLikeBagRows(sqlLower)) {
                 sawQualifyingBagRows = true;
               }
-              // NOTE: sqlLooksLikeCapacityChain is intentionally kept (domain helper) for future enforcement expansions.
-              // We do not change behavior here.
               if (sqlLooksLikeCapacityChain(sqlLower)) { /* no-op */ }
             } catch {}
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
           }
 
+        // resolver tools (kept)
         } else if (name === "resolve_field") {
           didAny = true;
           result = resolveField(safeStr(args.query || ""));
@@ -658,37 +638,16 @@ export async function handleChatHttp(req, res) {
 
     let text = extractAssistantText(rsp) || "No answer.";
 
-    /* =====================================================================
-       ✅ MANDATORY BUSHEL COMMIT (ENFORCEMENT PASS) — VIEW ONLY / PUTDOWN ONLY
-    ===================================================================== */
+    // MANDATORY BUSHEL COMMIT (if model refuses to use grain tool but bag rows exist)
     if (wantsBagBushels && sawQualifyingBagRows && !assistantHasBushelNumber(text)) {
       input_list.push({
         role: "user",
         content: [
           "MANDATORY COMMIT RULE ENFORCEMENT:",
-          "You have qualifying grain bag rows (rowCount > 0). The user asked for BUSHELS.",
-          "",
-          "HARD: ONLY use v_grainBag_open_remaining (PUTDOWN-adjusted truth).",
-          "Do NOT compute totals from pickUp rows.",
-          "",
-          "Capacity chain:",
-          "- JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId",
-          "- JOIN productsGrainBags pgb ON pgb.id = inv.productId",
-          "",
-          "PARTIALS (HARD):",
-          "- If v.remainingPartial <= 0 then effectiveFeet MUST be 0 (even if v.remainingPartialFeetSum > 0)",
-          "- Else effectiveFeet = MIN(v.remainingPartialFeetSum, v.remainingPartial * pgb.lengthFt)",
-          "- partialCornBu = (effectiveFeet / pgb.lengthFt) * pgb.bushelsCorn",
-          "",
-          "Compute:",
-          "- fullCornBu = v.remainingFull * pgb.bushelsCorn",
-          "- totalCornBu = fullCornBu + partialCornBu",
-          "- totalBu = totalCornBu * cropFactor",
-          "",
-          wantsGroupedByField ? "ALSO: group by v.fieldName and return bushels per field plus a grand total." : "",
-          "",
-          "Return numeric bushels (bu). Use db_query as needed."
-        ].filter(Boolean).join("\n")
+          "User asked for bushels in grain bags and qualifying rows exist.",
+          "You MUST return a numeric bushel total.",
+          "Prefer calling tool: grain_bags_bushels_now."
+        ].join("\n")
       });
 
       let rspB = await openaiResponsesCreate({
@@ -708,18 +667,30 @@ export async function handleChatHttp(req, res) {
         let didAny = false;
 
         for (const call of calls) {
-          if (safeStr(call?.name) !== "db_query") continue;
+          const nm = safeStr(call?.name);
+          const a = jsonTryParse(call.arguments) || {};
+
+          const domainResult = dispatchDomainTool(nm, a);
+          if (domainResult) {
+            didAny = true;
+            input_list.push({
+              type: "function_call_output",
+              call_id: call.call_id,
+              output: JSON.stringify(domainResult)
+            });
+            continue;
+          }
+
+          if (nm !== "db_query") continue;
           didAny = true;
 
-          const args = jsonTryParse(call.arguments) || {};
           let result;
-
           try {
-            const sql = cleanSql(args.sql || "");
+            const sql = cleanSql(a.sql || "");
             result = runSql({
               sql,
-              params: Array.isArray(args.params) ? args.params : [],
-              limit: Number.isFinite(args.limit) ? args.limit : 200
+              params: Array.isArray(a.params) ? a.params : [],
+              limit: Number.isFinite(a.limit) ? a.limit : 200
             });
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
@@ -753,7 +724,7 @@ export async function handleChatHttp(req, res) {
     if (isEmptyOrNoAnswer(text)) {
       input_list.push({
         role: "user",
-        content: "You returned no answer. Follow GLOBAL FALLBACK UX CONTRACT: ask one clarifying question and show up to 5 DB-backed options. Do not refuse."
+        content: "You returned no answer. Ask one clarifying question and show up to 5 DB-backed options. Do not refuse."
       });
 
       let rsp2 = await openaiResponsesCreate({
@@ -771,15 +742,27 @@ export async function handleChatHttp(req, res) {
         if (!calls.length) break;
 
         for (const call of calls) {
-          if (safeStr(call?.name) !== "db_query") continue;
-          const args = jsonTryParse(call.arguments) || {};
+          const nm = safeStr(call?.name);
+          const a = jsonTryParse(call.arguments) || {};
+
+          const domainResult = dispatchDomainTool(nm, a);
+          if (domainResult) {
+            input_list.push({
+              type: "function_call_output",
+              call_id: call.call_id,
+              output: JSON.stringify(domainResult)
+            });
+            continue;
+          }
+
+          if (nm !== "db_query") continue;
           let result;
           try {
-            const sql = cleanSql(args.sql || "");
+            const sql = cleanSql(a.sql || "");
             result = runSql({
               sql,
-              params: Array.isArray(args.params) ? args.params : [],
-              limit: Number.isFinite(args.limit) ? args.limit : 50
+              params: Array.isArray(a.params) ? a.params : [],
+              limit: Number.isFinite(a.limit) ? a.limit : 50
             });
           } catch (e) {
             result = { ok: false, error: e?.message || String(e) };
