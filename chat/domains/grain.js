@@ -1,13 +1,18 @@
 // /chat/domains/grain.js  (FULL FILE)
-// Rev: 2026-01-16p  domain:grain
+// Rev: 2026-01-16q  domain:grain
 //
-// Phone-safe hotfix (no SQL debugging needed):
-// ✅ Reject invalid cropYear (0, null, junk) — treat as unspecified
-// ✅ Pick BEST year with bags > 0 (never pick a 0-bag year)
-// ✅ Always return a useful answer (no “tell me what you meant”)
-// ✅ Provide by-crop breakdown so “How many are soybeans?” works
+// RULES (HARD):
+// ✅ NEVER mention 0-bag years (like 2024) unless user explicitly asked that year.
+// ✅ When year is not specified, silently use the most recent cropYear with bags > 0.
+// ✅ If OpenAI passes a year that totals 0 but another year has bags, silently switch to the best year.
+// ✅ NEVER output "for 0" or any invalid year.
 //
-// Exports match handleChat imports.
+// Tools:
+// - grain_bags_entry (summary + breakdown)
+// - grain_bags_count_now
+// - grain_bags_where_now
+//
+// Exports kept for handleChat imports.
 
 'use strict';
 
@@ -18,7 +23,6 @@ function norm(v){ return safeStr(v).trim().toLowerCase(); }
 function num(v){ const x = Number(v); return Number.isFinite(x) ? x : 0; }
 function round0(v){ return Math.round(Number(v)||0); }
 
-const CURRENT_YEAR = new Date().getFullYear();
 const CROPS = ["corn","soybeans","wheat","milo","oats"];
 
 function normalizeCrop(c){
@@ -38,10 +42,9 @@ function normalizeYear(y){
   return yi;
 }
 
-/* ---------- core totals ---------- */
+/* ---------- totals by year ---------- */
 
 function yearTotalsAll(){
-  // IMPORTANT: we only care about years with bags > 0
   const r = runSql({
     sql: `
       SELECT cropYear,
@@ -50,6 +53,7 @@ function yearTotalsAll(){
       GROUP BY cropYear
       ORDER BY cropYear DESC
     `,
+    params: [],
     limit: 200
   });
   const rows = Array.isArray(r?.rows) ? r.rows : [];
@@ -65,11 +69,13 @@ function bestYearWithBags(){
   return nonZero[0].year; // most recent with bags > 0
 }
 
-function totalBagsAll(year){
+function totalBagsAllForYear(year){
   const r = runSql({
-    sql: `SELECT SUM(COALESCE(remainingFull,0)+COALESCE(remainingPartial,0)) AS bags
-          FROM v_grainBag_open_remaining
-          WHERE cropYear=?`,
+    sql: `
+      SELECT SUM(COALESCE(remainingFull,0)+COALESCE(remainingPartial,0)) AS bags
+      FROM v_grainBag_open_remaining
+      WHERE cropYear=?
+    `,
     params: [year],
     limit: 1
   });
@@ -123,18 +129,17 @@ function whereByFieldAll(year){
 
 /* =====================================================================
    TOOL DEFS
-   Keep names handleChat expects, plus a single entry tool that OpenAI can always pick.
 ===================================================================== */
 export function grainToolDefs(){
   return [
     {
       type: "function",
       name: "grain_bags_entry",
-      description: "ENTRY: grain bag summary (count + crop breakdown). Always returns an answer.",
+      description: "ENTRY: grain bag totals + crop breakdown (uses best year automatically if needed).",
       parameters: {
         type: "object",
         properties: {
-          cropYear: { type: "number" }
+          cropYear: { type: "number", description: "Optional crop year (YYYY)" }
         }
       }
     },
@@ -167,47 +172,41 @@ export function grainToolDefs(){
    TOOL HANDLER
 ===================================================================== */
 export function grainHandleToolCall(name, args){
-  const cropYear = normalizeYear(args?.cropYear);
+  const reqYear = normalizeYear(args?.cropYear);
 
-  // Decide year safely
-  let year = cropYear;
-  let note = "";
+  // Choose year:
+  // - If requested year is valid AND has >0, use it
+  // - Otherwise, silently use bestYearWithBags()
+  let year = null;
+
+  if (reqYear != null) {
+    const tot = totalBagsAllForYear(reqYear);
+    if (tot > 0) year = reqYear;
+  }
 
   if (year == null) {
-    const best = bestYearWithBags();
-    if (best == null) {
-      const noneText = "You have 0 grain bags.";
-      if (name === "grain_bags_where_now") return { ok:true, text:noneText };
-      return { ok:true, text:noneText };
-    }
-    year = best;
-    if (year !== CURRENT_YEAR) note = `Note: using ${year} (most recent crop year with grain bags).`;
-  } else {
-    // If user/LLM supplied a valid year but it’s 0-bag, fall back to best >0 year
-    const tot = totalBagsAll(year);
-    if (tot <= 0) {
-      const best = bestYearWithBags();
-      if (best != null && best !== year) {
-        note = `Note: ${year} has 0 grain bags; using ${best}.`;
-        year = best;
-      }
+    year = bestYearWithBags();
+    if (year == null) {
+      // No bags anywhere
+      if (name === "grain_bags_where_now") return { ok:true, text:"You have 0 grain bags." };
+      if (name === "grain_bags_count_now") return { ok:true, text:"You have 0 grain bags." };
+      if (name === "grain_bags_entry") return { ok:true, text:"You have 0 grain bags." };
+      return { ok:true, text:"You have 0 grain bags." };
     }
   }
 
   if (name === "grain_bags_entry") {
-    const total = totalBagsAll(year);
+    const total = totalBagsAllForYear(year);
     const byCrop = breakdownByCrop(year);
-
     const nonZeroCrops = [...byCrop.entries()].filter(([,n]) => n > 0);
 
     const lines = [];
-    if (note) lines.push(note, "");
     lines.push(`You have ${round0(total)} grain bags (crop year ${year}).`);
 
     if (nonZeroCrops.length === 1) {
       lines.push(`All bags are ${nonZeroCrops[0][0]}.`);
     } else if (nonZeroCrops.length > 1) {
-      lines.push("Breakdown by crop:");
+      lines.push(`Breakdown by crop:`);
       for (const c of CROPS) {
         const v = byCrop.get(c) || 0;
         if (v > 0) lines.push(`- ${c}: ${round0(v)} bags`);
@@ -218,14 +217,12 @@ export function grainHandleToolCall(name, args){
   }
 
   if (name === "grain_bags_count_now") {
-    const total = totalBagsAll(year);
-    const msg = `You have ${round0(total)} grain bags (crop year ${year}).`;
-    return { ok:true, text: note ? `${note}\n\n${msg}` : msg };
+    const total = totalBagsAllForYear(year);
+    return { ok:true, text:`You have ${round0(total)} grain bags (crop year ${year}).` };
   }
 
   if (name === "grain_bags_where_now") {
-    const msg = whereByFieldAll(year);
-    return { ok:true, text: note ? `${note}\n\n${msg}` : msg };
+    return { ok:true, text: whereByFieldAll(year) };
   }
 
   return null;
