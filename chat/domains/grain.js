@@ -1,19 +1,10 @@
 // /chat/domains/grain.js  (FULL FILE)
-// Rev: 2026-01-16h  domain:grain
+// Rev: 2026-01-16i  domain:grain
 //
-// FIX (critical):
-// ✅ NEVER default cropYear silently.
-// ✅ If cropYear omitted:
-//    - If EXACTLY ONE cropYear has bags > 0 -> AUTO USE IT (no follow-up), but mention the year.
-//    - If 2+ cropYears have bags > 0 -> ask which year (or offer both).
-//    - Only say "0" when ALL crop years are 0 OR no crop years exist.
-//
-// Tools:
-// - grain_bags_count_now
-// - grain_bags_where_now
-// - grain_bags_priority_pickup_now
-// - grain_bags_years
-// - grain_bags_bushels_now
+// Goal: Grain domain ALWAYS answers grain-bag questions correctly.
+// - cropType omitted: return totals across crops; ask only if multiple cropYears have non-zero bags.
+// - cropType provided, cropYear omitted: auto-use only non-zero year; ask only if 2+ non-zero years.
+// - NEVER say "none in any crop year" unless actually true.
 //
 // HARD RULES (kept):
 // - PUTDOWN ONLY / VIEW ONLY: v_grainBag_open_remaining is truth.
@@ -27,8 +18,10 @@ import { runSql } from "../sqlRunner.js";
 function safeStr(v){ return (v==null?"":String(v)); }
 function norm(v){ return safeStr(v).trim().toLowerCase(); }
 function num(v){ const x = Number(v); return Number.isFinite(x)?x:0; }
+function round0(v){ return Math.round(Number(v)||0); }
 
 const CROP_FACTOR = { corn:1.00, soybeans:0.93, wheat:1.07, milo:1.02, oats:0.78 };
+const KNOWN_CROPS = ["corn","soybeans","wheat","milo","oats"];
 const CURRENT_CROP_YEAR = (new Date()).getFullYear();
 
 function normalizeCrop(c){
@@ -36,68 +29,26 @@ function normalizeCrop(c){
   if (!t) return "";
   if (t === "soy" || t === "beans" || t === "sb") return "soybeans";
   if (t === "sorghum") return "milo";
+  if (t === "maize" || t === "kern") return "corn";
   return t;
 }
 
 function cropFactorFor(c){
   const k = norm(c);
-  return Object.prototype.hasOwnProperty.call(CROP_FACTOR, k) ? CROP_FACTOR[k] : null;
+  return Object.prototype.hasOwnProperty.call(CROP_FACTOR,k) ? CROP_FACTOR[k] : null;
 }
 
-function round0(n){ return Math.round(Number(n)||0); }
+/* ---------------- basic discovery ---------------- */
 
-/* ---------------- schema helpers (priority flag) ---------------- */
-
-function pragmaCols(tableOrViewName){
-  const name = safeStr(tableOrViewName).trim();
-  if (!name) return [];
-  try {
-    const r = runSql({
-      sql: `SELECT name, type FROM pragma_table_info('${name.replace(/'/g,"''")}') ORDER BY cid`,
-      params: [],
-      limit: 500
-    });
-    const rows = Array.isArray(r?.rows) ? r.rows : [];
-    return rows.map(x => ({ name: safeStr(x.name), type: safeStr(x.type) }));
-  } catch {
-    return [];
-  }
+function listYearsAll() {
+  const r = runSql({
+    sql: `SELECT DISTINCT cropYear FROM v_grainBag_open_remaining ORDER BY cropYear DESC`,
+    params: [],
+    limit: 50
+  });
+  const rows = Array.isArray(r?.rows) ? r.rows : [];
+  return rows.map(x => Number(x.cropYear)).filter(Number.isFinite);
 }
-
-function findPriorityColumn(cols){
-  const map = new Map((cols||[]).map(c => [norm(c.name), c.name]));
-  const candidates = [
-    "pickuppriority","pickup_priority","pickupPriority",
-    "prioritypickup","priority_pickup","priorityPickup",
-    "priority_for_pickup","priorityForPickup",
-    "priority","ispriority","is_priority","isPriority",
-    "highpriority","high_priority","highPriority"
-  ];
-  for (const k of candidates){
-    const real = map.get(norm(k));
-    if (real) return real;
-  }
-  const hits = (cols||[]).map(c => c.name).filter(nm => norm(nm).includes("priority"));
-  return hits.length ? hits[0] : "";
-}
-
-function buildPrioritySpec(){
-  const viewCols = pragmaCols("v_grainBag_open_remaining");
-  const viewCol = findPriorityColumn(viewCols);
-  if (viewCol) return { source:"view", col:viewCol };
-
-  const invCols = pragmaCols("inventoryGrainBagMovements");
-  const invCol = findPriorityColumn(invCols);
-  if (invCol) return { source:"inv", col:invCol };
-
-  return null;
-}
-
-function truthyExpr(alias, col){
-  return `(${alias}.${col} = 1 OR lower(CAST(${alias}.${col} AS TEXT)) IN ('true','t','yes','y','1'))`;
-}
-
-/* ---------------- year logic (the big fix) ---------------- */
 
 function listYearsForCrop(cropType){
   const c = normalizeCrop(cropType);
@@ -113,13 +64,12 @@ function listYearsForCrop(cropType){
     limit: 50
   });
   const rows = Array.isArray(r?.rows) ? r.rows : [];
-  return rows.map(x => Number(x.cropYear)).filter(y => Number.isFinite(y));
+  return rows.map(x => Number(x.cropYear)).filter(Number.isFinite);
 }
 
-function bagCountForYear(cropType, cropYear){
+function bagCountForCropYear(cropType, cropYear){
   const c = normalizeCrop(cropType);
   if (!c || !Number.isFinite(cropYear)) return 0;
-
   const r = runSql({
     sql: `
       SELECT
@@ -132,85 +82,91 @@ function bagCountForYear(cropType, cropYear){
     limit: 1
   });
   const row = Array.isArray(r?.rows) && r.rows.length ? r.rows[0] : {};
-  return num(row.fullBags) + num(row.partialBags);
+  return num(row.fullBags)+num(row.partialBags);
 }
 
-function summarizeYearsForCrop(cropType){
+function bagCountAllCropsForYear(cropYear){
+  if (!Number.isFinite(cropYear)) return 0;
+  const r = runSql({
+    sql: `
+      SELECT
+        SUM(COALESCE(v.remainingFull,0)) AS fullBags,
+        SUM(COALESCE(v.remainingPartial,0)) AS partialBags
+      FROM v_grainBag_open_remaining v
+      WHERE v.cropYear=?
+    `,
+    params: [Number(cropYear)],
+    limit: 1
+  });
+  const row = Array.isArray(r?.rows) && r.rows.length ? r.rows[0] : {};
+  return num(row.fullBags)+num(row.partialBags);
+}
+
+/* ---------------- year decision helpers ---------------- */
+
+function decideYearForCropOrAsk(cropType){
   const c = normalizeCrop(cropType);
   const years = listYearsForCrop(c);
-  if (!years.length) return { years: [], nonZero: [], summary: [] };
+  if (!years.length) return { kind:"none", text:`No open ${c} grain bag rows found in any crop year.` };
 
-  // Evaluate up to 8 years to be safe (still fast)
-  const summary = years.slice(0, 8).map(y => ({ cropYear: y, bags: bagCountForYear(c, y) }));
+  const summary = years.slice(0, 8).map(y => ({ y, bags: bagCountForCropYear(c,y) }));
   const nonZero = summary.filter(x => x.bags > 0);
 
-  return { years, nonZero, summary };
-}
+  if (!nonZero.length) return { kind:"none", text:`You have 0 ${c} grain bags in all crop years.` };
 
-/**
- * Decide year behavior:
- * - If exactly one nonZero year -> auto-use (no follow-up), but provide note.
- * - If multiple nonZero years -> ask which year (list).
- * - If none -> "none" message.
- */
-function decideYearOrAsk(cropType){
-  const c = normalizeCrop(cropType);
-  const { years, nonZero, summary } = summarizeYearsForCrop(c);
-
-  if (!years.length) {
-    return { kind: "none", text: `No open ${c} grain bag rows found in any crop year.` };
-  }
-
-  if (!nonZero.length) {
-    return { kind: "none", text: `You have 0 ${c} grain bags in all crop years.` };
-  }
-
-  // Exactly one real choice -> auto-use it
   if (nonZero.length === 1) {
-    const y = nonZero[0].cropYear;
-    // If user asked without year and current year differs, mention it
+    const y = nonZero[0].y;
     const note = (y !== CURRENT_CROP_YEAR)
       ? `Note: you have 0 ${c} grain bags for ${CURRENT_CROP_YEAR}; using ${y} because that’s the only year with ${c} grain bags.`
       : "";
-    return { kind: "use", year: y, note };
+    return { kind:"use", year:y, note };
   }
 
-  // Multiple real choices -> ask
   const lines = [];
   lines.push(`Which crop year for ${c}? I see:`);
-  for (const x of nonZero) lines.push(`- ${x.cropYear}: ${round0(x.bags).toLocaleString()} bags`);
-  lines.push(`Reply with the year, or say "all" for all years.`);
-  return { kind: "ask", text: lines.join("\n") };
+  for (const x of nonZero) lines.push(`- ${x.y}: ${round0(x.bags).toLocaleString()} bags`);
+  lines.push(`Reply with the year, or say "all".`);
+  return { kind:"ask", text: lines.join("\n") };
 }
 
-/* ---------------- SQL builders (bags) ---------------- */
+function decideYearAllCropsOrAsk(){
+  const years = listYearsAll();
+  if (!years.length) return { kind:"none", text:`No open grain bag rows found in any crop year.` };
 
-function whereSqlAndParams({ cropType, cropYear, fieldName }){
+  const summary = years.slice(0, 8).map(y => ({ y, bags: bagCountAllCropsForYear(y) }));
+  const nonZero = summary.filter(x => x.bags > 0);
+
+  if (!nonZero.length) return { kind:"none", text:`You have 0 grain bags in all crop years.` };
+
+  if (nonZero.length === 1) {
+    const y = nonZero[0].y;
+    const note = (y !== CURRENT_CROP_YEAR)
+      ? `Note: you have 0 grain bags for ${CURRENT_CROP_YEAR}; using ${y} because that’s the only year with grain bags.`
+      : "";
+    return { kind:"use", year:y, note };
+  }
+
+  const lines = [];
+  lines.push(`Which crop year for grain bags? I see:`);
+  for (const x of nonZero) lines.push(`- ${x.y}: ${round0(x.bags).toLocaleString()} bags`);
+  lines.push(`Reply with the year, or say "all".`);
+  return { kind:"ask", text: lines.join("\n") };
+}
+
+/* ---------------- shared SQL for where/bushels ---------------- */
+
+function whereSqlAndParams({ cropType, cropYear }){
   const wh = [];
   const params = [];
 
   const c = normalizeCrop(cropType);
   if (c) { wh.push("lower(v.cropType)=lower(?)"); params.push(c); }
-
   if (cropYear != null && Number.isFinite(cropYear)) { wh.push("v.cropYear=?"); params.push(Number(cropYear)); }
-
-  const fn = safeStr(fieldName).trim();
-  if (fn) { wh.push("lower(v.fieldName) LIKE lower(?)"); params.push(`%${fn}%`); }
 
   return { whereSql: wh.length ? `WHERE ${wh.join(" AND ")}` : "", params };
 }
 
-function baseSql({ whereSql, prioritySpec, requirePriority }){
-  const prioritySelect = prioritySpec
-    ? (prioritySpec.source === "view" ? `, v.${prioritySpec.col} AS priorityFlag` : `, inv.${prioritySpec.col} AS priorityFlag`)
-    : "";
-
-  const priorityWhere = (requirePriority && prioritySpec)
-    ? (prioritySpec.source === "view"
-        ? ` AND ${truthyExpr("v", prioritySpec.col)}`
-        : ` AND ${truthyExpr("inv", prioritySpec.col)}`)
-    : "";
-
+function baseSql(whereSql){
   return `
     SELECT
       v.fieldName AS fieldName,
@@ -229,18 +185,14 @@ function baseSql({ whereSql, prioritySpec, requirePriority }){
             (MIN(v.remainingPartialFeetSum, (v.remainingPartial * pgb.lengthFt)) / pgb.lengthFt) * pgb.bushelsCorn
         END
       ) AS partialCornBu
-      ${prioritySelect}
     FROM v_grainBag_open_remaining v
     JOIN inventoryGrainBagMovements inv ON inv.id = v.bagSkuId
     JOIN productsGrainBags pgb ON pgb.id = inv.productId
     ${whereSql}
-    ${requirePriority ? priorityWhere : ""}
   `;
 }
 
-function computeCornBuRow(r){
-  return (num(r.fullCornBu) + num(r.partialCornBu));
-}
+function cornBu(row){ return num(row.fullCornBu)+num(row.partialCornBu); }
 
 /* =====================================================================
    Tool defs
@@ -249,41 +201,15 @@ export function grainToolDefs(){
   return [
     {
       type:"function",
-      name:"grain_bags_years",
-      description:"List available cropYears for a cropType in grain bags.",
-      parameters:{ type:"object", properties:{ cropType:{type:"string"} }, required:["cropType"] }
-    },
-    {
-      type:"function",
       name:"grain_bags_count_now",
-      description:"Count grain bags down now (full+partial). NEVER assumes cropYear; only asks if there is more than one choice.",
+      description:"Count grain bags. cropType optional. cropYear optional. Asks ONLY if multiple real choices.",
       parameters:{ type:"object", properties:{ cropType:{type:"string"}, cropYear:{type:"number"} } }
     },
     {
       type:"function",
       name:"grain_bags_where_now",
-      description:"Where are the grain bags? Groups by fieldName; returns bags + bushels. NEVER assumes cropYear; only asks if there is more than one choice.",
+      description:"Where are grain bags (by field). cropType optional. cropYear optional. Asks ONLY if multiple real choices.",
       parameters:{ type:"object", properties:{ cropType:{type:"string"}, cropYear:{type:"number"} } }
-    },
-    {
-      type:"function",
-      name:"grain_bags_priority_pickup_now",
-      description:"High priority bags to pick up (schema-aware priority flag), grouped by field. NEVER assumes cropYear; only asks if there is more than one choice.",
-      parameters:{ type:"object", properties:{ cropType:{type:"string"}, cropYear:{type:"number"} } }
-    },
-    {
-      type:"function",
-      name:"grain_bags_bushels_now",
-      description:"Compute bushels in grain bags now. If cropYear omitted, auto-uses the only valid year; asks only if multiple years have bags.",
-      parameters:{
-        type:"object",
-        properties:{
-          cropType:{type:"string"},
-          cropYear:{type:"number"},
-          fieldName:{type:"string"},
-          groupedByField:{type:"boolean"}
-        }
-      }
     }
   ];
 }
@@ -292,192 +218,123 @@ export function grainToolDefs(){
    Tool handler
 ===================================================================== */
 export function grainHandleToolCall(name, args){
-  if (name === "grain_bags_years") {
-    const c = normalizeCrop(args?.cropType);
-    if (!c) return { ok:false, error:"missing_cropType" };
-    const years = listYearsForCrop(c);
-    if (!years.length) return { ok:true, text:`No open ${c} grain bag rows found in any crop year.` };
-    return { ok:true, text:`${c} grain bags exist in crop years: ${years.join(", ")}.` };
-  }
-
   if (name === "grain_bags_count_now") {
     const cropType = normalizeCrop(args?.cropType);
     let cropYear = Number.isFinite(args?.cropYear) ? Number(args.cropYear) : null;
-    if (!cropType) return { ok:false, error:"missing_cropType" };
 
-    let note = "";
-    if (cropYear == null) {
-      const d = decideYearOrAsk(cropType);
-      if (d.kind === "use") { cropYear = d.year; note = d.note || ""; }
-      else return { ok:true, text:d.text };
+    // If cropType omitted, treat as "all crops"
+    if (!cropType) {
+      if (cropYear == null) {
+        const d = decideYearAllCropsOrAsk();
+        if (d.kind === "use") cropYear = d.year;
+        else return { ok:true, text: d.text };
+        const total = bagCountAllCropsForYear(cropYear);
+        const msg = `You have ${round0(total).toLocaleString()} grain bags for ${cropYear} (all crops).`;
+        return { ok:true, text: d.note ? `${d.note}\n\n${msg}` : msg };
+      }
+
+      const total = bagCountAllCropsForYear(cropYear);
+      return { ok:true, text:`You have ${round0(total).toLocaleString()} grain bags for ${cropYear} (all crops).` };
     }
 
-    const total = bagCountForYear(cropType, cropYear);
-    const msg = `You have ${round0(total).toLocaleString()} ${cropType} grain bags for ${cropYear}.`;
-    return { ok:true, text: note ? `${note}\n\n${msg}` : msg };
+    // cropType provided
+    if (cropYear == null) {
+      const d = decideYearForCropOrAsk(cropType);
+      if (d.kind === "use") cropYear = d.year;
+      else return { ok:true, text: d.text };
+
+      const total = bagCountForCropYear(cropType, cropYear);
+      const msg = `You have ${round0(total).toLocaleString()} ${cropType} grain bags for ${cropYear}.`;
+      return { ok:true, text: d.note ? `${d.note}\n\n${msg}` : msg };
+    }
+
+    const total = bagCountForCropYear(cropType, cropYear);
+    return { ok:true, text:`You have ${round0(total).toLocaleString()} ${cropType} grain bags for ${cropYear}.` };
   }
 
   if (name === "grain_bags_where_now") {
     const cropType = normalizeCrop(args?.cropType);
     let cropYear = Number.isFinite(args?.cropYear) ? Number(args.cropYear) : null;
-    if (!cropType) return { ok:false, error:"missing_cropType" };
 
-    let note = "";
+    // If cropType omitted, treat as "all crops"
+    if (!cropType) {
+      if (cropYear == null) {
+        const d = decideYearAllCropsOrAsk();
+        if (d.kind === "use") cropYear = d.year;
+        else return { ok:true, text: d.text };
+      }
+
+      const { whereSql, params } = whereSqlAndParams({ cropType:"", cropYear });
+      const r = runSql({ sql: baseSql(whereSql), params, limit: 5000 });
+      const rows = Array.isArray(r?.rows) ? r.rows : [];
+
+      if (!rows.length) return { ok:true, text:`No open grain bags found for ${cropYear}.` };
+
+      // group by field and crop
+      const byField = new Map(); // field -> { bags, cornBu, byCrop:Map }
+      for (const row of rows) {
+        const field = safeStr(row.fieldName).trim() || "(Unknown Field)";
+        const crop = normalizeCrop(row.cropType);
+        const bags = num(row.remainingFull) + Math.max(0,num(row.remainingPartial));
+        const cb = cornBu(row);
+
+        const cur = byField.get(field) || { bags:0, byCrop:new Map() };
+        cur.bags += bags;
+
+        const cc = cur.byCrop.get(crop) || { bags:0, cornBu:0 };
+        cc.bags += bags;
+        cc.cornBu += cb;
+        cur.byCrop.set(crop, cc);
+
+        byField.set(field, cur);
+      }
+
+      const lines = [];
+      lines.push(`Where grain bags are ${cropYear} (all crops):`);
+      for (const field of [...byField.keys()].sort((a,b)=>a.localeCompare(b))) {
+        const cur = byField.get(field);
+        lines.push(`- ${field}: ${round0(cur.bags)} bags`);
+        for (const crop of [...cur.byCrop.keys()].sort((a,b)=>a.localeCompare(b))) {
+          const cc = cur.byCrop.get(crop);
+          const factor = cropFactorFor(crop) || 1.0;
+          const bu = cc.cornBu * factor;
+          lines.push(`  • ${crop}: ${round0(cc.bags)} bags, ${round0(bu).toLocaleString()} bu`);
+        }
+      }
+      return { ok:true, text: lines.join("\n").trim() };
+    }
+
+    // cropType provided
     if (cropYear == null) {
-      const d = decideYearOrAsk(cropType);
-      if (d.kind === "use") { cropYear = d.year; note = d.note || ""; }
-      else return { ok:true, text:d.text };
+      const d = decideYearForCropOrAsk(cropType);
+      if (d.kind === "use") cropYear = d.year;
+      else return { ok:true, text: d.text };
     }
 
     const factor = cropFactorFor(cropType) || 1.0;
+    const { whereSql, params } = whereSqlAndParams({ cropType, cropYear });
 
-    const { whereSql, params } = whereSqlAndParams({ cropType, cropYear, fieldName:"" });
-    const sql = baseSql({ whereSql, prioritySpec:null, requirePriority:false });
-
-    const r = runSql({ sql, params, limit: 5000 });
+    const r = runSql({ sql: baseSql(whereSql), params, limit: 5000 });
     const rows = Array.isArray(r?.rows) ? r.rows : [];
     if (!rows.length) return { ok:true, text:`No open ${cropType} grain bags found for ${cropYear}.` };
 
-    const byField = new Map();
+    const byField = new Map(); // field -> { bags, cornBu }
     for (const row of rows) {
-      const f = safeStr(row.fieldName).trim() || "(Unknown Field)";
-      const cur = byField.get(f) || { full:0, partial:0, cornBu:0 };
-      cur.full += num(row.remainingFull);
-      cur.partial += Math.max(0, num(row.remainingPartial));
-      cur.cornBu += computeCornBuRow(row);
-      byField.set(f, cur);
+      const field = safeStr(row.fieldName).trim() || "(Unknown Field)";
+      const bags = num(row.remainingFull) + Math.max(0,num(row.remainingPartial));
+      const cb = cornBu(row);
+      const cur = byField.get(field) || { bags:0, cornBu:0 };
+      cur.bags += bags;
+      cur.cornBu += cb;
+      byField.set(field, cur);
     }
 
     const lines = [];
-    if (note) lines.push(note, "");
     lines.push(`Where ${cropType} grain bags are ${cropYear} (by field):`);
-    for (const f of [...byField.keys()].sort((a,b)=>a.localeCompare(b))) {
-      const cur = byField.get(f);
-      const bags = cur.full + cur.partial;
-      const bu = cur.cornBu * factor;
-      lines.push(`- ${f}: ${round0(bags).toLocaleString()} bags, ${round0(bu).toLocaleString()} bu`);
+    for (const field of [...byField.keys()].sort((a,b)=>a.localeCompare(b))) {
+      const cur = byField.get(field);
+      lines.push(`- ${field}: ${round0(cur.bags)} bags, ${round0(cur.cornBu*factor).toLocaleString()} bu`);
     }
-    return { ok:true, text: lines.join("\n").trim() };
-  }
-
-  if (name === "grain_bags_priority_pickup_now") {
-    const cropType = normalizeCrop(args?.cropType);
-    let cropYear = Number.isFinite(args?.cropYear) ? Number(args.cropYear) : null;
-    if (!cropType) return { ok:false, error:"missing_cropType" };
-
-    let note = "";
-    if (cropYear == null) {
-      const d = decideYearOrAsk(cropType);
-      if (d.kind === "use") { cropYear = d.year; note = d.note || ""; }
-      else return { ok:true, text:d.text };
-    }
-
-    const prioritySpec = buildPrioritySpec();
-    if (!prioritySpec) {
-      const vCols = pragmaCols("v_grainBag_open_remaining").map(c=>c.name).filter(nm=>norm(nm).includes("priority"));
-      const iCols = pragmaCols("inventoryGrainBagMovements").map(c=>c.name).filter(nm=>norm(nm).includes("priority"));
-      const lines = [];
-      lines.push(`I can’t find a priority pickup flag column in this snapshot.`);
-      if (vCols.length) lines.push(`v_grainBag_open_remaining priority-ish columns: ${vCols.join(", ")}`);
-      if (iCols.length) lines.push(`inventoryGrainBagMovements priority-ish columns: ${iCols.join(", ")}`);
-      lines.push(`Tell me the exact field name you use for pickup priority and I’ll wire it in.`);
-      return { ok:true, text: lines.join("\n").trim() };
-    }
-
-    const factor = cropFactorFor(cropType) || 1.0;
-
-    const { whereSql, params } = whereSqlAndParams({ cropType, cropYear, fieldName:"" });
-    const sql = baseSql({ whereSql, prioritySpec, requirePriority:true });
-
-    const r = runSql({ sql, params, limit: 5000 });
-    const rows = Array.isArray(r?.rows) ? r.rows : [];
-    if (!rows.length) return { ok:true, text:`No HIGH priority ${cropType} grain bags found for ${cropYear}.` };
-
-    const byField = new Map();
-    for (const row of rows) {
-      const f = safeStr(row.fieldName).trim() || "(Unknown Field)";
-      const cur = byField.get(f) || { full:0, partial:0, cornBu:0 };
-      cur.full += num(row.remainingFull);
-      cur.partial += Math.max(0, num(row.remainingPartial));
-      cur.cornBu += computeCornBuRow(row);
-      byField.set(f, cur);
-    }
-
-    const lines = [];
-    if (note) lines.push(note, "");
-    lines.push(`HIGH priority ${cropType} grain bags to pick up ${cropYear} (by field):`);
-    for (const f of [...byField.keys()].sort((a,b)=>a.localeCompare(b))) {
-      const cur = byField.get(f);
-      const bags = cur.full + cur.partial;
-      const bu = cur.cornBu * factor;
-      lines.push(`- ${f}: ${round0(bags).toLocaleString()} bags, ${round0(bu).toLocaleString()} bu`);
-    }
-    return { ok:true, text: lines.join("\n").trim() };
-  }
-
-  if (name === "grain_bags_bushels_now") {
-    const cropType = normalizeCrop(args?.cropType);
-    let cropYear = Number.isFinite(args?.cropYear) ? Number(args.cropYear) : null;
-    const fieldName = safeStr(args?.fieldName).trim();
-    const groupedByField = !!args?.groupedByField;
-
-    let note = "";
-    if (cropType && cropYear == null) {
-      const d = decideYearOrAsk(cropType);
-      if (d.kind === "use") { cropYear = d.year; note = d.note || ""; }
-      else return { ok:true, text:d.text };
-    }
-
-    const cropFactor = cropType ? (cropFactorFor(cropType) || 1.0) : null;
-
-    const { whereSql, params } = whereSqlAndParams({ cropType, cropYear, fieldName });
-    const sql = baseSql({ whereSql, prioritySpec:null, requirePriority:false });
-
-    const r = runSql({ sql, params, limit: 5000 });
-    const rows = Array.isArray(r?.rows) ? r.rows : [];
-    if (!rows.length) return { ok:true, rowCount:0, text:"0 bu (no qualifying grain bag rows)" };
-
-    const perField = new Map();
-    let totalCornBu = 0;
-    for (const row of rows) {
-      const cornBu = computeCornBuRow(row);
-      totalCornBu += cornBu;
-      const f = safeStr(row.fieldName).trim() || "(Unknown Field)";
-      perField.set(f, (perField.get(f) || 0) + cornBu);
-    }
-
-    // corn-rated when cropType missing
-    if (!cropFactor) {
-      if (!groupedByField) {
-        const msg = `${round0(totalCornBu).toLocaleString()} bu (corn-rated)`;
-        return { ok:true, text: note ? `${note}\n\n${msg}` : msg };
-      }
-      const lines = [];
-      if (note) lines.push(note, "");
-      lines.push(`Grain bags (corn-rated):`);
-      for (const f of [...perField.keys()].sort((a,b)=>a.localeCompare(b))) {
-        lines.push(`- ${f}: ${round0(perField.get(f)).toLocaleString()} bu (corn-rated)`);
-      }
-      lines.push("");
-      lines.push(`Total: ${round0(totalCornBu).toLocaleString()} bu (corn-rated)`);
-      return { ok:true, text: lines.join("\n").trim() };
-    }
-
-    const totalBu = totalCornBu * cropFactor;
-
-    if (!groupedByField) {
-      const msg = `${round0(totalBu).toLocaleString()} bu`;
-      return { ok:true, text: note ? `${note}\n\n${msg}` : msg };
-    }
-
-    const lines = [];
-    if (note) lines.push(note, "");
-    lines.push(`Grain bags (${cropType}${cropYear!=null?` ${cropYear}`:""}) — bushels now:`);
-    for (const f of [...perField.keys()].sort((a,b)=>a.localeCompare(b))) {
-      lines.push(`- ${f}: ${round0(perField.get(f) * cropFactor).toLocaleString()} bu`);
-    }
-    lines.push("");
-    lines.push(`Total: ${round0(totalBu).toLocaleString()} bu`);
     return { ok:true, text: lines.join("\n").trim() };
   }
 
@@ -485,7 +342,7 @@ export function grainHandleToolCall(name, args){
 }
 
 /* =====================================================================
-   Helpers used by handleChat for context carry (unchanged)
+   Helpers used by handleChat (kept)
 ===================================================================== */
 export function userReferencesThoseBags(text) {
   const t = (text || "").toString().toLowerCase();
