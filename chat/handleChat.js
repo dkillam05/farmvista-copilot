@@ -364,7 +364,7 @@ export async function handleChatHttp(req, res) {
     let rsp = await openaiResponsesCreate({
       model: OPENAI_MODEL,
       tools,
-      tool_choice: "auto",
+      tool_choice: "required",
       input: input_list,
       temperature: 0.2
     });
@@ -443,7 +443,7 @@ export async function handleChatHttp(req, res) {
       rsp = await openaiResponsesCreate({
         model: OPENAI_MODEL,
         tools,
-        tool_choice: "auto",
+        tool_choice: "required",
         input: input_list,
         temperature: 0.2
       });
