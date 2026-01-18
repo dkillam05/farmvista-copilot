@@ -1,11 +1,12 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200b
+// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200c
 //
-// FIX:
-// ✅ db_query schema is now valid (params has items).
-// ✅ Always returns HTTP 200 JSON with meta (so UI always shows OpenAI footer).
+// FIX (critical):
+// ✅ First OpenAI call: tool_choice="required" (forces tool use)
+// ✅ Subsequent OpenAI calls: tool_choice="auto" (allows final text)
+// ✅ Always returns HTTP 200 JSON with meta so UI footer always shows.
 //
-// Everything else unchanged.
+// Everything else remains BORING orchestration.
 
 'use strict';
 
@@ -82,7 +83,6 @@ function dbQueryToolDef(){
       type: "object",
       properties: {
         sql: { type: "string" },
-        // ✅ FIX: array must declare items
         params: {
           type: "array",
           items: { type: ["string", "number", "boolean", "null"] }
@@ -137,10 +137,8 @@ You are FarmVista Copilot.
 
 HARD RULES:
 - You MUST call at least one tool to answer every user message.
-- You MUST NOT answer directly in plain text without tool output.
 - Prefer domain tools (grain/fields/farms/rtk). Use db_query only if needed.
-
-Return concise results. Do not mention internal IDs.
+- Return concise results. Do not mention internal IDs.
 `.trim();
 
     const tools = [
@@ -156,6 +154,7 @@ Return concise results. Do not mention internal IDs.
       { role:"user", content: text }
     ];
 
+    // 1) First call MUST use tools
     let rsp = await openai({
       model: OPENAI_MODEL,
       tools,
@@ -167,6 +166,7 @@ Return concise results. Do not mention internal IDs.
     const toolInput = [...input];
     if (Array.isArray(rsp.output)) toolInput.push(...rsp.output);
 
+    // 2) Execute tool calls loop
     for (let iter = 0; iter < 12; iter++){
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -178,12 +178,14 @@ Return concise results. Do not mention internal IDs.
 
         let result = null;
 
+        // Domain tools
         try {
           result = dispatchDomainTool(name, args);
         } catch (e) {
           result = { ok:false, error:`domain_error:${safeStr(e?.message || e)}` };
         }
 
+        // db_query fallback
         if (!result && name === "db_query"){
           meta.dbQueryUsed = true;
           try {
@@ -209,10 +211,11 @@ Return concise results. Do not mention internal IDs.
         });
       }
 
+      // ✅ Key fix: allow final assistant text after tool outputs
       rsp = await openai({
         model: OPENAI_MODEL,
         tools,
-        tool_choice: "required",
+        tool_choice: "auto",
         input: toolInput,
         temperature: 0.2
       });
@@ -226,7 +229,7 @@ Return concise results. Do not mention internal IDs.
       return respond(
         res,
         false,
-        "OpenAI returned no final text. Check meta.toolsCalled for what it attempted.",
+        "OpenAI returned no final text. See meta.toolsCalled.",
         meta,
         "no_final_text_from_openai"
       );
@@ -236,11 +239,7 @@ Return concise results. Do not mention internal IDs.
 
   }catch(e){
     const msg = safeStr(e?.message || e);
-
-    if (msg.toLowerCase().includes("missing openai_api_key")) {
-      meta.usedOpenAI = false;
-    }
-
+    if (msg.toLowerCase().includes("missing openai_api_key")) meta.usedOpenAI = false;
     return respond(res, false, `Backend error: ${msg}`, meta, msg);
   }
 }
