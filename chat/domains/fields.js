@@ -1,5 +1,5 @@
 // /chat/domains/fields.js  (FULL FILE)
-// Rev: 2026-01-16e  domain:fields
+// Rev: 2026-01-16e+idDirect  domain:fields
 //
 // Owns field tools + field prefix guardrail.
 // Tools:
@@ -14,6 +14,10 @@
 // ✅ Never complain about missing columns.
 // ✅ Only ask a follow-up when there are multiple real choices.
 // ✅ Active default: archived IS NULL OR archived = 0
+//
+// FIX (critical):
+// ✅ If query looks like an internal field id, SELECT by id directly before resolveField().
+//    This fixes: "Yes" after did-you-mean -> could not load field profile.
 
 'use strict';
 
@@ -104,7 +108,7 @@ export function looksLikeRtkFieldPrefix(text) {
 }
 
 export function findFieldsByPrefix(prefix) {
-  const sql = `
+  const sql =	tf
     SELECT id, name, rtkTowerId, rtkTowerName
     FROM fields
     WHERE name LIKE ?
@@ -207,7 +211,6 @@ function findColByCandidates(cols, candidates) {
 }
 
 function listAcreColumns(cols) {
-  // any column containing "acre" is a candidate
   return cols.map(c => c.name).filter(nm => norm(nm).includes("acre"));
 }
 
@@ -238,7 +241,6 @@ function chooseAcreColumn(kind, cols) {
   if (k === "tillable") return { kind: "tillable", col: findColByCandidates(cols, tillableCandidates) };
   if (k === "total") return { kind: "total", col: findColByCandidates(cols, totalCandidates) };
 
-  // default best: prefer tillable, else total, else hel/crp, else any acre column
   const till = findColByCandidates(cols, tillableCandidates);
   if (till) return { kind: "tillable", col: till };
 
@@ -262,7 +264,6 @@ function activeWhere() {
 }
 
 function sumAcreColumn(col) {
-  // Cast to REAL because snapshot columns can be text sometimes
   const r = runSql({
     sql: `SELECT SUM(CAST(${col} AS REAL)) AS acres FROM fields WHERE ${activeWhere()}`,
     params: [],
@@ -407,55 +408,11 @@ export function fieldsHandleToolCall(name, args) {
     return { ok: true, text: `There are ${Number.isFinite(n) ? n : 0} active fields in the system.` };
   }
 
-  if (name === "fields_total_acres") {
-    const kind = safeStr(args?.kind).trim();
-    const cols = getFieldsColumns();
-    const pick = chooseAcreColumn(kind, cols);
-
-    if (!pick.col) {
-      const acreCols = listAcreColumns(cols);
-      if (!acreCols.length) {
-        return { ok: true, text: `I don’t see any acreage columns in the fields snapshot.` };
-      }
-      return { ok: true, text: `I see these acreage columns on fields: ${acreCols.join(", ")}. Which one should I total?` };
-    }
-
-    const total = sumAcreColumn(pick.col);
-    const label = pick.kind === "unknown" ? pick.col : pick.kind;
-    return { ok: true, text: `Total ${label} acres across all active fields: ${Math.round(total * 10) / 10} acres.` };
-  }
-
-  if (name === "fields_list_by_acres") {
-    const kind = safeStr(args?.kind).trim();
-    const limit = args?.limit;
-    const cols = getFieldsColumns();
-    const pick = chooseAcreColumn(kind, cols);
-
-    if (!pick.col) {
-      const acreCols = listAcreColumns(cols);
-      if (!acreCols.length) return { ok: true, text: `I don’t see any acreage columns in the fields snapshot.` };
-      return { ok: true, text: `I see these acreage columns on fields: ${acreCols.join(", ")}. Which one should I use?` };
-    }
-
-    const rows = listTopByAcreColumn(pick.col, limit);
-    const label = pick.kind === "unknown" ? pick.col : pick.kind;
-
-    const lines = [];
-    lines.push(`Top fields by ${label} acres:`);
-    for (const r of rows) {
-      const a = Number(r.acres);
-      const show = Number.isFinite(a) ? (Math.round(a * 100) / 100) : safeStr(r.acres);
-      lines.push(`- ${safeStr(r.name)}: ${show} acres`);
-    }
-    return { ok: true, text: lines.join("\n").trim() };
-  }
-
   if (name === "fields_list_hel_gt0") {
     return { ok: true, text: listHelFields(args?.limit) };
   }
 
   if (name === "field_pick_any_profile") {
-    // Pick first active field alphabetically and return profile.
     const r = runSql({
       sql: `SELECT id, name FROM fields WHERE ${activeWhere()} ORDER BY name LIMIT 1`,
       params: [],
@@ -471,17 +428,48 @@ export function fieldsHandleToolCall(name, args) {
   const query = safeStr(args?.query).trim();
   if (!query) return { ok: false, error: "missing_query" };
 
+  // ✅ FIX: if it looks like an internal id (common in pending confirm), try direct select first.
+  // (Avoid resolveField() failing on ids.)
+  const looksLikeId = query.length >= 12 && !/^\d{3,5}$/.test(query);
+  if (looksLikeId) {
+    const direct = runSql({ sql: `SELECT * FROM fields WHERE id = ? LIMIT 1`, params: [query], limit: 1 });
+    const fieldRow = Array.isArray(direct?.rows) && direct.rows.length ? direct.rows[0] : null;
+    if (fieldRow) {
+      // farm best-effort
+      let farmRow = null;
+      try {
+        const farmId = safeStr(fieldRow.farmId).trim();
+        if (farmId) {
+          const fr = runSql({ sql: `SELECT * FROM farms WHERE id = ? LIMIT 1`, params: [farmId], limit: 1 });
+          farmRow = Array.isArray(fr?.rows) && fr.rows.length ? fr.rows[0] : null;
+        }
+      } catch {}
+
+      // tower best-effort
+      let towerRow = null;
+      try {
+        const towerId = safeStr(fieldRow.rtkTowerId).trim();
+        if (towerId) {
+          const tr = runSql({ sql: `SELECT * FROM rtkTowers WHERE id = ? LIMIT 1`, params: [towerId], limit: 1 });
+          towerRow = Array.isArray(tr?.rows) && tr.rows.length ? tr.rows[0] : null;
+        }
+      } catch {}
+
+      return { ok: true, text: formatFieldProfile(fieldRow, farmRow, towerRow) };
+    }
+  }
+
   // If user gives a short numeric code like "0513", try LIKE first.
   const isCode = /^\d{3,5}$/.test(query);
   if (isCode) {
     const r = findFieldsByPrefix(query);
     const rows = Array.isArray(r?.rows) ? r.rows : [];
-
-    // Only ask if truly >1 matches
     if (rows.length === 1) {
       const fieldId = safeStr(rows[0].id);
       const rf = resolveField(fieldId);
-      if (rf?.match?.id) return fieldsHandleToolCall("field_profile", { query: safeStr(rf.match.id) });
+      if (rf?.match?.id) {
+        return fieldsHandleToolCall("field_profile", { query: safeStr(rf.match.id) });
+      }
     }
     if (rows.length > 1) {
       return { ok: false, error: "ambiguous_field_prefix", candidates: rows.map(x => ({ id: safeStr(x.id), name: safeStr(x.name) })) };
