@@ -1,12 +1,17 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200c
+// Rev: 2026-01-17-debug-proof-all-domains-HTTP200d-pendingFix
 //
 // FIX (critical):
-// ✅ First OpenAI call: tool_choice="required" (forces tool use)
-// ✅ Subsequent OpenAI calls: tool_choice="auto" (allows final text)
-// ✅ Always returns HTTP 200 JSON with meta so UI footer always shows.
+// ✅ Implements server-side pending disambiguation per client threadId.
+//    - If a domain tool returns candidates, we store pending and return "Did you mean".
+//    - If user replies Yes / number / exact name, we resolve immediately to the correct domain tool.
+// ✅ Prevents "Yes" from being interpreted as a new unrelated question (grain bags, etc.).
 //
-// Everything else remains BORING orchestration.
+// Keeps:
+// ✅ OpenAI tools loop
+// ✅ HTTP 200 always (frontend keeps meta + proof footer)
+// ✅ meta.toolsCalled + dbQueryUsed + snapshot
+// ✅ Domains still own logic; handleChat only orchestrates.
 
 'use strict';
 
@@ -22,8 +27,81 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL   = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE    = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
+/* ---------------- thread store (pending) ---------------- */
+const TTL_MS = 12 * 60 * 60 * 1000;
+const THREADS = new Map();
+
+function nowMs(){ return Date.now(); }
+
+function getThread(threadId){
+  const tid = String(threadId || "").trim();
+  if (!tid) return null;
+
+  const cur = THREADS.get(tid);
+  if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
+
+  const fresh = { pending: null, updatedAt: nowMs() };
+  THREADS.set(tid, fresh);
+  return fresh;
+}
+
+function pruneThreads(){
+  const now = nowMs();
+  for (const [k, v] of THREADS.entries()){
+    if (!v?.updatedAt || (now - v.updatedAt) > TTL_MS) THREADS.delete(k);
+  }
+}
+
+function setPending(thread, pending){
+  if (!thread) return;
+  thread.pending = pending || null;
+  thread.updatedAt = nowMs();
+}
+
+/* ---------------- basics ---------------- */
 function jsonTry(s){ try { return JSON.parse(s); } catch { return null; } }
 function safeStr(v){ return (v == null ? "" : String(v)); }
+function norm(v){ return safeStr(v).trim().toLowerCase(); }
+
+function isYesLike(s){
+  return ["yes","y","yea","yep","yeah","ok","okay","sure","correct","right"].includes(norm(s));
+}
+function isNoLike(s){
+  return ["no","n","nope","nah"].includes(norm(s));
+}
+
+function pickCandidateFromReply(text, candidates){
+  const t = safeStr(text).trim();
+
+  // number selection
+  const mNum = t.match(/^\s*(\d{1,2})\s*$/);
+  if (mNum){
+    const n = parseInt(mNum[1], 10);
+    if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) return candidates[n - 1] || null;
+  }
+
+  // exact name
+  const exact = candidates.find(c => safeStr(c?.name).trim().toLowerCase() === t.toLowerCase());
+  if (exact) return exact;
+
+  // prefix
+  const pref = t.toLowerCase();
+  if (pref && pref.length >= 3){
+    const hit = candidates.find(c => safeStr(c?.name).toLowerCase().startsWith(pref));
+    if (hit) return hit;
+  }
+
+  return null;
+}
+
+function formatDidYouMean(kind, candidates){
+  const lines = [];
+  lines.push(`Did you mean (${kind}):`);
+  for (const c of (candidates || []).slice(0, 8)) lines.push(`- ${c.name}`);
+  lines.push("");
+  lines.push(`Reply with "yes" to pick the first one, or reply with the option number (1–8), or type the exact name.`);
+  return lines.join("\n");
+}
 
 function cleanSql(raw){
   let s = safeStr(raw || "").trim();
@@ -74,6 +152,7 @@ function extractAssistantText(rsp){
   return parts.join("\n").trim();
 }
 
+/* ---------------- tools ---------------- */
 function dbQueryToolDef(){
   return {
     type: "function",
@@ -83,10 +162,7 @@ function dbQueryToolDef(){
       type: "object",
       properties: {
         sql: { type: "string" },
-        params: {
-          type: "array",
-          items: { type: ["string", "number", "boolean", "null"] }
-        },
+        params: { type: "array", items: { type: ["string", "number", "boolean", "null"] } },
         limit: { type: "number" }
       },
       required: ["sql"]
@@ -110,7 +186,12 @@ function respond(res, ok, text, meta, errorMsg){
   return res.status(200).json(payload);
 }
 
+/* =====================================================================
+   HTTP handler
+===================================================================== */
 export async function handleChatHttp(req,res){
+  pruneThreads();
+
   const meta = {
     usedOpenAI: true,
     provider: "OpenAI",
@@ -126,10 +207,62 @@ export async function handleChatHttp(req,res){
     const dbStatus = await getDbStatus();
     meta.snapshot = dbStatus?.snapshot || null;
 
-    const text = safeStr(req.body?.text || "").trim();
-    if(!text) {
+    const textRaw = safeStr(req.body?.text || "").trim();
+    const threadId = safeStr(req.body?.threadId || "").trim();
+    const thread = getThread(threadId);
+
+    if(!textRaw) {
       meta.usedOpenAI = false;
       return respond(res, false, "Missing message text.", meta, "missing_text");
+    }
+
+    /* ==========================================================
+       ✅ PENDING DISAMBIGUATION HANDLER (THIS FIXES YOUR BUG)
+       If user says Yes after a did-you-mean, resolve immediately.
+    ========================================================== */
+    if (thread?.pending?.kind && Array.isArray(thread.pending.candidates) && thread.pending.candidates.length){
+      const pend = thread.pending;
+      const cands = pend.candidates;
+
+      if (isNoLike(textRaw)){
+        setPending(thread, null);
+        return respond(res, true, "Okay — tell me the exact name you meant.", meta);
+      }
+
+      let picked = null;
+      if (isYesLike(textRaw)) picked = cands[0] || null;
+      else picked = pickCandidateFromReply(textRaw, cands.slice(0, 8));
+
+      if (picked?.id || picked?.name){
+        setPending(thread, null);
+
+        // Resolve directly via the domain tool that triggered the pending
+        if (pend.kind === "field"){
+          const out = fieldsHandleToolCall("field_profile", { query: safeStr(picked.id || picked.name) });
+          meta.usedOpenAI = false;
+          meta.toolsCalled = ["field_profile(direct)"];
+          if (out?.ok && out.text) return respond(res, true, out.text, meta);
+          return respond(res, false, "Could not load that field profile.", meta, "pending_field_profile_failed");
+        }
+
+        if (pend.kind === "rtk tower"){
+          const out = rtkTowersHandleToolCall("rtk_tower_profile", { query: safeStr(picked.id || picked.name) });
+          meta.usedOpenAI = false;
+          meta.toolsCalled = ["rtk_tower_profile(direct)"];
+          if (out?.ok && out.text) return respond(res, true, out.text, meta);
+          return respond(res, false, "Could not load that RTK tower profile.", meta, "pending_rtk_profile_failed");
+        }
+
+        if (pend.kind === "farm"){
+          const out = farmsHandleToolCall("farm_profile", { query: safeStr(picked.id || picked.name) });
+          meta.usedOpenAI = false;
+          meta.toolsCalled = ["farm_profile(direct)"];
+          if (out?.ok && out.text) return respond(res, true, out.text, meta);
+          return respond(res, false, "Could not load that farm profile.", meta, "pending_farm_profile_failed");
+        }
+      }
+
+      // If user typed something else, fall through to OpenAI as a new question
     }
 
     const system = `
@@ -139,6 +272,9 @@ HARD RULES:
 - You MUST call at least one tool to answer every user message.
 - Prefer domain tools (grain/fields/farms/rtk). Use db_query only if needed.
 - Return concise results. Do not mention internal IDs.
+
+IMPORTANT:
+- If a tool returns candidates (ambiguous), ask the user to confirm.
 `.trim();
 
     const tools = [
@@ -151,10 +287,10 @@ HARD RULES:
 
     const input = [
       { role:"system", content: system },
-      { role:"user", content: text }
+      { role:"user", content: textRaw }
     ];
 
-    // 1) First call MUST use tools
+    // First call MUST use tools
     let rsp = await openai({
       model: OPENAI_MODEL,
       tools,
@@ -166,7 +302,7 @@ HARD RULES:
     const toolInput = [...input];
     if (Array.isArray(rsp.output)) toolInput.push(...rsp.output);
 
-    // 2) Execute tool calls loop
+    // Tool loop
     for (let iter = 0; iter < 12; iter++){
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -179,25 +315,30 @@ HARD RULES:
         let result = null;
 
         // Domain tools
-        try {
-          result = dispatchDomainTool(name, args);
-        } catch (e) {
-          result = { ok:false, error:`domain_error:${safeStr(e?.message || e)}` };
+        result = dispatchDomainTool(name, args);
+
+        // If a domain tool returns candidates, store pending and return prompt immediately
+        if (result && result.ok === false && Array.isArray(result.candidates) && result.candidates.length){
+          const kind =
+            name.startsWith("field_") ? "field" :
+            name.startsWith("rtk_") ? "rtk tower" :
+            name.startsWith("farm_") ? "farm" :
+            "item";
+
+          setPending(thread, { kind, candidates: result.candidates, originalText: textRaw });
+
+          return respond(res, true, formatDidYouMean(kind, result.candidates), meta);
         }
 
         // db_query fallback
         if (!result && name === "db_query"){
           meta.dbQueryUsed = true;
-          try {
-            const sql = cleanSql(args.sql || "");
-            result = runSql({
-              sql,
-              params: Array.isArray(args.params) ? args.params : [],
-              limit: Number.isFinite(args.limit) ? args.limit : 200
-            });
-          } catch (e) {
-            result = { ok:false, error:`db_query_error:${safeStr(e?.message || e)}` };
-          }
+          const sql = cleanSql(args.sql || "");
+          result = runSql({
+            sql,
+            params: Array.isArray(args.params) ? args.params : [],
+            limit: Number.isFinite(args.limit) ? args.limit : 200
+          });
         }
 
         if (!result){
@@ -211,7 +352,7 @@ HARD RULES:
         });
       }
 
-      // ✅ Key fix: allow final assistant text after tool outputs
+      // Allow final text
       rsp = await openai({
         model: OPENAI_MODEL,
         tools,
@@ -224,15 +365,8 @@ HARD RULES:
     }
 
     const answer = extractAssistantText(rsp);
-
     if (!answer) {
-      return respond(
-        res,
-        false,
-        "OpenAI returned no final text. See meta.toolsCalled.",
-        meta,
-        "no_final_text_from_openai"
-      );
+      return respond(res, false, "OpenAI returned no final text. See meta.toolsCalled.", meta, "no_final_text_from_openai");
     }
 
     return respond(res, true, answer, meta);
