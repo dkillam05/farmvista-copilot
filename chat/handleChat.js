@@ -1,14 +1,11 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200
+// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200b
 //
-// FIX (critical):
-// ✅ NEVER return non-200 from /chat.
-//    - Frontend throws on non-200 and you lose meta/proof.
-// ✅ Always return { ok, text, meta, error? } with HTTP 200.
-// ✅ Keeps: OpenAI tool loop + meta.toolsCalled + dbQueryUsed + snapshot.
+// FIX:
+// ✅ db_query schema is now valid (params has items).
+// ✅ Always returns HTTP 200 JSON with meta (so UI always shows OpenAI footer).
 //
-// This restores your "AI: OpenAI • Model …" footer consistently,
-// even when the backend has an error.
+// Everything else unchanged.
 
 'use strict';
 
@@ -85,7 +82,11 @@ function dbQueryToolDef(){
       type: "object",
       properties: {
         sql: { type: "string" },
-        params: { type: "array" },
+        // ✅ FIX: array must declare items
+        params: {
+          type: "array",
+          items: { type: ["string", "number", "boolean", "null"] }
+        },
         limit: { type: "number" }
       },
       required: ["sql"]
@@ -106,7 +107,6 @@ function dispatchDomainTool(name, args){
 function respond(res, ok, text, meta, errorMsg){
   const payload = { ok: !!ok, text: safeStr(text || "").trim(), meta: meta || {} };
   if (errorMsg) payload.error = safeStr(errorMsg);
-  // ✅ ALWAYS 200 so frontend never throws away meta
   return res.status(200).json(payload);
 }
 
@@ -156,7 +156,6 @@ Return concise results. Do not mention internal IDs.
       { role:"user", content: text }
     ];
 
-    // 1) OpenAI must call tools
     let rsp = await openai({
       model: OPENAI_MODEL,
       tools,
@@ -168,7 +167,6 @@ Return concise results. Do not mention internal IDs.
     const toolInput = [...input];
     if (Array.isArray(rsp.output)) toolInput.push(...rsp.output);
 
-    // 2) Execute tool calls loop
     for (let iter = 0; iter < 12; iter++){
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -180,14 +178,12 @@ Return concise results. Do not mention internal IDs.
 
         let result = null;
 
-        // Domain tools
         try {
           result = dispatchDomainTool(name, args);
         } catch (e) {
           result = { ok:false, error:`domain_error:${safeStr(e?.message || e)}` };
         }
 
-        // db_query fallback
         if (!result && name === "db_query"){
           meta.dbQueryUsed = true;
           try {
@@ -239,10 +235,8 @@ Return concise results. Do not mention internal IDs.
     return respond(res, true, answer, meta);
 
   }catch(e){
-    // Still return 200 + meta so UI shows proof + tool list even on errors
     const msg = safeStr(e?.message || e);
 
-    // If key missing, it's not OpenAI's fault, but we still show meta.
     if (msg.toLowerCase().includes("missing openai_api_key")) {
       meta.usedOpenAI = false;
     }
