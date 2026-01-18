@@ -1,14 +1,14 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-always-all-domains
+// Rev: 2026-01-17-debug-proof-always-all-domains-HTTP200
 //
-// Goals:
-// ✅ OpenAI handles every question.
-// ✅ Tool use is REQUIRED (no plain text answers).
-// ✅ Always return proof meta so UI footer shows who answered + what tools were used.
-// ✅ Support ALL domains (grain/fields/farms/rtk) + db_query fallback.
+// FIX (critical):
+// ✅ NEVER return non-200 from /chat.
+//    - Frontend throws on non-200 and you lose meta/proof.
+// ✅ Always return { ok, text, meta, error? } with HTTP 200.
+// ✅ Keeps: OpenAI tool loop + meta.toolsCalled + dbQueryUsed + snapshot.
 //
-// Notes:
-// - handleChat remains BORING: orchestrator + tool runner + meta.
+// This restores your "AI: OpenAI • Model …" footer consistently,
+// even when the backend has an error.
 
 'use strict';
 
@@ -103,6 +103,13 @@ function dispatchDomainTool(name, args){
   );
 }
 
+function respond(res, ok, text, meta, errorMsg){
+  const payload = { ok: !!ok, text: safeStr(text || "").trim(), meta: meta || {} };
+  if (errorMsg) payload.error = safeStr(errorMsg);
+  // ✅ ALWAYS 200 so frontend never throws away meta
+  return res.status(200).json(payload);
+}
+
 export async function handleChatHttp(req,res){
   const meta = {
     usedOpenAI: true,
@@ -110,7 +117,8 @@ export async function handleChatHttp(req,res){
     model: OPENAI_MODEL,
     toolsCalled: [],
     dbQueryUsed: false,
-    snapshot: null
+    snapshot: null,
+    route: "/chat"
   };
 
   try{
@@ -119,10 +127,11 @@ export async function handleChatHttp(req,res){
     meta.snapshot = dbStatus?.snapshot || null;
 
     const text = safeStr(req.body?.text || "").trim();
-    if(!text) return res.status(400).json({ ok:false, error:"missing_text", meta });
+    if(!text) {
+      meta.usedOpenAI = false;
+      return respond(res, false, "Missing message text.", meta, "missing_text");
+    }
 
-    // You said you want to know how every question is answered:
-    // keep debug always on from server side.
     const system = `
 You are FarmVista Copilot.
 
@@ -131,10 +140,9 @@ HARD RULES:
 - You MUST NOT answer directly in plain text without tool output.
 - Prefer domain tools (grain/fields/farms/rtk). Use db_query only if needed.
 
-When you answer, be concise and include the result. Do not mention internal IDs.
+Return concise results. Do not mention internal IDs.
 `.trim();
 
-    // Tools = all domains + db_query
     const tools = [
       ...grainToolDefs(),
       ...fieldsToolDefs(),
@@ -143,7 +151,6 @@ When you answer, be concise and include the result. Do not mention internal IDs.
       dbQueryToolDef()
     ];
 
-    // Conversation input (single-turn; you can add thread memory later if desired)
     const input = [
       { role:"system", content: system },
       { role:"user", content: text }
@@ -158,7 +165,6 @@ When you answer, be concise and include the result. Do not mention internal IDs.
       temperature: 0.2
     });
 
-    // Keep a running list of tool outputs fed back to OpenAI
     const toolInput = [...input];
     if (Array.isArray(rsp.output)) toolInput.push(...rsp.output);
 
@@ -175,17 +181,25 @@ When you answer, be concise and include the result. Do not mention internal IDs.
         let result = null;
 
         // Domain tools
-        result = dispatchDomainTool(name, args);
+        try {
+          result = dispatchDomainTool(name, args);
+        } catch (e) {
+          result = { ok:false, error:`domain_error:${safeStr(e?.message || e)}` };
+        }
 
         // db_query fallback
         if (!result && name === "db_query"){
           meta.dbQueryUsed = true;
-          const sql = cleanSql(args.sql || "");
-          result = runSql({
-            sql,
-            params: Array.isArray(args.params) ? args.params : [],
-            limit: Number.isFinite(args.limit) ? args.limit : 200
-          });
+          try {
+            const sql = cleanSql(args.sql || "");
+            result = runSql({
+              sql,
+              params: Array.isArray(args.params) ? args.params : [],
+              limit: Number.isFinite(args.limit) ? args.limit : 200
+            });
+          } catch (e) {
+            result = { ok:false, error:`db_query_error:${safeStr(e?.message || e)}` };
+          }
         }
 
         if (!result){
@@ -211,17 +225,28 @@ When you answer, be concise and include the result. Do not mention internal IDs.
     }
 
     const answer = extractAssistantText(rsp);
+
     if (!answer) {
-      return res.status(500).json({
-        ok:false,
-        error:"no_final_text_from_openai",
-        meta
-      });
+      return respond(
+        res,
+        false,
+        "OpenAI returned no final text. Check meta.toolsCalled for what it attempted.",
+        meta,
+        "no_final_text_from_openai"
+      );
     }
 
-    return res.json({ ok:true, text: answer, meta });
+    return respond(res, true, answer, meta);
 
   }catch(e){
-    return res.status(500).json({ ok:false, error: safeStr(e?.message || e), meta });
+    // Still return 200 + meta so UI shows proof + tool list even on errors
+    const msg = safeStr(e?.message || e);
+
+    // If key missing, it's not OpenAI's fault, but we still show meta.
+    if (msg.toLowerCase().includes("missing openai_api_key")) {
+      meta.usedOpenAI = false;
+    }
+
+    return respond(res, false, `Backend error: ${msg}`, meta, msg);
   }
 }
