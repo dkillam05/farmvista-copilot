@@ -1,7 +1,7 @@
 // /chat/domains/fields.js  (FULL FILE)
 // Rev: 2026-01-16e+idDirect  domain:fields
 //
-// Owns field tools + field prefix guardrail.
+// Owns field tools+field prefix guardrail.
 // Tools:
 // - field_profile(query)                 => full field info + farm + RTK tower details (best-effort).
 // - field_pick_any_profile()             => pick one field and return full profile (no failures).
