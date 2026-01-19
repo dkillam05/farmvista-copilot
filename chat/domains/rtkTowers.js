@@ -1,9 +1,9 @@
 // /chat/domains/rtkTowers.js  (FULL FILE)
-// Rev: 2026-01-17h  domain:rtkTowers
+// Rev: 2026-01-17i  domain:rtkTowers
 //
 // Tools:
 // - rtk_towers_count_active()   => count RTK towers
-// - rtk_towers_list(limit)      => list RTK towers A–Z  ✅ NEW (prevents guessing rtk_towers table)
+// - rtk_towers_list(limit)      => list RTK towers A–Z ✅ NEW (prevents guessing rtk_towers table)
 // - rtk_tower_profile(query)    => tower details
 // - rtk_tower_fields(query)     => list fields on that tower (optional)
 
@@ -79,7 +79,7 @@ export function rtkTowersHandleToolCall(name, args){
     if (!rows.length) return { ok:true, text:"No RTK towers found in the snapshot." };
 
     const lines = [];
-    lines.push(`RTK towers (${rows.length}${rows.length === limit ? "+" : ""}):`);
+    lines.push(`RTK towers (${rows.length}${rows.length===limit?"+":""}):`);
     for (const row of rows) lines.push(`- ${safeStr(row.name)}`);
     return { ok:true, text: lines.join("\n") };
   }
@@ -101,7 +101,7 @@ export function rtkTowersHandleToolCall(name, args){
     const net = safeStr(row.networkId || row.netId).trim();
     if (net) lines.push(`- Network ID: ${net}`);
 
-    const freq = safeStr(row.frequency || row.freq || row.frequencyMHz).trim();
+    const freq = safeStr(row.frequency || row.freq).trim();
     if (freq) lines.push(`- Frequency: ${freq}`);
 
     return { ok:true, text: lines.join("\n") };
