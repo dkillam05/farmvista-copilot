@@ -1,12 +1,11 @@
 // /chat/domains/rtkTowers.js  (FULL FILE)
-// Rev: 2026-01-17e  domain:rtkTowers
+// Rev: 2026-01-17h  domain:rtkTowers
 //
 // Tools:
 // - rtk_towers_count_active()   => count RTK towers
+// - rtk_towers_list(limit)      => list RTK towers A–Z  ✅ NEW (prevents guessing rtk_towers table)
 // - rtk_tower_profile(query)    => tower details
 // - rtk_tower_fields(query)     => list fields on that tower (optional)
-//
-// Goal: Prevent OpenAI loops by always providing a direct tool for "how many towers".
 
 'use strict';
 
@@ -23,6 +22,17 @@ export function rtkTowersToolDefs(){
       name:"rtk_towers_count_active",
       description:"Count RTK towers in the system. Read-only.",
       parameters:{ type:"object", properties:{} }
+    },
+    {
+      type:"function",
+      name:"rtk_towers_list",
+      description:"List RTK towers A–Z. Read-only.",
+      parameters:{
+        type:"object",
+        properties:{
+          limit:{ type:"number", description:"Max towers to list (default 200, max 500)." }
+        }
+      }
     },
     {
       type:"function",
@@ -58,6 +68,22 @@ export function rtkTowersHandleToolCall(name, args){
     return { ok:true, text:`There are ${Number.isFinite(n)?n:0} RTK towers in the system.` };
   }
 
+  if (name === "rtk_towers_list") {
+    const limit = Math.max(1, Math.min(500, Number(args?.limit || 200)));
+    const r = runSql({
+      sql: `SELECT name FROM rtkTowers ORDER BY name LIMIT ?`,
+      params: [limit],
+      limit
+    });
+    const rows = Array.isArray(r?.rows) ? r.rows : [];
+    if (!rows.length) return { ok:true, text:"No RTK towers found in the snapshot." };
+
+    const lines = [];
+    lines.push(`RTK towers (${rows.length}${rows.length === limit ? "+" : ""}):`);
+    for (const row of rows) lines.push(`- ${safeStr(row.name)}`);
+    return { ok:true, text: lines.join("\n") };
+  }
+
   if (name === "rtk_tower_profile") {
     const query = safeStr(args?.query).trim();
     if (!query) return { ok:false, error:"missing_query" };
@@ -75,7 +101,7 @@ export function rtkTowersHandleToolCall(name, args){
     const net = safeStr(row.networkId || row.netId).trim();
     if (net) lines.push(`- Network ID: ${net}`);
 
-    const freq = safeStr(row.frequency || row.freq).trim();
+    const freq = safeStr(row.frequency || row.freq || row.frequencyMHz).trim();
     if (freq) lines.push(`- Frequency: ${freq}`);
 
     return { ok:true, text: lines.join("\n") };
