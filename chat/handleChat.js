@@ -1,8 +1,16 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-all-domains-HTTP200d-pendingFix+binSites
+// Rev: 2026-01-17-debug-proof-all-domains-HTTP200d-pendingFix+memoryTopic
 //
-// Same as your live file, with ONE addition:
-// ✅ binSites domain (prevents "no such table: grain_bins")
+// FIXES:
+// ✅ Keeps lightweight per-thread message history (so "list them" refers to prior answer)
+// ✅ Tracks lastTopic based on tool calls (bin_sites / rtk / fields / grain / farms)
+// ✅ Still uses OpenAI for everything, but now OpenAI has context
+//
+// Keeps:
+// ✅ pending disambiguation Yes/1/exact-name
+// ✅ HTTP 200 always with meta proof footer
+// ✅ tool loop (required then auto)
+// ✅ db_query schema fixed
 
 'use strict';
 
@@ -19,9 +27,10 @@ const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL   = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
 const OPENAI_BASE    = (process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").toString().trim();
 
-/* ---------------- thread store (pending) ---------------- */
+/* ---------------- thread store (pending + memory) ---------------- */
 const TTL_MS = 12 * 60 * 60 * 1000;
 const THREADS = new Map();
+const MAX_MSGS = 20;
 
 function nowMs(){ return Date.now(); }
 
@@ -32,7 +41,7 @@ function getThread(threadId){
   const cur = THREADS.get(tid);
   if (cur && (nowMs() - (cur.updatedAt || 0)) <= TTL_MS) return cur;
 
-  const fresh = { pending: null, updatedAt: nowMs() };
+  const fresh = { pending: null, messages: [], lastTopic: "", updatedAt: nowMs() };
   THREADS.set(tid, fresh);
   return fresh;
 }
@@ -50,6 +59,27 @@ function setPending(thread, pending){
   thread.updatedAt = nowMs();
 }
 
+function pushThreadMsg(thread, role, content){
+  if (!thread) return;
+  const c = String(content ?? "").trim();
+  if (!c) return;
+  thread.messages.push({ role, content: c });
+  if (thread.messages.length > MAX_MSGS) thread.messages = thread.messages.slice(-MAX_MSGS);
+  thread.updatedAt = nowMs();
+}
+
+function setLastTopicFromTool(thread, toolName){
+  if (!thread) return;
+  const n = String(toolName || "");
+  let topic = "";
+  if (n.startsWith("bin_sites_")) topic = "bin_sites";
+  else if (n.startsWith("rtk_") || n.startsWith("rtk_tower") || n.startsWith("rtk_towers_")) topic = "rtk";
+  else if (n.startsWith("field_") || n.startsWith("fields_")) topic = "fields";
+  else if (n.startsWith("grain_") || n.startsWith("grain_bags_")) topic = "grain";
+  else if (n.startsWith("farm_") || n.startsWith("farms_")) topic = "farms";
+  if (topic) thread.lastTopic = topic;
+}
+
 /* ---------------- basics ---------------- */
 function jsonTry(s){ try { return JSON.parse(s); } catch { return null; } }
 function safeStr(v){ return (v == null ? "" : String(v)); }
@@ -65,18 +95,15 @@ function isNoLike(s){
 function pickCandidateFromReply(text, candidates){
   const t = safeStr(text).trim();
 
-  // number selection
   const mNum = t.match(/^\s*(\d{1,2})\s*$/);
   if (mNum){
     const n = parseInt(mNum[1], 10);
     if (Number.isFinite(n) && n >= 1 && n <= Math.min(8, candidates.length)) return candidates[n - 1] || null;
   }
 
-  // exact name
   const exact = candidates.find(c => safeStr(c?.name).trim().toLowerCase() === t.toLowerCase());
   if (exact) return exact;
 
-  // prefix
   const pref = t.toLowerCase();
   if (pref && pref.length >= 3){
     const hit = candidates.find(c => safeStr(c?.name).toLowerCase().startsWith(pref));
@@ -209,6 +236,9 @@ export async function handleChatHttp(req,res){
       return respond(res, false, "Missing message text.", meta, "missing_text");
     }
 
+    // Always store user message for context
+    pushThreadMsg(thread, "user", textRaw);
+
     /* ==========================================================
        ✅ PENDING DISAMBIGUATION HANDLER
     ========================================================== */
@@ -218,7 +248,9 @@ export async function handleChatHttp(req,res){
 
       if (isNoLike(textRaw)){
         setPending(thread, null);
-        return respond(res, true, "Okay — tell me the exact name you meant.", meta);
+        const msg = "Okay — tell me the exact name you meant.";
+        pushThreadMsg(thread, "assistant", msg);
+        return respond(res, true, msg, meta);
       }
 
       let picked = null;
@@ -232,26 +264,45 @@ export async function handleChatHttp(req,res){
           const out = fieldsHandleToolCall("field_profile", { query: safeStr(picked.id || picked.name) });
           meta.usedOpenAI = false;
           meta.toolsCalled = ["field_profile(direct)"];
-          if (out?.ok && out.text) return respond(res, true, out.text, meta);
-          return respond(res, false, "Could not load that field profile.", meta, "pending_field_profile_failed");
+          thread.lastTopic = "fields";
+          if (out?.ok && out.text) {
+            pushThreadMsg(thread, "assistant", out.text);
+            return respond(res, true, out.text, meta);
+          }
+          const msg = "Could not load that field profile.";
+          pushThreadMsg(thread, "assistant", msg);
+          return respond(res, false, msg, meta, "pending_field_profile_failed");
         }
 
         if (pend.kind === "rtk tower"){
           const out = rtkTowersHandleToolCall("rtk_tower_profile", { query: safeStr(picked.id || picked.name) });
           meta.usedOpenAI = false;
           meta.toolsCalled = ["rtk_tower_profile(direct)"];
-          if (out?.ok && out.text) return respond(res, true, out.text, meta);
-          return respond(res, false, "Could not load that RTK tower profile.", meta, "pending_rtk_profile_failed");
+          thread.lastTopic = "rtk";
+          if (out?.ok && out.text) {
+            pushThreadMsg(thread, "assistant", out.text);
+            return respond(res, true, out.text, meta);
+          }
+          const msg = "Could not load that RTK tower profile.";
+          pushThreadMsg(thread, "assistant", msg);
+          return respond(res, false, msg, meta, "pending_rtk_profile_failed");
         }
 
         if (pend.kind === "farm"){
           const out = farmsHandleToolCall("farm_profile", { query: safeStr(picked.id || picked.name) });
           meta.usedOpenAI = false;
           meta.toolsCalled = ["farm_profile(direct)"];
-          if (out?.ok && out.text) return respond(res, true, out.text, meta);
-          return respond(res, false, "Could not load that farm profile.", meta, "pending_farm_profile_failed");
+          thread.lastTopic = "farms";
+          if (out?.ok && out.text) {
+            pushThreadMsg(thread, "assistant", out.text);
+            return respond(res, true, out.text, meta);
+          }
+          const msg = "Could not load that farm profile.";
+          pushThreadMsg(thread, "assistant", msg);
+          return respond(res, false, msg, meta, "pending_farm_profile_failed");
         }
       }
+      // else fall through to OpenAI
     }
 
     const system = `
@@ -260,10 +311,11 @@ You are FarmVista Copilot.
 HARD RULES:
 - You MUST call at least one tool to answer every user message.
 - Prefer domain tools first. Use db_query only if needed.
+- If a tool returns candidates, ask the user to confirm.
 - Return concise results. Do not mention internal IDs.
 
-IMPORTANT:
-- If a tool returns candidates (ambiguous), ask the user to confirm.
+Context:
+- last_topic=${safeStr(thread?.lastTopic || "")}
 `.trim();
 
     const tools = [
@@ -275,8 +327,10 @@ IMPORTANT:
       dbQueryToolDef()
     ];
 
+    // Include lightweight history so "list them" stays on-topic
     const input = [
       { role:"system", content: system },
+      ...(Array.isArray(thread?.messages) ? thread.messages.slice(-MAX_MSGS) : []),
       { role:"user", content: textRaw }
     ];
 
@@ -300,18 +354,21 @@ IMPORTANT:
         const name = safeStr(call?.name);
         const args = jsonTry(call?.arguments) || {};
         meta.toolsCalled.push(name);
+        setLastTopicFromTool(thread, name);
 
         let result = dispatchDomainTool(name, args);
 
         if (result && result.ok === false && Array.isArray(result.candidates) && result.candidates.length){
           const kind =
             name.startsWith("field_") ? "field" :
-            name.startsWith("rtk_") ? "rtk tower" :
+            (name.startsWith("rtk_") || name.startsWith("rtk_tower") || name.startsWith("rtk_towers_")) ? "rtk tower" :
             name.startsWith("farm_") ? "farm" :
             "item";
 
           setPending(thread, { kind, candidates: result.candidates, originalText: textRaw });
-          return respond(res, true, formatDidYouMean(kind, result.candidates), meta);
+          const msg = formatDidYouMean(kind, result.candidates);
+          pushThreadMsg(thread, "assistant", msg);
+          return respond(res, true, msg, meta);
         }
 
         if (!result && name === "db_query"){
@@ -335,6 +392,7 @@ IMPORTANT:
         });
       }
 
+      // Allow final text
       rsp = await openai({
         model: OPENAI_MODEL,
         tools,
@@ -348,14 +406,18 @@ IMPORTANT:
 
     const answer = extractAssistantText(rsp);
     if (!answer) {
-      return respond(res, false, "OpenAI returned no final text. See meta.toolsCalled.", meta, "no_final_text_from_openai");
+      const msg = "OpenAI returned no final text. See meta.toolsCalled.";
+      pushThreadMsg(thread, "assistant", msg);
+      return respond(res, false, msg, meta, "no_final_text_from_openai");
     }
 
+    pushThreadMsg(thread, "assistant", answer);
     return respond(res, true, answer, meta);
 
   }catch(e){
     const msg = safeStr(e?.message || e);
     if (msg.toLowerCase().includes("missing openai_api_key")) meta.usedOpenAI = false;
+    pushThreadMsg(getThread(safeStr(req.body?.threadId || "").trim()), "assistant", `Backend error: ${msg}`);
     return respond(res, false, `Backend error: ${msg}`, meta, msg);
   }
 }
