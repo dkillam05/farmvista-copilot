@@ -5,7 +5,8 @@
 // - bin_sites_count()
 // - bin_sites_list(limit)
 //
-// Schema-safe: finds the correct table name from sqlite_master and counts/lists it.
+// This is schema-tolerant: it discovers the correct table name from sqlite_master
+// so we never guess tables like "grain_bins".
 
 'use strict';
 
@@ -76,14 +77,13 @@ export function binSitesToolDefs(){
 export function binSitesHandleToolCall(name, args){
   if (name !== "bin_sites_count" && name !== "bin_sites_list") return null;
 
-  // Try common real-world names; you can extend if needed.
+  // Common candidate names (adjust later if needed)
   const siteTable = pickExistingTable([
     "binSites",
     "bin_sites",
     "grainBinSites",
     "grain_bin_sites",
-    "binSite",
-    "bin_sites_master"
+    "binSite"
   ]);
 
   if (!siteTable) {
@@ -98,7 +98,6 @@ export function binSitesHandleToolCall(name, args){
   }
 
   if (name === "bin_sites_count") {
-    // If archived column exists, prefer active filter, else plain count.
     const n1 = tryCount(`SELECT COUNT(*) AS n FROM ${siteTable} WHERE archived IS NULL OR archived=0`);
     const n = (n1 != null) ? n1 : (tryCount(`SELECT COUNT(*) AS n FROM ${siteTable}`) || 0);
     return { ok:true, text:`There are ${Number(n)} grain bin sites in the system.` };
@@ -106,12 +105,10 @@ export function binSitesHandleToolCall(name, args){
 
   const lim = Math.max(1, Math.min(500, Number(args?.limit || 200)));
 
-  // Prefer name if it exists
   let rows = tryList(`SELECT name FROM ${siteTable} ORDER BY name LIMIT ?`, [lim], lim);
   let key = "name";
 
   if (!rows.length) {
-    // fallback to id
     rows = tryList(`SELECT id FROM ${siteTable} ORDER BY id LIMIT ?`, [lim], lim);
     key = "id";
   }
@@ -119,7 +116,7 @@ export function binSitesHandleToolCall(name, args){
   if (!rows.length) return { ok:true, text:`No bin sites found in table ${siteTable}.` };
 
   const lines = [];
-  lines.push(`Grain bin sites (${rows.length}${rows.length === lim ? "+" : ""}):`);
+  lines.push(`Grain bin sites (${rows.length}${rows.length===lim?"+":""}):`);
   for (const r of rows) lines.push(`- ${safeStr(r[key])}`);
   return { ok:true, text: lines.join("\n") };
 }
