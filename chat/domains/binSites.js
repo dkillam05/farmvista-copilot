@@ -1,12 +1,13 @@
 // /chat/domains/binSites.js  (FULL FILE)
-// Rev: 2026-01-17a  domain:binSites
+// Rev: 2026-01-17b  domain:binSites
+//
+// FIX (critical):
+// ✅ Do NOT use "LIMIT ?" because runSql() will append another LIMIT and break the query.
+// ✅ Use a numeric LIMIT in the SQL string after clamping.
 //
 // Tools:
 // - bin_sites_count()
 // - bin_sites_list(limit)
-//
-// This is schema-tolerant: it discovers the correct table name from sqlite_master
-// so we never guess tables like "grain_bins".
 
 'use strict';
 
@@ -14,6 +15,12 @@ import { runSql } from "../sqlRunner.js";
 
 function safeStr(v){ return (v==null?"":String(v)); }
 function norm(v){ return safeStr(v).trim().toLowerCase(); }
+
+function clampLimit(x, dflt, max){
+  const n = Number(x);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(1, Math.min(max, Math.floor(n)));
+}
 
 function listTables(){
   const r = runSql({
@@ -43,9 +50,9 @@ function tryCount(sql){
   }
 }
 
-function tryList(sql, params, limit){
+function tryList(sql){
   try {
-    const r = runSql({ sql, params, limit });
+    const r = runSql({ sql, params: [], limit: 2000 });
     return Array.isArray(r?.rows) ? r.rows : [];
   } catch {
     return [];
@@ -77,7 +84,6 @@ export function binSitesToolDefs(){
 export function binSitesHandleToolCall(name, args){
   if (name !== "bin_sites_count" && name !== "bin_sites_list") return null;
 
-  // Common candidate names (adjust later if needed)
   const siteTable = pickExistingTable([
     "binSites",
     "bin_sites",
@@ -103,13 +109,14 @@ export function binSitesHandleToolCall(name, args){
     return { ok:true, text:`There are ${Number(n)} grain bin sites in the system.` };
   }
 
-  const lim = Math.max(1, Math.min(500, Number(args?.limit || 200)));
+  const lim = clampLimit(args?.limit, 200, 500);
 
-  let rows = tryList(`SELECT name FROM ${siteTable} ORDER BY name LIMIT ?`, [lim], lim);
+  // ✅ numeric LIMIT to avoid "LIMIT ?"
+  let rows = tryList(`SELECT name FROM ${siteTable} ORDER BY name LIMIT ${lim}`);
   let key = "name";
 
   if (!rows.length) {
-    rows = tryList(`SELECT id FROM ${siteTable} ORDER BY id LIMIT ?`, [lim], lim);
+    rows = tryList(`SELECT id FROM ${siteTable} ORDER BY id LIMIT ${lim}`);
     key = "id";
   }
 
