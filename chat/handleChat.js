@@ -1,17 +1,8 @@
 // /chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-17-debug-proof-all-domains-HTTP200d-pendingFix
+// Rev: 2026-01-17-debug-proof-all-domains-HTTP200d-pendingFix+binSites
 //
-// FIX (critical):
-// ✅ Implements server-side pending disambiguation per client threadId.
-//    - If a domain tool returns candidates, we store pending and return "Did you mean".
-//    - If user replies Yes / number / exact name, we resolve immediately to the correct domain tool.
-// ✅ Prevents "Yes" from being interpreted as a new unrelated question (grain bags, etc.).
-//
-// Keeps:
-// ✅ OpenAI tools loop
-// ✅ HTTP 200 always (frontend keeps meta + proof footer)
-// ✅ meta.toolsCalled + dbQueryUsed + snapshot
-// ✅ Domains still own logic; handleChat only orchestrates.
+// Same as your live file, with ONE addition:
+// ✅ binSites domain (prevents "no such table: grain_bins")
 
 'use strict';
 
@@ -22,6 +13,7 @@ import { grainToolDefs, grainHandleToolCall } from "./domains/grain.js";
 import { fieldsToolDefs, fieldsHandleToolCall } from "./domains/fields.js";
 import { farmsToolDefs, farmsHandleToolCall } from "./domains/farms.js";
 import { rtkTowersToolDefs, rtkTowersHandleToolCall } from "./domains/rtkTowers.js";
+import { binSitesToolDefs, binSitesHandleToolCall } from "./domains/binSites.js";
 
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").toString().trim();
 const OPENAI_MODEL   = (process.env.OPENAI_MODEL || "gpt-4.1-mini").toString().trim();
@@ -176,6 +168,7 @@ function dispatchDomainTool(name, args){
     fieldsHandleToolCall(name, args) ||
     farmsHandleToolCall(name, args) ||
     rtkTowersHandleToolCall(name, args) ||
+    binSitesHandleToolCall(name, args) ||
     null
   );
 }
@@ -217,8 +210,7 @@ export async function handleChatHttp(req,res){
     }
 
     /* ==========================================================
-       ✅ PENDING DISAMBIGUATION HANDLER (THIS FIXES YOUR BUG)
-       If user says Yes after a did-you-mean, resolve immediately.
+       ✅ PENDING DISAMBIGUATION HANDLER
     ========================================================== */
     if (thread?.pending?.kind && Array.isArray(thread.pending.candidates) && thread.pending.candidates.length){
       const pend = thread.pending;
@@ -236,7 +228,6 @@ export async function handleChatHttp(req,res){
       if (picked?.id || picked?.name){
         setPending(thread, null);
 
-        // Resolve directly via the domain tool that triggered the pending
         if (pend.kind === "field"){
           const out = fieldsHandleToolCall("field_profile", { query: safeStr(picked.id || picked.name) });
           meta.usedOpenAI = false;
@@ -261,8 +252,6 @@ export async function handleChatHttp(req,res){
           return respond(res, false, "Could not load that farm profile.", meta, "pending_farm_profile_failed");
         }
       }
-
-      // If user typed something else, fall through to OpenAI as a new question
     }
 
     const system = `
@@ -270,7 +259,7 @@ You are FarmVista Copilot.
 
 HARD RULES:
 - You MUST call at least one tool to answer every user message.
-- Prefer domain tools (grain/fields/farms/rtk). Use db_query only if needed.
+- Prefer domain tools first. Use db_query only if needed.
 - Return concise results. Do not mention internal IDs.
 
 IMPORTANT:
@@ -282,6 +271,7 @@ IMPORTANT:
       ...fieldsToolDefs(),
       ...farmsToolDefs(),
       ...rtkTowersToolDefs(),
+      ...binSitesToolDefs(),
       dbQueryToolDef()
     ];
 
@@ -302,7 +292,6 @@ IMPORTANT:
     const toolInput = [...input];
     if (Array.isArray(rsp.output)) toolInput.push(...rsp.output);
 
-    // Tool loop
     for (let iter = 0; iter < 12; iter++){
       const calls = extractFunctionCalls(rsp);
       if (!calls.length) break;
@@ -312,12 +301,8 @@ IMPORTANT:
         const args = jsonTry(call?.arguments) || {};
         meta.toolsCalled.push(name);
 
-        let result = null;
+        let result = dispatchDomainTool(name, args);
 
-        // Domain tools
-        result = dispatchDomainTool(name, args);
-
-        // If a domain tool returns candidates, store pending and return prompt immediately
         if (result && result.ok === false && Array.isArray(result.candidates) && result.candidates.length){
           const kind =
             name.startsWith("field_") ? "field" :
@@ -326,11 +311,9 @@ IMPORTANT:
             "item";
 
           setPending(thread, { kind, candidates: result.candidates, originalText: textRaw });
-
           return respond(res, true, formatDidYouMean(kind, result.candidates), meta);
         }
 
-        // db_query fallback
         if (!result && name === "db_query"){
           meta.dbQueryUsed = true;
           const sql = cleanSql(args.sql || "");
@@ -352,7 +335,6 @@ IMPORTANT:
         });
       }
 
-      // Allow final text
       rsp = await openai({
         model: OPENAI_MODEL,
         tools,
