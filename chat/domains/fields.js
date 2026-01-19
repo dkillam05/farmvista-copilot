@@ -1,7 +1,7 @@
 // /chat/domains/fields.js  (FULL FILE)
 // Rev: 2026-01-16e+idDirect  domain:fields
 //
-// Owns field tools+field prefix guardrail.
+// Owns field tools + field prefix guardrail.
 // Tools:
 // - field_profile(query)                 => full field info + farm + RTK tower details (best-effort).
 // - field_pick_any_profile()             => pick one field and return full profile (no failures).
@@ -108,7 +108,7 @@ export function looksLikeRtkFieldPrefix(text) {
 }
 
 export function findFieldsByPrefix(prefix) {
-  const sql =	tf
+  const sql = `
     SELECT id, name, rtkTowerId, rtkTowerName
     FROM fields
     WHERE name LIKE ?
@@ -428,8 +428,7 @@ export function fieldsHandleToolCall(name, args) {
   const query = safeStr(args?.query).trim();
   if (!query) return { ok: false, error: "missing_query" };
 
-  // ✅ FIX: if it looks like an internal id (common in pending confirm), try direct select first.
-  // (Avoid resolveField() failing on ids.)
+  // ✅ FIX: if it looks like an internal id, SELECT by id directly before resolveField()
   const looksLikeId = query.length >= 12 && !/^\d{3,5}$/.test(query);
   if (looksLikeId) {
     const direct = runSql({ sql: `SELECT * FROM fields WHERE id = ? LIMIT 1`, params: [query], limit: 1 });
@@ -459,7 +458,7 @@ export function fieldsHandleToolCall(name, args) {
     }
   }
 
-  // If user gives a short numeric code like "0513", try LIKE first.
+  // original logic continues unchanged...
   const isCode = /^\d{3,5}$/.test(query);
   if (isCode) {
     const r = findFieldsByPrefix(query);
@@ -487,7 +486,6 @@ export function fieldsHandleToolCall(name, args) {
   const fieldRow = Array.isArray(fieldRes?.rows) && fieldRes.rows.length ? fieldRes.rows[0] : null;
   if (!fieldRow) return { ok: false, error: "field_not_found" };
 
-  // farm best-effort
   let farmRow = null;
   try {
     const farmId = safeStr(fieldRow.farmId).trim();
@@ -499,7 +497,6 @@ export function fieldsHandleToolCall(name, args) {
     }
   } catch {}
 
-  // tower best-effort
   let towerRow = null;
   try {
     const towerId = safeStr(fieldRow.rtkTowerId).trim();
