@@ -1,10 +1,10 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-20-v2-handlechat-dbready
+// Rev: 2026-01-20-v2-handlechat-splitgetters
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
 import { ensureReady } from "../data/sqlite.js";
-import { getFieldFullByKey, getGrainBagsDownSummary } from "../data/getters.js";
+import { getFieldFullByKey, getGrainBagsDownSummary } from "../data/getters/index.js";
 
 export async function handleChat(req, res) {
   try {
@@ -21,12 +21,14 @@ export async function handleChat(req, res) {
     switch ((intent?.intent || "").toUpperCase()) {
       case "FIELD_FULL":
         data = getFieldFullByKey(intent.key);
-        prompt = "Write a complete field summary for operations. Include farm + county/state + tillable acres + HEL/CRP + RTK tower/network/frequency if present.";
+        prompt =
+          "Write a complete field summary for operations. Include farm + county/state + tillable acres + HEL/CRP + RTK tower/network/frequency if present.";
         break;
 
       case "GRAIN_BAGS_DOWN":
         data = getGrainBagsDownSummary();
-        prompt = "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
+        prompt =
+          "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
         break;
 
       default:
@@ -35,7 +37,6 @@ export async function handleChat(req, res) {
 
     const answer = await writeAnswer(prompt, data);
     res.json({ answer });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err?.message || String(err) });
