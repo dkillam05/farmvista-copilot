@@ -14,12 +14,12 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --omit=dev
 
-# ---- Copy only what v2 needs (no legacy fallbacks) ----
+# ---- Copy ONLY what v2 needs ----
 COPY src ./src
 COPY context ./context
 
 ENV PORT=8080
 EXPOSE 8080
 
-# Uses package.json "start" which MUST point to src/server.js
+# Must point to src/server.js via package.json "start"
 CMD ["npm", "start"]
