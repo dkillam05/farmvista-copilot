@@ -1,24 +1,67 @@
 // /src/data/getters/grainBags.js  (FULL FILE)
-// Rev: 2026-01-20-v2-getters-grainbags
+// Rev: 2026-01-20-v2-getters-grainbags-soycol-autodetect
 //
-// Uses canonical truth view: v_grainBag_open_remaining
-// Uses productsGrainBags for capacities (if join matches)
+// Fix:
+// - Soybeans were returning 0 bushels even with non-zero counts.
+// - Root cause is typically a schema mismatch: productsGrainBags soy capacity column name differs.
+// - This version auto-detects the soy capacity column from PRAGMA table_info(productsGrainBags)
+//   and uses it in the SQL.
+// - Also relaxes brand matching so capacity join doesn't silently fail on soy bags.
+//
+// Truth source remains: v_grainBag_open_remaining
 
-import { db } from '../sqlite.js';
+import { db } from "../sqlite.js";
+
+function pickCapacityCols(sqlite) {
+  const cols = sqlite.prepare(`PRAGMA table_info(productsGrainBags)`).all().map(r => r.name);
+
+  const has = (c) => cols.includes(c);
+
+  // Corn is usually stable
+  const corn = has("bushelsCorn") ? "bushelsCorn" : null;
+
+  // Soy is commonly named a few ways
+  const soy =
+    has("bushelsSoy") ? "bushelsSoy" :
+    has("bushelsSoybeans") ? "bushelsSoybeans" :
+    has("bushelsBeans") ? "bushelsBeans" :
+    has("bushelsBean") ? "bushelsBean" :
+    null;
+
+  const wheat =
+    has("bushelsWheat") ? "bushelsWheat" :
+    has("bushelsWh") ? "bushelsWh" :
+    null;
+
+  if (!corn) {
+    throw new Error("productsGrainBags is missing bushelsCorn (required for v2)");
+  }
+  if (!soy) {
+    // We can still run, but soy will be 0; better to fail loudly so you fix schema once.
+    throw new Error("productsGrainBags has no recognized soy capacity column (expected bushelsSoy or bushelsSoybeans etc.)");
+  }
+  // wheat is optional
+
+  return { corn, soy, wheat };
+}
 
 export function getGrainBagsDownSummary() {
   const sqlite = db();
+  const { corn, soy, wheat } = pickCapacityCols(sqlite);
 
-  const rows = sqlite.prepare(`
+  // Build SQL with chosen column names (safe because they come from PRAGMA)
+  const wheatExpr = wheat ? `COALESCE(cap.${wheat}, 0)` : `0`;
+
+  const sql = `
     WITH cap AS (
       SELECT
         p.id,
         p.brand,
         p.diameterFt,
         p.lengthFt,
-        p.bushelsCorn,
-        p.bushelsSoy,
-        p.bushelsWheat
+        p.${corn}  AS bushelsCorn,
+        p.${soy}   AS bushelsSoy,
+        ${wheat ? `p.${wheat} AS bushelsWheat` : `0 AS bushelsWheat`}
       FROM productsGrainBags p
     ),
     open AS (
@@ -41,17 +84,20 @@ export function getGrainBagsDownSummary() {
         open.remainingPartial AS remainingPartial,
         open.remainingPartialFeetSum AS remainingPartialFeetSum,
         open.bagSizeFeet AS bagSizeFeet,
+
         CASE
           WHEN lower(open.cropType) LIKE '%corn%'  THEN COALESCE(cap.bushelsCorn, 0)
           WHEN lower(open.cropType) LIKE '%soy%'   THEN COALESCE(cap.bushelsSoy, 0)
-          WHEN lower(open.cropType) LIKE '%wheat%' THEN COALESCE(cap.bushelsWheat, 0)
+          WHEN lower(open.cropType) LIKE '%bean%'  THEN COALESCE(cap.bushelsSoy, 0)
+          WHEN lower(open.cropType) LIKE '%wheat%' THEN ${wheat ? "COALESCE(cap.bushelsWheat, 0)" : "0"}
           ELSE COALESCE(cap.bushelsCorn, 0)
         END AS bagCapacityBu
+
       FROM open
       LEFT JOIN cap
         ON cap.diameterFt = open.bagDiameterFt
        AND cap.lengthFt   = open.bagSizeFeet
-       AND (cap.brand IS NULL OR open.bagBrand IS NULL OR lower(cap.brand)=lower(open.bagBrand))
+       -- Brand matching is optional; do not fail join just because brand differs/missing.
     )
     SELECT
       cropType,
@@ -80,7 +126,7 @@ export function getGrainBagsDownSummary() {
     FROM joined
     GROUP BY cropType
     ORDER BY cropType ASC
-  `).all();
+  `;
 
-  return rows;
+  return sqlite.prepare(sql).all();
 }
