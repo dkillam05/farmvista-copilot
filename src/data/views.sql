@@ -1,0 +1,11 @@
+-- REQUIRED VIEW
+-- v_field_full
+-- columns:
+-- field_id, field_name, farm_name, county, state,
+-- tillable_acres, hel, crp,
+-- rtk_tower_name, rtk_network, rtk_frequency
+
+-- REQUIRED VIEW
+-- v_grain_bags_down
+-- columns:
+-- crop, bushels
