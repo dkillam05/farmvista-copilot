@@ -1,32 +1,36 @@
-import { detectIntent } from './intent.js';
-import { writeAnswer } from './answerWriter.js';
-import { getFieldFullByKey, getGrainBagSummary } from '../data/getters.js';
+// /src/chat/handleChat.js  (FULL FILE)
+// Rev: 2026-01-20-v2-handlechat-dbready
+
+import { detectIntent } from "./intent.js";
+import { writeAnswer } from "./answerWriter.js";
+import { ensureReady } from "../data/sqlite.js";
+import { getFieldFullByKey, getGrainBagsDownSummary } from "../data/getters.js";
 
 export async function handleChat(req, res) {
   try {
     const { question } = req.body;
-    if (!question) {
-      return res.status(400).json({ error: 'Missing question' });
-    }
+    if (!question) return res.status(400).json({ error: "Missing question" });
+
+    await ensureReady();
 
     const intent = await detectIntent(question);
 
     let data;
     let prompt;
 
-    switch (intent.intent) {
-      case 'FIELD_FULL':
+    switch ((intent?.intent || "").toUpperCase()) {
+      case "FIELD_FULL":
         data = getFieldFullByKey(intent.key);
-        prompt = 'Explain everything about this field including RTK info.';
+        prompt = "Write a complete field summary for operations. Include farm + county/state + tillable acres + HEL/CRP + RTK tower/network/frequency if present.";
         break;
 
-      case 'GRAIN_BAGS_DOWN':
-        data = getGrainBagSummary();
-        prompt = 'Summarize current grain bags down.';
+      case "GRAIN_BAGS_DOWN":
+        data = getGrainBagsDownSummary();
+        prompt = "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
         break;
 
       default:
-        return res.json({ answer: "I don't know how to answer that yet." });
+        return res.json({ answer: "I don't know how to answer that yet in v2." });
     }
 
     const answer = await writeAnswer(prompt, data);
@@ -34,6 +38,6 @@ export async function handleChat(req, res) {
 
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err?.message || String(err) });
   }
 }
