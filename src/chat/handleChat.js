@@ -1,10 +1,7 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-21-v2-handlechat-rtk-count-list-fields
+// Rev: 2026-01-21-v2-handlechat-add-counties
 //
-// Supports:
-// - payload.text or payload.question
-// - intents: FIELD_FULL, GRAIN_BAGS_DOWN, RTK_TOWER_COUNT, RTK_TOWER_LIST, RTK_TOWER_FIELDS
-// - returns ok/text/meta for FarmVista UI
+// Adds COUNTIES_FARMED routing. Uses fields.county as truth.
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
@@ -15,7 +12,8 @@ import {
   getGrainBagsDownSummary,
   getRtkTowerCount,
   getRtkTowerList,
-  getFieldsByRtkTowerKey
+  getFieldsByRtkTowerKey,
+  getCountySummary
 } from "../data/getters/index.js";
 
 function pickPrompt(body) {
@@ -67,6 +65,12 @@ export async function handleChat(req, res) {
         data = getFieldsByRtkTowerKey(intent.key);
         prompt =
           "Show the RTK tower info (name, network, frequency), then list the fields assigned to it. For each field show fieldName, farmName, county/state, and acresTillable (if present).";
+        break;
+
+      case "COUNTIES_FARMED":
+        data = getCountySummary();
+        prompt =
+          "Answer how many counties we farm in. Then list each county with fieldCount and tillableAcres. Keep it compact.";
         break;
 
       default: {
