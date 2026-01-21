@@ -1,7 +1,7 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-21-v2-handlechat-add-counties
+// Rev: 2026-01-21-v2-handlechat-county-reports
 //
-// Adds COUNTIES_FARMED routing. Uses fields.county as truth.
+// Adds COUNTY_STATS / COUNTY_FIELDS / COUNTY_FARMS.
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
@@ -13,7 +13,10 @@ import {
   getRtkTowerCount,
   getRtkTowerList,
   getFieldsByRtkTowerKey,
-  getCountySummary
+  getCountySummary,
+  getCountyStatsByKey,
+  getFieldsInCounty,
+  getFarmsInCounty
 } from "../data/getters/index.js";
 
 function pickPrompt(body) {
@@ -71,6 +74,24 @@ export async function handleChat(req, res) {
         data = getCountySummary();
         prompt =
           "Answer how many counties we farm in. Then list each county with fieldCount and tillableAcres. Keep it compact.";
+        break;
+
+      case "COUNTY_STATS":
+        data = getCountyStatsByKey(intent.key);
+        prompt =
+          "Give county totals: fieldCount, tillableAcres, HEL acres + helFieldCount, CRP acres + crpFieldCount. Use a tight, readable format.";
+        break;
+
+      case "COUNTY_FIELDS":
+        data = getFieldsInCounty(intent.key);
+        prompt =
+          "Show the county name, then list fields in that county. For each field show fieldName, farmName, acresTillable, and HEL/CRP acres if any. Keep it readable.";
+        break;
+
+      case "COUNTY_FARMS":
+        data = getFarmsInCounty(intent.key);
+        prompt =
+          "Show the county name, then list farms that have fields in that county. For each farm show farmName, fieldCount, and tillableAcres.";
         break;
 
       default: {
