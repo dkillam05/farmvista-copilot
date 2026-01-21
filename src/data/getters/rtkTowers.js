@@ -1,29 +1,33 @@
 // /src/data/getters/rtkTowers.js  (FULL FILE)
-// Rev: 2026-01-21-v2-getters-rtk-allinone
+// Rev: 2026-01-21-v2-getters-rtk-active-default
 //
-// RTK getters (ALL in one file):
-// - getRtkTowerCount()
-// - getRtkTowerList()
-// - getFieldsByRtkTowerKey(key)
-//
-// Snapshot tables used:
-// - rtkTowers
-// - fields
-// - farms (for farm name join on fields)
+// Default: ACTIVE ONLY for field assignment counts/lists.
+// includeArchived=true will include archived fields (separated).
 
 import { db } from "../sqlite.js";
 
-function normKey(x) {
-  return (x ?? "").toString().trim();
+function normKey(x) { return (x ?? "").toString().trim(); }
+function asStr(x) { return (x ?? "").toString(); }
+function nonEmptyOrNull(x) { const s = asStr(x).trim(); return s ? s : null; }
+
+function hasColumn(sqlite, table, col) {
+  try {
+    const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all();
+    return rows.some(r => r.name === col);
+  } catch {
+    return false;
+  }
 }
 
-function asStr(x) {
-  return (x ?? "").toString();
+function activeWhere(sqlite, alias, includeArchived) {
+  if (includeArchived) return "";
+  if (hasColumn(sqlite, "fields", "archived")) return ` AND COALESCE(${alias}.archived,0)=0 `;
+  return "";
 }
 
-function nonEmptyOrNull(x) {
-  const s = asStr(x).trim();
-  return s ? s : null;
+function archivedWhere(sqlite, alias) {
+  if (hasColumn(sqlite, "fields", "archived")) return ` AND COALESCE(${alias}.archived,0)=1 `;
+  return " AND 1=0 ";
 }
 
 export function getRtkTowerCount() {
@@ -32,20 +36,23 @@ export function getRtkTowerCount() {
   return { count: Number(row?.n || 0) };
 }
 
-export function getRtkTowerList() {
+export function getRtkTowerList(opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const sqlite = db();
 
-  // List towers with number of assigned fields
   const rows = sqlite.prepare(`
     SELECT
       t.id        AS towerId,
       t.name      AS towerName,
       t.networkId AS networkId,
       t.frequency AS frequency,
-      COUNT(f.id) AS fieldCount
+      (
+        SELECT COUNT(1)
+        FROM fields f
+        WHERE f.rtkTowerId = t.id
+        ${activeWhere(sqlite, "f", includeArchived)}
+      ) AS fieldCount
     FROM rtkTowers t
-    LEFT JOIN fields f ON f.rtkTowerId = t.id
-    GROUP BY t.id
     ORDER BY
       CASE WHEN t.name IS NULL OR t.name = '' THEN 1 ELSE 0 END,
       lower(t.name) ASC
@@ -60,13 +67,13 @@ export function getRtkTowerList() {
   }));
 }
 
-export function getFieldsByRtkTowerKey(key) {
+export function getFieldsByRtkTowerKey(key, opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const k = normKey(key);
   if (!k) throw new Error("Missing tower key");
 
   const sqlite = db();
 
-  // Resolve tower by exact id first, else name contains
   const tower =
     sqlite.prepare(`
       SELECT id AS towerId, name AS towerName, networkId, frequency
@@ -85,24 +92,50 @@ export function getFieldsByRtkTowerKey(key) {
 
   if (!tower) throw new Error(`RTK tower not found: ${k}`);
 
-  const fields = sqlite.prepare(`
+  const fetch = (whereExtra) => sqlite.prepare(`
     SELECT
-      f.id            AS fieldId,
-      f.name          AS fieldName,
-
-      -- fields.farmName is often "" so treat empty string as NULL and fall back to farms.name
-      COALESCE(NULLIF(f.farmName, ''), fm.name) AS farmName,
-
-      f.county        AS county,
-      f.state         AS state,
+      f.id AS fieldId,
+      f.name AS fieldName,
+      COALESCE(NULLIF(f.farmName,''), fm.name) AS farmName,
+      f.county AS county,
+      COALESCE(f.state,'') AS state,
       f.acresTillable AS acresTillable
     FROM fields f
     LEFT JOIN farms fm ON fm.id = f.farmId
     WHERE f.rtkTowerId = ?
-    ORDER BY
-      CASE WHEN f.name IS NULL OR f.name = '' THEN 1 ELSE 0 END,
-      lower(f.name) ASC
+    ${whereExtra}
+    ORDER BY lower(f.name) ASC
   `).all(tower.towerId);
+
+  const active = fetch(activeWhere(sqlite, "f", includeArchived)).map(r => ({
+    fieldId: r.fieldId,
+    fieldName: nonEmptyOrNull(r.fieldName) || "(Unnamed)",
+    farmName: nonEmptyOrNull(r.farmName) || "",
+    county: nonEmptyOrNull(r.county) || "",
+    state: nonEmptyOrNull(r.state) || "",
+    acresTillable: (r.acresTillable === null || r.acresTillable === undefined) ? "" : r.acresTillable
+  }));
+
+  if (!includeArchived) {
+    return {
+      tower: {
+        towerId: tower.towerId,
+        towerName: nonEmptyOrNull(tower.towerName) || "(Unnamed)",
+        networkId: nonEmptyOrNull(tower.networkId) || "",
+        frequency: nonEmptyOrNull(tower.frequency) || ""
+      },
+      active
+    };
+  }
+
+  const archived = fetch(archivedWhere(sqlite, "f")).map(r => ({
+    fieldId: r.fieldId,
+    fieldName: nonEmptyOrNull(r.fieldName) || "(Unnamed)",
+    farmName: nonEmptyOrNull(r.farmName) || "",
+    county: nonEmptyOrNull(r.county) || "",
+    state: nonEmptyOrNull(r.state) || "",
+    acresTillable: (r.acresTillable === null || r.acresTillable === undefined) ? "" : r.acresTillable
+  }));
 
   return {
     tower: {
@@ -111,13 +144,7 @@ export function getFieldsByRtkTowerKey(key) {
       networkId: nonEmptyOrNull(tower.networkId) || "",
       frequency: nonEmptyOrNull(tower.frequency) || ""
     },
-    fields: fields.map(f => ({
-      fieldId: f.fieldId,
-      fieldName: nonEmptyOrNull(f.fieldName) || "(Unnamed)",
-      farmName: nonEmptyOrNull(f.farmName) || "",
-      county: nonEmptyOrNull(f.county) || "",
-      state: nonEmptyOrNull(f.state) || "",
-      acresTillable: (f.acresTillable === null || f.acresTillable === undefined) ? "" : f.acresTillable
-    }))
+    active,
+    archived
   };
 }
