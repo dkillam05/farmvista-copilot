@@ -1,12 +1,5 @@
 // /src/chat/intent.js  (FULL FILE)
-// Rev: 2026-01-21-v2-intent-rtk-count-list-fields
-//
-// Supports RTK intents:
-// - RTK_TOWER_COUNT
-// - RTK_TOWER_LIST
-// - RTK_TOWER_FIELDS
-//
-// Keeps existing FIELD_FULL and GRAIN_BAGS_DOWN behavior.
+// Rev: 2026-01-21-v2-intent-rtk-plus-county-reports
 
 import OpenAI from 'openai';
 
@@ -25,37 +18,30 @@ export async function detectIntent(userText) {
 Classify the user request into ONE intent and return JSON ONLY.
 
 Intents:
-- FIELD_FULL
-  User wants details about a specific field (id or name).
-  key = field id or field name.
+- FIELD_FULL: field details (id/name). key=field id/name.
+- GRAIN_BAGS_DOWN: grain bags down summary. key="".
+- RTK_TOWER_COUNT: count RTK towers. key="".
+- RTK_TOWER_LIST: list RTK towers. key="".
+- RTK_TOWER_FIELDS: fields assigned to a specific RTK tower. key=tower name/id.
 
-- GRAIN_BAGS_DOWN
-  User wants current grain bags down summary.
-  key = "".
+- COUNTIES_FARMED: how many counties we farm in / which counties. key="".
+- COUNTY_STATS: HEL/CRP/tillable/field counts for a county. key=county name.
+- COUNTY_FIELDS: list fields in a county. key=county name.
+- COUNTY_FARMS: list farms that have fields in a county. key=county name.
 
-- RTK_TOWER_COUNT
-  User asks how many RTK towers exist / are used.
-  key = "".
+- UNKNOWN: anything else. key="".
 
-- RTK_TOWER_LIST
-  User asks to list RTK towers.
-  key = "".
+Rules:
+- If question asks "how many" + ("rtk" and "tower") -> RTK_TOWER_COUNT.
+- If question asks to "list/show" towers -> RTK_TOWER_LIST.
+- If question asks for fields assigned to a tower -> RTK_TOWER_FIELDS (key=tower).
 
-- RTK_TOWER_FIELDS
-  User asks for fields assigned to a specific RTK tower.
-  key = RTK tower name or id.
+- If question asks "how many counties" OR "which counties" AND mentions farm/farm in/we farm -> COUNTIES_FARMED.
+- If question mentions "county" AND any of (HEL, CRP, tillable, acres, stats, totals) -> COUNTY_STATS (key=county).
+- If question mentions "fields" AND "county" -> COUNTY_FIELDS (key=county).
+- If question mentions "farms" AND "county" -> COUNTY_FARMS (key=county).
 
-- UNKNOWN
-  Anything else.
-  key = "".
-
-Rules (IMPORTANT):
-- If question contains "how many" AND mentions "rtk" and "tower" -> RTK_TOWER_COUNT.
-- If question contains "list" OR "show" AND mentions "tower" -> RTK_TOWER_LIST.
-- If question mentions BOTH "fields" AND "tower" AND references a specific tower name -> RTK_TOWER_FIELDS.
-- Do NOT choose FIELD_FULL for generic phrases like "rtk towers".
-
-Return JSON ONLY in this format:
+Return JSON ONLY:
 { "intent": "<INTENT>", "key": "<string>" }
         `.trim()
       },
