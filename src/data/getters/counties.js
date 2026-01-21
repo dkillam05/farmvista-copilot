@@ -1,166 +1,220 @@
 // /src/data/getters/counties.js  (FULL FILE)
-// Rev: 2026-01-21-v2-getters-counties-reports
+// Rev: 2026-01-21-v2-getters-counties-active-default-archived-separate
 //
-// County reporting from fields (truth):
-// - getCountySummary()                     => how many counties + per-county fieldCount/tillable
-// - getCountyStatsByKey(countyKey)         => HEL/CRP/tillable + counts for a specific county
-// - getFieldsInCounty(countyKey)           => list fields in a county (with farm + acres + HEL/CRP)
-// - getFarmsInCounty(countyKey)            => list farms that have fields in a county (with counts)
-//
-// Tables used:
-// - fields (county/state/acresTillable/hasHEL/helAcres/hasCRP/crpAcres/farmId/farmName)
-// - farms  (name)
+// Default behavior: ACTIVE ONLY.
+// If includeArchived=true, we return active + archived sections separately.
+// Counties with zero active fields never appear in normal results.
 
 import { db } from "../sqlite.js";
 
-function norm(s) {
-  return (s ?? "").toString().trim();
+function norm(s) { return (s ?? "").toString().trim(); }
+
+function hasColumn(sqlite, table, col) {
+  try {
+    const rows = sqlite.prepare(`PRAGMA table_info(${table})`).all();
+    return rows.some(r => r.name === col);
+  } catch {
+    return false;
+  }
 }
 
-function requireKey(key, label) {
-  const k = norm(key);
-  if (!k) throw new Error(`Missing ${label}`);
-  return k;
+function activeWhere(sqlite, alias, includeArchived) {
+  if (includeArchived) return "";
+  // If archived column exists, filter to active
+  if (hasColumn(sqlite, "fields", "archived")) {
+    return ` AND COALESCE(${alias}.archived,0)=0 `;
+  }
+  return "";
 }
 
-export function getCountySummary() {
+function archivedWhere(sqlite, alias) {
+  if (hasColumn(sqlite, "fields", "archived")) {
+    return ` AND COALESCE(${alias}.archived,0)=1 `;
+  }
+  // If no archived column, there is no concept of archived
+  return " AND 1=0 ";
+}
+
+export function getCountySummary(opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const sqlite = db();
 
-  const rows = sqlite.prepare(`
+  const act = sqlite.prepare(`
     SELECT
-      county,
-      COALESCE(state, '') AS state,
+      f.county AS county,
+      COALESCE(f.state,'') AS state,
       COUNT(1) AS fieldCount,
-      ROUND(SUM(COALESCE(acresTillable, 0)), 2) AS tillableAcres
-    FROM fields
-    WHERE county IS NOT NULL AND TRIM(county) <> ''
-    GROUP BY county, state
-    ORDER BY lower(county) ASC
+      ROUND(SUM(COALESCE(f.acresTillable, 0)), 2) AS tillableAcres
+    FROM fields f
+    WHERE f.county IS NOT NULL AND TRIM(f.county) <> ''
+    ${activeWhere(sqlite, "f", false)}
+    GROUP BY f.county, state
+    HAVING COUNT(1) > 0
+    ORDER BY lower(f.county) ASC
   `).all();
 
-  const counties = rows
+  const active = act.map(r => ({
+    county: norm(r.county),
+    state: norm(r.state),
+    fieldCount: Number(r.fieldCount || 0),
+    tillableAcres: Number(r.tillableAcres || 0)
+  })).filter(x => x.county);
+
+  if (!includeArchived) return { active };
+
+  // Archived-only counties = counties that appear in archived fields but not in active fields
+  const arch = sqlite.prepare(`
+    SELECT
+      f.county AS county,
+      COALESCE(f.state,'') AS state,
+      COUNT(1) AS fieldCount,
+      ROUND(SUM(COALESCE(f.acresTillable, 0)), 2) AS tillableAcres
+    FROM fields f
+    WHERE f.county IS NOT NULL AND TRIM(f.county) <> ''
+    ${archivedWhere(sqlite, "f")}
+    GROUP BY f.county, state
+    HAVING COUNT(1) > 0
+    ORDER BY lower(f.county) ASC
+  `).all();
+
+  const activeSet = new Set(active.map(x => `${x.county}|${x.state}`));
+  const archivedOnly = arch
     .map(r => ({
       county: norm(r.county),
       state: norm(r.state),
       fieldCount: Number(r.fieldCount || 0),
       tillableAcres: Number(r.tillableAcres || 0)
     }))
-    .filter(x => x.county);
+    .filter(x => x.county && !activeSet.has(`${x.county}|${x.state}`));
 
-  return { count: counties.length, counties };
+  return { active, archivedOnly };
 }
 
-export function getCountyStatsByKey(countyKey) {
-  const k = requireKey(countyKey, "county");
+export function getCountyStatsByKey(countyKey, opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const sqlite = db();
+  const key = norm(countyKey);
+  if (!key) throw new Error("Missing county");
 
-  // Resolve county by "contains" match (case-insensitive) so user can say "macoup" etc.
-  // Pick the best match with most fields.
-  const best = sqlite.prepare(`
-    SELECT county, COALESCE(state,'') AS state, COUNT(1) AS n
-    FROM fields
-    WHERE county IS NOT NULL AND TRIM(county) <> '' AND lower(county) LIKE lower(?)
-    GROUP BY county, state
-    ORDER BY n DESC
-    LIMIT 1
-  `).get(`%${k}%`);
+  function bestCounty(whereExtra) {
+    return sqlite.prepare(`
+      SELECT f.county AS county, COALESCE(f.state,'') AS state, COUNT(1) AS n
+      FROM fields f
+      WHERE f.county IS NOT NULL AND TRIM(f.county) <> '' AND lower(f.county) LIKE lower(?)
+      ${whereExtra}
+      GROUP BY f.county, state
+      ORDER BY n DESC
+      LIMIT 1
+    `).get(`%${key}%`);
+  }
 
-  if (!best) throw new Error(`County not found: ${k}`);
+  const bestActive = bestCounty(activeWhere(sqlite, "f", false));
+  if (!bestActive && !includeArchived) throw new Error(`County not found (active): ${key}`);
 
-  const stats = sqlite.prepare(`
+  const best = bestActive || bestCounty(""); // any if includeArchived=true
+
+  const compute = (whereExtra) => sqlite.prepare(`
     SELECT
-      county,
-      COALESCE(state,'') AS state,
       COUNT(1) AS fieldCount,
-      ROUND(SUM(COALESCE(acresTillable, 0)), 2) AS tillableAcres,
-
-      SUM(CASE WHEN COALESCE(hasHEL,0) = 1 THEN 1 ELSE 0 END) AS helFieldCount,
-      ROUND(SUM(COALESCE(helAcres, 0)), 2) AS helAcres,
-
-      SUM(CASE WHEN COALESCE(hasCRP,0) = 1 THEN 1 ELSE 0 END) AS crpFieldCount,
-      ROUND(SUM(COALESCE(crpAcres, 0)), 2) AS crpAcres
-    FROM fields
-    WHERE county = ? AND COALESCE(state,'') = ?
+      ROUND(SUM(COALESCE(f.acresTillable,0)), 2) AS tillableAcres,
+      SUM(CASE WHEN COALESCE(f.hasHEL,0)=1 THEN 1 ELSE 0 END) AS helFieldCount,
+      ROUND(SUM(COALESCE(f.helAcres,0)), 2) AS helAcres,
+      SUM(CASE WHEN COALESCE(f.hasCRP,0)=1 THEN 1 ELSE 0 END) AS crpFieldCount,
+      ROUND(SUM(COALESCE(f.crpAcres,0)), 2) AS crpAcres
+    FROM fields f
+    WHERE f.county = ? AND COALESCE(f.state,'') = ?
+    ${whereExtra}
   `).get(best.county, best.state);
 
-  return {
-    county: norm(stats.county),
-    state: norm(stats.state),
-    fieldCount: Number(stats.fieldCount || 0),
-    tillableAcres: Number(stats.tillableAcres || 0),
-    helFieldCount: Number(stats.helFieldCount || 0),
-    helAcres: Number(stats.helAcres || 0),
-    crpFieldCount: Number(stats.crpFieldCount || 0),
-    crpAcres: Number(stats.crpAcres || 0)
-  };
+  const active = compute(activeWhere(sqlite, "f", false));
+  if (!includeArchived) {
+    return { county: norm(best.county), state: norm(best.state), active };
+  }
+
+  const archived = compute(archivedWhere(sqlite, "f"));
+  return { county: norm(best.county), state: norm(best.state), active, archived };
 }
 
-export function getFieldsInCounty(countyKey) {
-  const k = requireKey(countyKey, "county");
+export function getFieldsInCounty(countyKey, opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const sqlite = db();
+  const key = norm(countyKey);
+  if (!key) throw new Error("Missing county");
 
   const best = sqlite.prepare(`
-    SELECT county, COALESCE(state,'') AS state, COUNT(1) AS n
-    FROM fields
-    WHERE county IS NOT NULL AND TRIM(county) <> '' AND lower(county) LIKE lower(?)
-    GROUP BY county, state
+    SELECT f.county AS county, COALESCE(f.state,'') AS state, COUNT(1) AS n
+    FROM fields f
+    WHERE f.county IS NOT NULL AND TRIM(f.county) <> '' AND lower(f.county) LIKE lower(?)
+    GROUP BY f.county, state
     ORDER BY n DESC
     LIMIT 1
-  `).get(`%${k}%`);
+  `).get(`%${key}%`);
 
-  if (!best) throw new Error(`County not found: ${k}`);
+  if (!best) throw new Error(`County not found: ${key}`);
 
-  const fields = sqlite.prepare(`
+  const fetchFields = (whereExtra) => sqlite.prepare(`
     SELECT
       f.id AS fieldId,
       f.name AS fieldName,
       COALESCE(NULLIF(f.farmName,''), fm.name) AS farmName,
-      f.county AS county,
-      COALESCE(f.state,'') AS state,
       f.acresTillable AS acresTillable,
       COALESCE(f.hasHEL,0) AS hasHEL,
       COALESCE(f.helAcres,0) AS helAcres,
       COALESCE(f.hasCRP,0) AS hasCRP,
-      COALESCE(f.crpAcres,0) AS crpAcres
+      COALESCE(f.crpAcres,0) AS crpAcres,
+      ${hasColumn(sqlite,"fields","archived") ? "COALESCE(f.archived,0) AS archived" : "0 AS archived"}
     FROM fields f
     LEFT JOIN farms fm ON fm.id = f.farmId
     WHERE f.county = ? AND COALESCE(f.state,'') = ?
+    ${whereExtra}
     ORDER BY lower(f.name) ASC
   `).all(best.county, best.state);
 
-  return {
-    county: norm(best.county),
-    state: norm(best.state),
-    fieldCount: fields.length,
-    fields: fields.map(r => ({
-      fieldId: r.fieldId,
-      fieldName: norm(r.fieldName) || "(Unnamed)",
-      farmName: norm(r.farmName) || "",
-      acresTillable: (r.acresTillable === null || r.acresTillable === undefined) ? "" : r.acresTillable,
-      hasHEL: Number(r.hasHEL || 0) === 1,
-      helAcres: Number(r.helAcres || 0),
-      hasCRP: Number(r.hasCRP || 0) === 1,
-      crpAcres: Number(r.crpAcres || 0)
-    }))
-  };
+  const active = fetchFields(activeWhere(sqlite, "f", false)).map(r => ({
+    fieldId: r.fieldId,
+    fieldName: norm(r.fieldName) || "(Unnamed)",
+    farmName: norm(r.farmName) || "",
+    acresTillable: r.acresTillable ?? "",
+    hasHEL: Number(r.hasHEL || 0) === 1,
+    helAcres: Number(r.helAcres || 0),
+    hasCRP: Number(r.hasCRP || 0) === 1,
+    crpAcres: Number(r.crpAcres || 0)
+  }));
+
+  if (!includeArchived) return { county: norm(best.county), state: norm(best.state), active };
+
+  const archived = fetchFields(archivedWhere(sqlite, "f")).map(r => ({
+    fieldId: r.fieldId,
+    fieldName: norm(r.fieldName) || "(Unnamed)",
+    farmName: norm(r.farmName) || "",
+    acresTillable: r.acresTillable ?? "",
+    hasHEL: Number(r.hasHEL || 0) === 1,
+    helAcres: Number(r.helAcres || 0),
+    hasCRP: Number(r.hasCRP || 0) === 1,
+    crpAcres: Number(r.crpAcres || 0)
+  }));
+
+  return { county: norm(best.county), state: norm(best.state), active, archived };
 }
 
-export function getFarmsInCounty(countyKey) {
-  const k = requireKey(countyKey, "county");
+export function getFarmsInCounty(countyKey, opts = {}) {
+  const includeArchived = opts.includeArchived === true;
   const sqlite = db();
+  const key = norm(countyKey);
+  if (!key) throw new Error("Missing county");
 
   const best = sqlite.prepare(`
-    SELECT county, COALESCE(state,'') AS state, COUNT(1) AS n
-    FROM fields
-    WHERE county IS NOT NULL AND TRIM(county) <> '' AND lower(county) LIKE lower(?)
-    GROUP BY county, state
+    SELECT f.county AS county, COALESCE(f.state,'') AS state, COUNT(1) AS n
+    FROM fields f
+    WHERE f.county IS NOT NULL AND TRIM(f.county) <> '' AND lower(f.county) LIKE lower(?)
+    GROUP BY f.county, state
     ORDER BY n DESC
     LIMIT 1
-  `).get(`%${k}%`);
+  `).get(`%${key}%`);
 
-  if (!best) throw new Error(`County not found: ${k}`);
+  if (!best) throw new Error(`County not found: ${key}`);
 
-  const rows = sqlite.prepare(`
+  const fetchFarms = (whereExtra) => sqlite.prepare(`
     SELECT
       COALESCE(NULLIF(f.farmName,''), fm.name, '(Unnamed)') AS farmName,
       COUNT(1) AS fieldCount,
@@ -168,18 +222,25 @@ export function getFarmsInCounty(countyKey) {
     FROM fields f
     LEFT JOIN farms fm ON fm.id = f.farmId
     WHERE f.county = ? AND COALESCE(f.state,'') = ?
+    ${whereExtra}
     GROUP BY farmName
+    HAVING COUNT(1) > 0
     ORDER BY lower(farmName) ASC
   `).all(best.county, best.state);
 
-  return {
-    county: norm(best.county),
-    state: norm(best.state),
-    farmCount: rows.length,
-    farms: rows.map(r => ({
-      farmName: norm(r.farmName) || "(Unnamed)",
-      fieldCount: Number(r.fieldCount || 0),
-      tillableAcres: Number(r.tillableAcres || 0)
-    }))
-  };
+  const active = fetchFarms(activeWhere(sqlite, "f", false)).map(r => ({
+    farmName: norm(r.farmName) || "(Unnamed)",
+    fieldCount: Number(r.fieldCount || 0),
+    tillableAcres: Number(r.tillableAcres || 0)
+  }));
+
+  if (!includeArchived) return { county: norm(best.county), state: norm(best.state), active };
+
+  const archived = fetchFarms(archivedWhere(sqlite, "f")).map(r => ({
+    farmName: norm(r.farmName) || "(Unnamed)",
+    fieldCount: Number(r.fieldCount || 0),
+    tillableAcres: Number(r.tillableAcres || 0)
+  }));
+
+  return { county: norm(best.county), state: norm(best.state), active, archived };
 }
