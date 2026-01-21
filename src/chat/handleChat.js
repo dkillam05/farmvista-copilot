@@ -1,15 +1,22 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-20-v2-handlechat-rtk-count
+// Rev: 2026-01-21-v2-handlechat-rtk-count-list-fields
 //
 // Supports:
 // - payload.text or payload.question
-// - intents: FIELD_FULL, GRAIN_BAGS_DOWN, RTK_TOWER_COUNT
+// - intents: FIELD_FULL, GRAIN_BAGS_DOWN, RTK_TOWER_COUNT, RTK_TOWER_LIST, RTK_TOWER_FIELDS
 // - returns ok/text/meta for FarmVista UI
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
 import { ensureReady } from "../data/sqlite.js";
-import { getFieldFullByKey, getGrainBagsDownSummary, getRtkTowerCount } from "../data/getters/index.js";
+
+import {
+  getFieldFullByKey,
+  getGrainBagsDownSummary,
+  getRtkTowerCount,
+  getRtkTowerList,
+  getFieldsByRtkTowerKey
+} from "../data/getters/index.js";
 
 function pickPrompt(body) {
   const q = (body?.question ?? "").toString().trim();
@@ -48,6 +55,18 @@ export async function handleChat(req, res) {
         data = getRtkTowerCount();
         prompt =
           "Answer in one sentence with the total count. If count is 0, say none are in the system.";
+        break;
+
+      case "RTK_TOWER_LIST":
+        data = getRtkTowerList();
+        prompt =
+          "List all RTK towers. For each include towerName, networkId, frequency, and fieldCount. Keep it readable.";
+        break;
+
+      case "RTK_TOWER_FIELDS":
+        data = getFieldsByRtkTowerKey(intent.key);
+        prompt =
+          "Show the RTK tower info (name, network, frequency), then list the fields assigned to it. For each field show fieldName, farmName, county/state, and acresTillable (if present).";
         break;
 
       default: {
