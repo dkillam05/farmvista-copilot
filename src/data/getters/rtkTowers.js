@@ -1,7 +1,7 @@
 // /src/data/getters/rtkTowers.js  (FULL FILE)
-// Rev: 2026-01-21-v2-getters-rtk-list-and-fields
+// Rev: 2026-01-21-v2-getters-rtk-allinone
 //
-// Provides:
+// RTK getters (ALL in one file):
 // - getRtkTowerCount()
 // - getRtkTowerList()
 // - getFieldsByRtkTowerKey(key)
@@ -9,6 +9,7 @@
 // Snapshot tables used:
 // - rtkTowers
 // - fields
+// - farms (for farm name join on fields)
 
 import { db } from "../sqlite.js";
 
@@ -16,10 +17,13 @@ function normKey(x) {
   return (x ?? "").toString().trim();
 }
 
-// small helper: treat "" as null
-function nvlStr(s) {
-  const v = (s ?? "").toString();
-  return v.trim() ? v : null;
+function asStr(x) {
+  return (x ?? "").toString();
+}
+
+function nonEmptyOrNull(x) {
+  const s = asStr(x).trim();
+  return s ? s : null;
 }
 
 export function getRtkTowerCount() {
@@ -31,7 +35,7 @@ export function getRtkTowerCount() {
 export function getRtkTowerList() {
   const sqlite = db();
 
-  // Include fieldCount so you can immediately see assignments.
+  // List towers with number of assigned fields
   const rows = sqlite.prepare(`
     SELECT
       t.id        AS towerId,
@@ -49,9 +53,9 @@ export function getRtkTowerList() {
 
   return rows.map(r => ({
     towerId: r.towerId,
-    towerName: nvlStr(r.towerName) || "(Unnamed)",
-    networkId: nvlStr(r.networkId) || "",
-    frequency: nvlStr(r.frequency) || "",
+    towerName: nonEmptyOrNull(r.towerName) || "(Unnamed)",
+    networkId: nonEmptyOrNull(r.networkId) || "",
+    frequency: nonEmptyOrNull(r.frequency) || "",
     fieldCount: Number(r.fieldCount || 0)
   }));
 }
@@ -85,7 +89,10 @@ export function getFieldsByRtkTowerKey(key) {
     SELECT
       f.id            AS fieldId,
       f.name          AS fieldName,
+
+      -- fields.farmName is often "" so treat empty string as NULL and fall back to farms.name
       COALESCE(NULLIF(f.farmName, ''), fm.name) AS farmName,
+
       f.county        AS county,
       f.state         AS state,
       f.acresTillable AS acresTillable
@@ -100,16 +107,16 @@ export function getFieldsByRtkTowerKey(key) {
   return {
     tower: {
       towerId: tower.towerId,
-      towerName: nvlStr(tower.towerName) || "(Unnamed)",
-      networkId: nvlStr(tower.networkId) || "",
-      frequency: nvlStr(tower.frequency) || ""
+      towerName: nonEmptyOrNull(tower.towerName) || "(Unnamed)",
+      networkId: nonEmptyOrNull(tower.networkId) || "",
+      frequency: nonEmptyOrNull(tower.frequency) || ""
     },
     fields: fields.map(f => ({
       fieldId: f.fieldId,
-      fieldName: nvlStr(f.fieldName) || "(Unnamed)",
-      farmName: nvlStr(f.farmName) || "",
-      county: nvlStr(f.county) || "",
-      state: nvlStr(f.state) || "",
+      fieldName: nonEmptyOrNull(f.fieldName) || "(Unnamed)",
+      farmName: nonEmptyOrNull(f.farmName) || "",
+      county: nonEmptyOrNull(f.county) || "",
+      state: nonEmptyOrNull(f.state) || "",
       acresTillable: (f.acresTillable === null || f.acresTillable === undefined) ? "" : f.acresTillable
     }))
   };
