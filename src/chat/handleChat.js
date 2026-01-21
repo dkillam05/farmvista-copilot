@@ -1,16 +1,15 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-20-v2-handlechat-splitgetters-acceptText-returnTextMeta
+// Rev: 2026-01-20-v2-handlechat-rtk-count
 //
-// Fix:
-// ✅ Accept payload.text (FarmVista UI) AND payload.question (console/tools)
-// ✅ Return response.text (preferred) AND response.answer (compat)
-// ✅ Include meta so UI can show AI proof footer
-// ✅ Preserve split getters + existing prompts
+// Supports:
+// - payload.text or payload.question
+// - intents: FIELD_FULL, GRAIN_BAGS_DOWN, RTK_TOWER_COUNT
+// - returns ok/text/meta for FarmVista UI
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
 import { ensureReady } from "../data/sqlite.js";
-import { getFieldFullByKey, getGrainBagsDownSummary } from "../data/getters/index.js";
+import { getFieldFullByKey, getGrainBagsDownSummary, getRtkTowerCount } from "../data/getters/index.js";
 
 function pickPrompt(body) {
   const q = (body?.question ?? "").toString().trim();
@@ -27,7 +26,6 @@ export async function handleChat(req, res) {
 
     await ensureReady();
 
-    // OpenAI intent detection
     const intent = await detectIntent(promptIn);
 
     let data;
@@ -44,6 +42,12 @@ export async function handleChat(req, res) {
         data = getGrainBagsDownSummary();
         prompt =
           "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
+        break;
+
+      case "RTK_TOWER_COUNT":
+        data = getRtkTowerCount();
+        prompt =
+          "Answer in one sentence with the total count. If count is 0, say none are in the system.";
         break;
 
       default: {
@@ -63,7 +67,6 @@ export async function handleChat(req, res) {
       }
     }
 
-    // OpenAI answer writing
     const outText = await writeAnswer(prompt, data);
 
     res.json({
@@ -75,8 +78,8 @@ export async function handleChat(req, res) {
         provider: "OpenAI",
         model: "gpt-4.1-mini",
         route: "/chat",
-        intent: intent.intent,
-        key: intent.key || ""
+        intent: (intent?.intent || "").toUpperCase(),
+        key: intent?.key || ""
       }
     });
   } catch (err) {
