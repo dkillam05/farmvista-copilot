@@ -1,7 +1,9 @@
 // /src/chat/intent.js  (FULL FILE)
-// Rev: 2026-01-22-v3-intent-add-equipment-boundary-fieldmaint-bins
+// Rev: 2026-01-22-v4-intent-add-grainbags-report
 //
 // Adds:
+// - GRAIN_BAGS_REPORT (bushels by crop + county/farm/field linkage)
+// Keeps v3 adds:
 // - BOUNDARY_REQUESTS
 // - FIELD_MAINTENANCE
 // - EQUIPMENT / EQUIPMENT_MAKES / EQUIPMENT_MODELS
@@ -32,6 +34,7 @@ Return JSON ONLY:
 INTENTS:
 - FIELD_FULL: field details (id/name). key=field id/name.
 - GRAIN_BAGS_DOWN: grain bags down summary. key="".
+- GRAIN_BAGS_REPORT: grain bags FULL report w/ bushels by crop and rollups. key may be crop filter ("corn", "soybeans", "beans", "wheat") or "".
 - RTK_TOWER_COUNT: count RTK towers. key="".
 - RTK_TOWER_LIST: list RTK towers. key="".
 - RTK_TOWER_FIELDS: fields assigned to a specific RTK tower. key=tower name/id.
@@ -68,11 +71,17 @@ INTENT RULES (keep simple):
 - If question mentions "farms" AND contains "<something> county" -> COUNTY_FARMS (key=<something>).
 - If question mentions "<something> county" AND mentions any of (HEL, CRP, tillable, acres, totals, stats) -> COUNTY_STATS (key=<something>).
 
+GRAIN BAGS RULES:
+- If question mentions "grain bags" (or "bags") AND mentions any of:
+  ("bushels", "by crop", "by county", "by farm", "report", "inventory", "capacity", "remaining")
+  -> GRAIN_BAGS_REPORT.
+- Otherwise if question mentions "grain bags down" or "bags down" -> GRAIN_BAGS_DOWN.
+
 - If question mentions "boundary" and ("fix" or "request" or "requests") -> BOUNDARY_REQUESTS.
 - If question mentions "field maintenance" or "maintenance" with field/farm context -> FIELD_MAINTENANCE.
-- If question mentions "equipment" -> EQUIPMENT.
 - If question mentions "equipment makes" -> EQUIPMENT_MAKES.
 - If question mentions "equipment models" -> EQUIPMENT_MODELS.
+- If question mentions "equipment" -> EQUIPMENT.
 - If question mentions "bin sites" or "grain bins" or "bin locations" -> BIN_SITES.
 - If question mentions "bin movements" or "bin transfers" or "in/out of bins" -> BIN_MOVEMENTS.
 
@@ -81,6 +90,7 @@ KEY EXTRACTION:
 - For BOUNDARY_REQUESTS: if user says open/completed/all, key should be that word.
 - For FIELD_MAINTENANCE: if user says a status (needs approved, pending, etc), key should be that phrase; if user says "all", key="all".
 - For BIN_MOVEMENTS: if user names a bin site, put that in key.
+- For GRAIN_BAGS_REPORT: if user says "corn" or "soybeans/beans" or "wheat", key should be that crop word; otherwise key="".
 
 IMPORTANT:
 - Do NOT choose FIELD_FULL for generic phrases like "rtk towers".
