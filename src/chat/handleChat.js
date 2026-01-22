@@ -1,5 +1,5 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-22-v3-handlechat-add-new-domains
+// Rev: 2026-01-22-v4-handlechat-add-grainbags-report
 //
 // Enforces: ACTIVE ONLY by default.
 // includeArchived=true requests separated archived results (where getter supports it).
@@ -11,6 +11,7 @@ import { ensureReady } from "../data/sqlite.js";
 import {
   getFieldFullByKey,
   getGrainBagsDownSummary,
+  getGrainBagsReport,
   getRtkTowerCount,
   getRtkTowerList,
   getFieldsByRtkTowerKey,
@@ -83,6 +84,23 @@ export async function handleChat(req, res) {
           "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
         break;
 
+      case "GRAIN_BAGS_REPORT": {
+        const k = lower(key);
+        const crop =
+          (k.includes("corn") ? "corn" :
+           (k.includes("soy") || k.includes("bean")) ? "soybeans" :
+           k.includes("wheat") ? "wheat" :
+           "");
+        data = getGrainBagsReport({ crop: crop || "" });
+        prompt =
+          "Summarize grain bags with a strong focus on BUSHELS BY CROP (most important). " +
+          "Show totals by crop (bushelsFull/bushelsPartial/bushelsTotal, plus remaining full/partial counts if present). " +
+          "Then show rollups by county and by farm. " +
+          "Finally list notable putDowns (top remaining bushels) with field -> farm -> county and bag capacity proof. " +
+          "Keep it readable and operational.";
+        break;
+      }
+
       case "RTK_TOWER_COUNT":
         data = getRtkTowerCount();
         prompt =
@@ -126,7 +144,7 @@ export async function handleChat(req, res) {
         break;
 
       // ---------------------------
-      // NEW: Boundary Requests
+      // Boundary Requests
       // ---------------------------
       case "BOUNDARY_REQUESTS": {
         const k = lower(key) || "open";
@@ -143,7 +161,7 @@ export async function handleChat(req, res) {
       }
 
       // ---------------------------
-      // NEW: Field Maintenance
+      // Field Maintenance
       // ---------------------------
       case "FIELD_MAINTENANCE": {
         const k = lower(key);
@@ -155,7 +173,7 @@ export async function handleChat(req, res) {
       }
 
       // ---------------------------
-      // NEW: Equipment
+      // Equipment
       // ---------------------------
       case "EQUIPMENT": {
         const k = lower(key);
@@ -189,7 +207,7 @@ export async function handleChat(req, res) {
       }
 
       // ---------------------------
-      // NEW: Bin Sites
+      // Bin Sites
       // ---------------------------
       case "BIN_SITES": {
         data = getBinSites({ includeArchived, q: key || "" });
@@ -199,7 +217,7 @@ export async function handleChat(req, res) {
       }
 
       // ---------------------------
-      // NEW: Bin Movements
+      // Bin Movements
       // ---------------------------
       case "BIN_MOVEMENTS": {
         const siteId = looksLikeFirestoreId(key) ? key : "";
