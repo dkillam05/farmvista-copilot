@@ -1,5 +1,6 @@
 // ======================================================================
-// src/data/getters/boundaryRequests.js
+// /src/data/getters/boundaryRequests.js  (FULL FILE - ESM)
+// Rev: 2026-01-22-v1-ESM
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
 // - Default returns ONLY status=Open
@@ -9,6 +10,13 @@
 // - list + count
 // - grouped summary by farm -> field -> requests
 // ======================================================================
+
+import { db } from '../sqlite.js';
+
+function getDb(){
+  // supports either `export const db = ...` or `export function db(){...}`
+  return (typeof db === 'function') ? db() : db;
+}
 
 function normStr(v){
   return (v == null) ? "" : String(v);
@@ -27,25 +35,22 @@ function safeBool(v){
   return !!v && v !== "false" && v !== 0 && v !== "0";
 }
 
-function hasColumn(db, table, col){
+function hasColumn(database, table, col){
   try{
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    const rows = database.prepare(`PRAGMA table_info(${table})`).all();
     return rows.some(r => String(r.name).toLowerCase() === String(col).toLowerCase());
   }catch(e){
     return false;
   }
 }
 
-function pickCols(db, table, desired){
-  // return only columns that exist, preserving order
-  return desired.filter(c => hasColumn(db, table, c));
+function pickCols(database, table, desired){
+  return desired.filter(c => hasColumn(database, table, c));
 }
 
 function isoOrEmpty(v){
-  // snapshot might store ISO strings or numbers; leave as string if possible
   if(v == null) return "";
   const s = String(v);
-  // if it's already ISO-ish, keep it
   if(s.includes("T") && s.includes("Z")) return s;
   return s;
 }
@@ -56,6 +61,7 @@ function summarizeRow(r){
   const scope = normStr(r.scope);
   const boundaryType = normStr(r.boundaryType);
   const notes = normStr(r.notes).trim();
+
   const updatedISO =
     r.updatedAtISO ||
     r.updatedAt ||
@@ -95,7 +101,6 @@ function summarizeRow(r){
 }
 
 function groupByFarmField(items){
-  // farms -> fields -> requests
   const farmMap = new Map();
 
   for(const it of items){
@@ -112,7 +117,6 @@ function groupByFarmField(items){
     const farm = farmMap.get(farmKey);
     farm.count++;
 
-    // field bucket inside farm
     if(!farm._fieldMap) farm._fieldMap = new Map();
     const fieldKey = `${it.fieldId || ""}||${it.field || ""}`.toLowerCase();
 
@@ -134,7 +138,6 @@ function groupByFarmField(items){
   const farms = Array.from(farmMap.values()).map(f => {
     const fields = Array.from(f._fieldMap.values())
       .map(x => {
-        // newest first (by timestampISO or createdAtISO)
         x.requests.sort((a,b) => {
           const aa = a.timestampISO || a.createdAtISO || "";
           const bb = b.timestampISO || b.createdAtISO || "";
@@ -164,7 +167,7 @@ function groupByFarmField(items){
 }
 
 /**
- * getBoundaryRequests(db, opts)
+ * getBoundaryRequests(opts)
  *
  * opts:
  *  - includeArchived (boolean) default false
@@ -174,12 +177,13 @@ function groupByFarmField(items){
  *  - Default: active-only (Open)
  *  - includeArchived=true: return archived separately
  */
-function getBoundaryRequests(db, opts={}){
+export function getBoundaryRequests(opts = {}){
+  const database = getDb();
   const table = "boundary_requests";
 
   // If table doesn't exist, return empty (no throw)
   try{
-    db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+    database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
   }catch(e){
     return {
       ok: true,
@@ -197,7 +201,6 @@ function getBoundaryRequests(db, opts={}){
   const includeArchived = safeBool(opts.includeArchived);
   const status = normStatus(opts.status || "open"); // default open
 
-  // Select columns that might exist across schema versions
   const wanted = [
     "id",
     "status",
@@ -214,31 +217,27 @@ function getBoundaryRequests(db, opts={}){
     "when",
     "timestampISO",
     "t",
-    // optional time columns depending on snapshot builder
     "createdAtISO",
     "updatedAtISO",
     "drivenAtISO",
     "completedAtISO",
-    // possible alternate names
     "createdAt",
     "updatedAt",
     "drivenAt",
     "completedAt"
   ];
 
-  const cols = pickCols(db, table, wanted);
+  const cols = pickCols(database, table, wanted);
   const selectCols = cols.length ? cols.map(c => `"${c}"`).join(", ") : "*";
 
-  const rows = db.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
-  const items = rows
-    .map(r => {
-      // Ensure id exists (some snapshots might store docId differently)
-      if(!r.id && r.docId) r.id = r.docId;
-      return summarizeRow(r);
-    });
+  const rows = database.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
+  const items = rows.map(r => {
+    if(!r.id && r.docId) r.id = r.docId;
+    return summarizeRow(r);
+  });
 
   const isActive = (it) => normStatus(it.status) === "open";
-  const isArchived = (it) => !isActive(it); // completed/other
+  const isArchived = (it) => !isActive(it);
 
   let activeItems = [];
   let archivedItems = [];
@@ -247,14 +246,11 @@ function getBoundaryRequests(db, opts={}){
     activeItems = items.filter(isActive);
     archivedItems = items.filter(isArchived);
   }else if(status === "completed"){
-    // completed is considered archived bucket
     archivedItems = items.filter(it => normStatus(it.status) === "completed");
   }else{
-    // default open
     activeItems = items.filter(isActive);
   }
 
-  // Build output
   const activeGrouped = groupByFarmField(activeItems);
 
   const out = {
@@ -278,7 +274,3 @@ function getBoundaryRequests(db, opts={}){
 
   return out;
 }
-
-module.exports = {
-  getBoundaryRequests
-};
