@@ -1,5 +1,6 @@
 // ======================================================================
-// src/data/getters/equipment.js
+// /src/data/getters/equipment.js  (FULL FILE - ESM)
+// Rev: 2026-01-22-v1-ESM
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
 // - Default returns ONLY active items
@@ -16,6 +17,12 @@
 // - grouped counts by type
 // - consistent summary line per item
 // ======================================================================
+
+import { db } from '../sqlite.js';
+
+function getDb(){
+  return (typeof db === 'function') ? db() : db;
+}
 
 function normStr(v){
   return (v == null) ? "" : String(v);
@@ -43,17 +50,17 @@ function truthy(v){
   return (s === "true" || s === "1" || s === "yes");
 }
 
-function hasColumn(db, table, col){
+function hasColumn(database, table, col){
   try{
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    const rows = database.prepare(`PRAGMA table_info(${table})`).all();
     return rows.some(r => String(r.name).toLowerCase() === String(col).toLowerCase());
   }catch(e){
     return false;
   }
 }
 
-function pickCols(db, table, desired){
-  return desired.filter(c => hasColumn(db, table, c));
+function pickCols(database, table, desired){
+  return desired.filter(c => hasColumn(database, table, c));
 }
 
 function safeNum(v){
@@ -64,7 +71,6 @@ function safeNum(v){
 
 function fmtNum(n){
   if(n == null) return "";
-  // keep simple; no locale formatting in server
   return String(n);
 }
 
@@ -77,9 +83,7 @@ function summarizeEquipment(e){
   const serial = normStr(e.serial);
   const status = normStatus(e.status);
 
-  // useful extras by type
   const engineHours = safeNum(e.engineHours ?? e.totalHours);
-  const totalHours = safeNum(e.totalHours);
   const totalAcres = safeNum(e.totalAcres);
   const workingWidthFt = safeNum(e.workingWidthFt);
   const boomWidthFt = safeNum(e.boomWidthFt);
@@ -89,13 +93,11 @@ function summarizeEquipment(e){
 
   const bits = [];
 
-  // name is usually already "Make Model (Year)" but keep it first
   const name = normStr(e.name) || [make, model, year ? `(${year})` : ""].filter(Boolean).join(" ").trim();
   bits.push(name || "(Unnamed equipment)");
 
   if(unitId) bits.push(`Unit ${unitId}`);
 
-  // per-type highlights
   if(type === "tractor" || type === "combine" || type === "sprayer" || type === "construction" || type === "fertilizer"){
     if(engineHours != null) bits.push(`${fmtNum(engineHours)} hrs`);
   }
@@ -137,37 +139,31 @@ function groupCountsByType(items){
     const t = it.type || "(unknown)";
     map.set(t, (map.get(t) || 0) + 1);
   }
-  const byType = Array.from(map.entries())
+  return Array.from(map.entries())
     .map(([type, count]) => ({ type, count }))
     .sort((a,b) => b.count - a.count || a.type.localeCompare(b.type));
-  return byType;
 }
 
 function sortNewestFirst(a,b){
-  // prefer updatedAtISO or updatedAt / createdAt if present
   const aa = normStr(a.updatedAtISO || a.updatedAt || a.createdAtISO || a.createdAt || "");
   const bb = normStr(b.updatedAtISO || b.updatedAt || b.createdAtISO || b.createdAt || "");
   return bb.localeCompare(aa);
 }
 
 /**
- * getEquipment(db, opts)
+ * getEquipment(opts)
  *
  * opts:
  *  - includeArchived (boolean) default false
  *  - type (string) optional: "tractor" | "implement" | "starfire" | ...
  *  - q (string) optional: search on name/make/model/unitId/serial
- *
- * Golden rule:
- *  - Default active-only
- *  - includeArchived=true => archived returned separately
  */
-function getEquipment(db, opts={}){
+export function getEquipment(opts = {}){
+  const database = getDb();
   const table = "equipment";
 
-  // table guard
   try{
-    db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
+    database.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get();
   }catch(e){
     return {
       ok: true,
@@ -184,7 +180,6 @@ function getEquipment(db, opts={}){
   const wantType = normLower(opts.type);
   const q = normLower(opts.q);
 
-  // choose likely columns (snapshot schema may vary)
   const wanted = [
     "id",
     "type",
@@ -217,28 +212,24 @@ function getEquipment(db, opts={}){
     "updatedAt"
   ];
 
-  const cols = pickCols(db, table, wanted);
+  const cols = pickCols(database, table, wanted);
   const selectCols = cols.length ? cols.map(c => `"${c}"`).join(", ") : "*";
-  const rows = db.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
+  const rows = database.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
 
-  // normalize + filter
   const activeRows = [];
   const archivedRows = [];
 
   for(const r of rows){
-    // ensure id
     const id = r.id || r.docId || null;
     if(!id) continue;
     r.id = id;
 
     const status = normStatus(r.status);
-    const isActive = (status === "active" || status === "open"); // "open" here just in case future usage
+    const isActive = (status === "active" || status === "open");
     const isArchived = (status === "archived" || status === "inactive" || status === "completed");
 
-    // type filter
     if(wantType && normLower(r.type) !== wantType) continue;
 
-    // search filter
     if(q){
       const hay = [
         r.name, r.makeName, r.modelName, r.unitId, r.serial, r.licensePlate,
@@ -249,16 +240,14 @@ function getEquipment(db, opts={}){
 
     if(isActive) activeRows.push(r);
     else if(isArchived) archivedRows.push(r);
-    else {
-      // unknown status: treat as archived unless includeArchived is false (safer to hide by default)
-      archivedRows.push(r);
-    }
+    else archivedRows.push(r); // unknown status hidden by default
   }
 
   activeRows.sort(sortNewestFirst);
   archivedRows.sort(sortNewestFirst);
 
   const activeItems = activeRows.map(summarizeEquipment);
+
   const out = {
     ok: true,
     intent: "equipment",
@@ -267,9 +256,7 @@ function getEquipment(db, opts={}){
       type: wantType || null,
       q: q || null
     },
-    counts: {
-      items: activeItems.length
-    },
+    counts: { items: activeItems.length },
     byType: groupCountsByType(activeItems),
     items: activeItems
   };
@@ -285,7 +272,3 @@ function getEquipment(db, opts={}){
 
   return out;
 }
-
-module.exports = {
-  getEquipment
-};
