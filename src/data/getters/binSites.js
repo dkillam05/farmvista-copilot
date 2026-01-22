@@ -1,5 +1,6 @@
 // ======================================================================
-// src/data/getters/binSites.js
+// /src/data/getters/binSites.js  (FULL FILE - ESM)
+// Rev: 2026-01-22-v1-ESM
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
 // - Default returns ONLY active bin sites (status="active") AND used=false (if column exists)
@@ -13,6 +14,13 @@
 // - totals (site count, total capacity, total onHand if available)
 // - per-site summary + per-bin quick summary
 // ======================================================================
+
+import { db } from '../sqlite.js';
+
+function getDb(){
+  // supports either `export const db = ...` or `export function db(){...}`
+  return (typeof db === 'function') ? db() : db;
+}
 
 function normStr(v){ return (v == null) ? "" : String(v); }
 function normLower(v){ return normStr(v).trim().toLowerCase(); }
@@ -28,30 +36,32 @@ function safeNum(v){
   return Number.isFinite(n) ? n : null;
 }
 
-function hasTable(db, name){
+function hasTable(database, name){
   try{
-    const row = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1`).get(name);
+    const row = database.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1`
+    ).get(name);
     return !!row;
   }catch(e){
     return false;
   }
 }
-function firstExistingTable(db, candidates){
+function firstExistingTable(database, candidates){
   for(const t of candidates){
-    if(hasTable(db, t)) return t;
+    if(hasTable(database, t)) return t;
   }
   return null;
 }
-function hasColumn(db, table, col){
+function hasColumn(database, table, col){
   try{
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    const rows = database.prepare(`PRAGMA table_info(${table})`).all();
     return rows.some(r => String(r.name).toLowerCase() === String(col).toLowerCase());
   }catch(e){
     return false;
   }
 }
-function pickCols(db, table, desired){
-  return desired.filter(c => hasColumn(db, table, c));
+function pickCols(database, table, desired){
+  return desired.filter(c => hasColumn(database, table, c));
 }
 
 function asArray(v){
@@ -98,7 +108,6 @@ function summarizeSite(site){
   const binCount = bins.length;
   const onHand = sumBinsOnHand(bins);
 
-  // bin summary lines (keep short)
   const binLines = bins
     .slice()
     .sort((a,b) => (safeNum(a.num) ?? 0) - (safeNum(b.num) ?? 0))
@@ -167,13 +176,15 @@ function rollupTotals(items){
 }
 
 /**
- * getBinSites(db, opts)
+ * getBinSites(opts)
  * opts:
  *  - includeArchived (boolean) default false
  *  - q (string) optional search by site name
  */
-function getBinSites(db, opts={}){
-  const table = firstExistingTable(db, [
+export function getBinSites(opts = {}){
+  const database = getDb();
+
+  const table = firstExistingTable(database, [
     "bin_sites",
     "binSites",
     "binsites"
@@ -207,9 +218,9 @@ function getBinSites(db, opts={}){
     "updatedAt"
   ];
 
-  const cols = pickCols(db, table, wanted);
+  const cols = pickCols(database, table, wanted);
   const selectCols = cols.length ? cols.map(c => `"${c}"`).join(", ") : "*";
-  const rows = db.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
+  const rows = database.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
 
   const active = [];
   const archived = [];
@@ -261,7 +272,3 @@ function getBinSites(db, opts={}){
 
   return out;
 }
-
-module.exports = {
-  getBinSites
-};
