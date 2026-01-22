@@ -1,14 +1,12 @@
 // /src/data/getters/index.js  (FULL FILE)
-// Rev: 2026-01-22-v3-getters-index-add-new-domains
-//
-// Keeps existing exports and adds:
-// - boundaryRequests
-// - fieldMaintenance
-// - equipment / equipmentMakes / equipmentModels
-// - binSites / binMovements
+// Rev: 2026-01-22-v4-getters-index-add-grainbags-report-new-domains
 
 export { getFieldFullByKey } from './fields.js';
-export { getGrainBagsDownSummary } from './grainBags.js';
+
+export {
+  getGrainBagsDownSummary,
+  getGrainBagsReport
+} from './grainBags.js';
 
 export {
   getRtkTowerCount,
@@ -23,12 +21,12 @@ export {
   getFarmsInCounty
 } from './counties.js';
 
-// NEW GETTERS
+// NEW DOMAINS
 export { getBoundaryRequests } from './boundaryRequests.js';
-
 export { getFieldMaintenance } from './fieldMaintenance.js';
-
 export { getEquipment } from './equipment.js';
+
+// (You still need to paste your makes/models getters if you haven’t converted them to ESM yet)
 export { getEquipmentMakes } from './equipmentMakes.js';
 export { getEquipmentModels } from './equipmentModels.js';
 
