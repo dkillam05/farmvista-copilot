@@ -1,5 +1,6 @@
 // ======================================================================
-// src/data/getters/fieldMaintenance.js
+// /src/data/getters/fieldMaintenance.js  (FULL FILE - ESM)
+// Rev: 2026-01-22-v1-ESM
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
 // - Default returns active-only (everything NOT completed/archived)
@@ -21,6 +22,12 @@
 // - consistent summary line per request
 // ======================================================================
 
+import { db } from '../sqlite.js';
+
+function getDb(){
+  return (typeof db === 'function') ? db() : db;
+}
+
 function normStr(v){
   return (v == null) ? "" : String(v);
 }
@@ -39,9 +46,9 @@ function safeNum(v){
   return Number.isFinite(n) ? n : null;
 }
 
-function hasTable(db, name){
+function hasTable(database, name){
   try{
-    const row = db.prepare(
+    const row = database.prepare(
       `SELECT name FROM sqlite_master WHERE type='table' AND name=? LIMIT 1`
     ).get(name);
     return !!row;
@@ -50,24 +57,24 @@ function hasTable(db, name){
   }
 }
 
-function firstExistingTable(db, candidates){
+function firstExistingTable(database, candidates){
   for(const t of candidates){
-    if(hasTable(db, t)) return t;
+    if(hasTable(database, t)) return t;
   }
   return null;
 }
 
-function hasColumn(db, table, col){
+function hasColumn(database, table, col){
   try{
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all();
+    const rows = database.prepare(`PRAGMA table_info(${table})`).all();
     return rows.some(r => String(r.name).toLowerCase() === String(col).toLowerCase());
   }catch(e){
     return false;
   }
 }
 
-function pickCols(db, table, desired){
-  return desired.filter(c => hasColumn(db, table, c));
+function pickCols(database, table, desired){
+  return desired.filter(c => hasColumn(database, table, c));
 }
 
 function asArray(v){
@@ -95,7 +102,6 @@ function asObj(v){
 function normStatus(v){
   const s = normLower(v);
   if(!s) return "";
-  // normalize common variants
   if(s === "needs approved" || s === "needs_approved") return "needs approved";
   if(s === "in progress" || s === "in_progress") return "in progress";
   if(s === "complete" || s === "completed") return "completed";
@@ -103,7 +109,6 @@ function normStatus(v){
   return s;
 }
 
-// For this domain, "active" means not completed/archived.
 function isArchivedStatus(status){
   const s = normStatus(status);
   return (s === "completed" || s === "archived" || s === "done" || s === "closed");
@@ -111,9 +116,7 @@ function isArchivedStatus(status){
 
 function isoOrEmpty(v){
   if(v == null) return "";
-  // snapshot builders may store ISO strings already
-  const s = String(v);
-  return s;
+  return String(v);
 }
 
 function shortText(s, max=120){
@@ -137,7 +140,6 @@ function summarizeRequest(r){
   const notes = shortText(r.notes, 140);
   const photoCount = safeNum(r.photoCount);
 
-  // submittedBy might be flattened or JSON
   const submittedByObj = asObj(r.submittedBy);
   const submittedByName =
     normStr(r.submittedByName) ||
@@ -151,7 +153,6 @@ function summarizeRequest(r){
     normStr(r.createdAt) ||
     "";
 
-  // location might be flattened or JSON
   const locObj = asObj(r.location);
   const lat = safeNum(r.locationLat ?? (locObj ? locObj.lat : null));
   const lng = safeNum(r.locationLng ?? (locObj ? locObj.lng : null));
@@ -243,7 +244,7 @@ function groupByFarm(items){
 }
 
 /**
- * getFieldMaintenance(db, opts)
+ * getFieldMaintenance(opts)
  *
  * opts:
  *  - includeArchived (boolean) default false
@@ -251,9 +252,10 @@ function groupByFarm(items){
  *  - farmId, fieldId, topicId optional filters
  *  - q (string) search: topic/farm/field/notes/submittedBy
  */
-function getFieldMaintenance(db, opts={}){
-  // Try a few common snapshot table names
-  const table = firstExistingTable(db, [
+export function getFieldMaintenance(opts = {}){
+  const database = getDb();
+
+  const table = firstExistingTable(database, [
     "field_maintenance",
     "fieldMaintenance",
     "fieldmaintenance"
@@ -309,9 +311,9 @@ function getFieldMaintenance(db, opts={}){
     "createdAt"
   ];
 
-  const cols = pickCols(db, table, wantedCols);
+  const cols = pickCols(database, table, wantedCols);
   const selectCols = cols.length ? cols.map(c => `"${c}"`).join(", ") : "*";
-  const rows = db.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
+  const rows = database.prepare(`SELECT ${selectCols} FROM ${table}`).all() || [];
 
   const activeRows = [];
   const archivedRows = [];
@@ -320,16 +322,13 @@ function getFieldMaintenance(db, opts={}){
     r.id = r.id || r.docId || null;
     if(!r.id) continue;
 
-    // filters
     if(wantFarmId && normStr(r.farmId) !== wantFarmId) continue;
     if(wantFieldId && normStr(r.fieldId) !== wantFieldId) continue;
     if(wantTopicId && normStr(r.topicId) !== wantTopicId) continue;
 
-    // status filter (special "all")
     const st = normStatus(r.status);
     if(wantStatus && wantStatus !== "all" && st !== wantStatus) continue;
 
-    // q search
     if(q){
       const submittedByObj = asObj(r.submittedBy);
       const submittedByName =
@@ -384,7 +383,3 @@ function getFieldMaintenance(db, opts={}){
 
   return out;
 }
-
-module.exports = {
-  getFieldMaintenance
-};
