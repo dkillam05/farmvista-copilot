@@ -1,15 +1,17 @@
 // /src/data/getters/grainBags.js  (FULL FILE)
-// Rev: 2026-01-22-v5-grainbags-report-from-events-productlink-county-rollups
+// Rev: 2026-01-23-v6-grainbags-support-snapshot-schema-appliedTo-table
 //
-// Goals:
-// - Do NOT depend on v_grainBag_open_remaining (may not exist in snapshot)
-// - Compute remaining from grain_bag_events: putDown minus pickUp.appliedTo
-// - Link bagSku -> inventoryGrainBagMovements -> productsGrainBags for capacity
-// - Link fieldId -> fields -> farms -> county for rollups
+// Fix (per Dane):
+// ✅ Support current SQLite snapshot schema from /context/snapshot-build.js:
+//    - events table = grainBagEvents (or grain_bag_events variants)
+//    - putDown counts are stored as countFull/countPartial + partialFeetJson/partialFeetSum
+//    - bagSku fields stored as bagSkuId/bagBrand/bagDiameterFt/bagSizeFeet
+//    - field stored as fieldId/fieldName
+//    - pickUp reductions stored in grainBagAppliedTo table (refPutDownId + takeFull/takePartial)
+// ✅ Still supports Firestore-shaped JSON rows (counts/bagSku/field/appliedTo) if present
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
-// - Grain bag "out in fields" means remainingFull>0 OR remainingPartial>0 OR remainingPartialFeetSum>0
-// - includeArchived not used here (events are not “archived”), but kept for signature compatibility.
+// - "out in fields" means remainingFull>0 OR remainingPartial>0 OR remainingPartialFeetSum>0
 
 import { db } from "../sqlite.js";
 
@@ -107,11 +109,7 @@ function parseProductRef(ref){
 
 /* ----------------------------- capacity ----------------------------- */
 function pickCapacityColumns(sqlite, tableProducts){
-  // We support:
-  // - bushels (your Firefoo example)
-  // - bushelsCorn/bushelsSoy/etc (older schema)
   const cols = sqlite.prepare(`PRAGMA table_info(${JSON.stringify(tableProducts)})`).all().map(r => r.name);
-
   const has = (c) => cols.includes(c);
 
   return {
@@ -133,7 +131,6 @@ function pickCapacityColumns(sqlite, tableProducts){
 function capacityForCrop(productRow, cropTypeNorm, capCols){
   if(!productRow) return null;
 
-  // Prefer generic bushels if present (your current Firefoo has it)
   if(capCols.any && productRow[capCols.any] != null){
     return safeNum(productRow[capCols.any]);
   }
@@ -142,24 +139,16 @@ function capacityForCrop(productRow, cropTypeNorm, capCols){
   if(cropTypeNorm === "Soybeans" && capCols.soy) return safeNum(productRow[capCols.soy]);
   if(cropTypeNorm === "Wheat" && capCols.wheat) return safeNum(productRow[capCols.wheat]);
 
-  // fallback: corn if present
   if(capCols.corn) return safeNum(productRow[capCols.corn]);
 
   return null;
 }
 
 /* ----------------------------- public: down summary ----------------------------- */
-/**
- * Backwards-compatible "bags down" summary.
- * If the old view exists, we still use it.
- * Otherwise we compute from events using getGrainBagsReport() and return crop totals.
- */
 export function getGrainBagsDownSummary(){
   const sqlite = getDb();
 
-  // If legacy view exists, keep it (fast path)
   if(hasTable(sqlite, "v_grainBag_open_remaining") && hasTable(sqlite, "productsGrainBags")){
-    // Keep your v2 logic but tolerate "bushels" column
     const capCols = pickCapacityColumns(sqlite, "productsGrainBags");
     const anyCol = capCols.any ? `p.${capCols.any} AS bushelsAny` : `NULL AS bushelsAny`;
     const cornCol = capCols.corn ? `p.${capCols.corn} AS bushelsCorn` : `NULL AS bushelsCorn`;
@@ -233,7 +222,6 @@ export function getGrainBagsDownSummary(){
     return sqlite.prepare(sql).all();
   }
 
-  // Otherwise compute from the new report
   const rep = getGrainBagsReport({});
   return rep.totals.byCrop.map(x => ({
     cropType: x.crop,
@@ -246,11 +234,6 @@ export function getGrainBagsDownSummary(){
 }
 
 /* ----------------------------- public: full report ----------------------------- */
-/**
- * getGrainBagsReport(opts)
- * opts:
- *  - crop (optional): "corn" | "soybeans" | "wheat" | "" (all)
- */
 export function getGrainBagsReport(opts = {}){
   const sqlite = getDb();
 
@@ -274,6 +257,13 @@ export function getGrainBagsReport(opts = {}){
     };
   }
 
+  // NEW: pickUp reductions table used by current snapshot schema
+  const tApplied = firstExistingTable(sqlite, [
+    "grainBagAppliedTo",
+    "grain_bag_applied_to",
+    "grainbagappliedto"
+  ]);
+
   const tInv = firstExistingTable(sqlite, [
     "inventoryGrainBagMovements",
     "inventory_grain_bag_movements",
@@ -286,7 +276,6 @@ export function getGrainBagsReport(opts = {}){
     "productsgrainbags"
   ]);
 
-  // Field lookup (best-effort)
   const tFields = firstExistingTable(sqlite, [
     "fields",
     "v_fields",
@@ -309,7 +298,13 @@ export function getGrainBagsReport(opts = {}){
 
   if(tProd){
     capCols = pickCapacityColumns(sqlite, tProd);
-    const wantedProd = pickCols(sqlite, tProd, ["id","brand","diameterFt","lengthFt","status", ...(capCols.any?[capCols.any]:[]), ...(capCols.corn?[capCols.corn]:[]), ...(capCols.soy?[capCols.soy]:[]), ...(capCols.wheat?[capCols.wheat]:[]) ]);
+    const wantedProd = pickCols(sqlite, tProd, [
+      "id","brand","diameterFt","lengthFt","status",
+      ...(capCols.any?[capCols.any]:[]),
+      ...(capCols.corn?[capCols.corn]:[]),
+      ...(capCols.soy?[capCols.soy]:[]),
+      ...(capCols.wheat?[capCols.wheat]:[])
+    ]);
     const sel = wantedProd.length ? wantedProd.map(c => `"${c}"`).join(", ") : "*";
     const rows = sqlite.prepare(`SELECT ${sel} FROM "${tProd}"`).all() || [];
     for(const r of rows){
@@ -320,7 +315,6 @@ export function getGrainBagsReport(opts = {}){
     }
   }
 
-  // bagSkuId -> productId map
   const bagSkuToProductId = new Map();
   if(tInv){
     const wantedInv = pickCols(sqlite, tInv, ["id","productRef","brand","diameterFt","lengthFt","status"]);
@@ -367,23 +361,16 @@ export function getGrainBagsReport(opts = {}){
 
   // ----- load events -----
   const wantedEv = pickCols(sqlite, tEvents, [
-    "id",
-    "type",
-    "cropType",
-    "crop",
-    "cropYear",
-    "datePlaced",
-    "pickedUpDate",
-    "createdAtISO",
-    "updatedAtISO",
-    "createdAt",
-    "updatedAt",
-    "bagSku",
-    "counts",
-    "countsPicked",
-    "appliedTo",
-    "field",
-    "notes"
+    // common
+    "id","type","cropType","crop","cropYear","datePlaced","pickedUpDate","notes",
+    "createdAtISO","updatedAtISO","createdAt","updatedAt",
+    // firestore-json style
+    "bagSku","counts","countsPicked","appliedTo","field",
+    // snapshot-extracted style
+    "fieldId","fieldName",
+    "bagSkuId","bagBrand","bagDiameterFt","bagSizeFeet",
+    "countFull","countPartial",
+    "partialFeetJson","partialFeetSum","partialUsageJson"
   ]);
   const selEv = wantedEv.length ? wantedEv.map(c => `"${c}"`).join(", ") : "*";
   const rows = sqlite.prepare(`SELECT ${selEv} FROM "${tEvents}"`).all() || [];
@@ -396,26 +383,44 @@ export function getGrainBagsReport(opts = {}){
     if(!id) continue;
 
     const type = normLower(r.type);
-    if(type === "putdown" || type === "putDown".toLowerCase()){
+    if(type === "putdown"){
       putDowns.push({ id, raw: r });
-    }else if(type === "pickup" || type === "pickUp".toLowerCase()){
+    }else if(type === "pickup"){
       pickUps.push({ id, raw: r });
     }
   }
 
   // ----- index pickUps by refPutDownId -----
   const pickedByPutDown = new Map();
-  for(const pu of pickUps){
-    const appliedTo = asArray(pu.raw.appliedTo);
-    for(const a of appliedTo){
-      const o = asObj(a) || a;
-      const ref = normStr(o?.refPutDownId);
+
+  // Preferred path: grainBagAppliedTo table (current snapshot schema)
+  if(tApplied){
+    const wantedAp = pickCols(sqlite, tApplied, ["refPutDownId","takeFull","takePartial"]);
+    const selAp = wantedAp.length ? wantedAp.map(c => `"${c}"`).join(", ") : "*";
+    const apRows = sqlite.prepare(`SELECT ${selAp} FROM "${tApplied}"`).all() || [];
+    for(const r of apRows){
+      const ref = normStr(r.refPutDownId);
       if(!ref) continue;
       if(!pickedByPutDown.has(ref)) pickedByPutDown.set(ref, []);
       pickedByPutDown.get(ref).push({
-        takeFull: safeNum(o?.takeFull) ?? 0,
-        takePartial: safeNum(o?.takePartial) ?? 0
+        takeFull: safeNum(r.takeFull) ?? 0,
+        takePartial: safeNum(r.takePartial) ?? 0
       });
+    }
+  } else {
+    // Fallback: Firestore-json appliedTo inside pickUp event
+    for(const pu of pickUps){
+      const appliedTo = asArray(pu.raw.appliedTo);
+      for(const a of appliedTo){
+        const o = asObj(a) || a;
+        const ref = normStr(o?.refPutDownId);
+        if(!ref) continue;
+        if(!pickedByPutDown.has(ref)) pickedByPutDown.set(ref, []);
+        pickedByPutDown.get(ref).push({
+          takeFull: safeNum(o?.takeFull) ?? 0,
+          takePartial: safeNum(o?.takePartial) ?? 0
+        });
+      }
     }
   }
 
@@ -433,11 +438,24 @@ export function getGrainBagsReport(opts = {}){
       if(crop !== want) continue;
     }
 
-    const counts = asObj(raw.counts) || {};
-    const full = safeNum(counts.full) ?? 0;
-    const partial = safeNum(counts.partial) ?? 0;
-    const partialFeetArr = asArray(counts.partialFeet).map(safeNum).filter(n => n != null);
-    const partialFeetSum = partialFeetArr.reduce((s,n)=>s+n,0);
+    // counts: firestore-json OR snapshot-extracted
+    const counts = asObj(raw.counts) || null;
+    const full =
+      (counts ? (safeNum(counts.full) ?? 0) : (safeNum(raw.countFull) ?? 0));
+    const partial =
+      (counts ? (safeNum(counts.partial) ?? 0) : (safeNum(raw.countPartial) ?? 0));
+
+    // partial feet: firestore-json OR snapshot-extracted
+    const partialFeetArr =
+      (counts && counts.partialFeet != null)
+        ? asArray(counts.partialFeet).map(safeNum).filter(n => n != null)
+        : asArray(raw.partialFeetJson).map(safeNum).filter(n => n != null);
+
+    const partialFeetSumFromArr = partialFeetArr.reduce((s,n)=>s+n,0);
+    const partialFeetSum =
+      (partialFeetSumFromArr > 0)
+        ? partialFeetSumFromArr
+        : (safeNum(raw.partialFeetSum) ?? 0);
 
     // subtract pickUps
     const picks = pickedByPutDown.get(pd.id) || [];
@@ -447,20 +465,25 @@ export function getGrainBagsReport(opts = {}){
     const remainingFull = Math.max(0, full - takeFull);
     const remainingPartial = Math.max(0, partial - takePartial);
 
-    // if we have explicit partialFeet, use it; otherwise assume each partial is a full-length partial bag
-    const bagSkuObj = asObj(raw.bagSku) || {};
-    const bagSizeFeet = safeNum(bagSkuObj.sizeFeet) ?? safeNum(bagSkuObj.bagSizeFeet) ?? null;
+    // bagSku: firestore-json OR snapshot-extracted
+    const bagSkuObj = asObj(raw.bagSku) || {
+      id: raw.bagSkuId,
+      brand: raw.bagBrand,
+      diameterFt: raw.bagDiameterFt,
+      sizeFeet: raw.bagSizeFeet
+    };
+
+    const bagSizeFeet = safeNum(bagSkuObj.sizeFeet) ?? safeNum(bagSkuObj.bagSizeFeet) ?? safeNum(raw.bagSizeFeet) ?? null;
 
     let remainingPartialFeetSum = partialFeetSum;
     if(remainingPartialFeetSum === 0 && remainingPartial > 0 && bagSizeFeet != null){
       remainingPartialFeetSum = remainingPartial * bagSizeFeet;
     }
 
-    // Determine if "out"
     const isOut = (remainingFull > 0) || (remainingPartial > 0) || (remainingPartialFeetSum > 0);
 
-    // Resolve field/farm/county
-    const fieldObj = asObj(raw.field) || {};
+    // field: firestore-json OR snapshot-extracted
+    const fieldObj = asObj(raw.field) || { id: raw.fieldId, name: raw.fieldName };
     const fieldId = normStr(fieldObj.id) || normStr(raw.fieldId);
     const fieldName = normStr(fieldObj.name) || normStr(raw.fieldName);
 
@@ -481,7 +504,7 @@ export function getGrainBagsReport(opts = {}){
     let capacityBu = null;
     let capacitySource = "";
 
-    const bagSkuId = normStr(bagSkuObj.id);
+    const bagSkuId = normStr(bagSkuObj.id) || normStr(raw.bagSkuId);
     const productId = bagSkuId ? (bagSkuToProductId.get(bagSkuId) || "") : "";
     const product = productId ? productById.get(productId) : null;
 
@@ -490,11 +513,10 @@ export function getGrainBagsReport(opts = {}){
       capacitySource = productId ? `productsGrainBags/${productId}` : "";
     }
 
-    // Fallback: match by diameter+length+brand if productId missing
     if(capacityBu == null && tProd && capCols){
-      const diam = safeNum(bagSkuObj.diameterFt);
-      const len = safeNum(bagSkuObj.sizeFeet);
-      const brand = normLower(bagSkuObj.brand);
+      const diam = safeNum(bagSkuObj.diameterFt) ?? safeNum(raw.bagDiameterFt);
+      const len = safeNum(bagSkuObj.sizeFeet) ?? safeNum(raw.bagSizeFeet);
+      const brand = normLower(bagSkuObj.brand) || normLower(raw.bagBrand);
       if(diam != null && len != null){
         for(const p of productById.values()){
           const pd = safeNum(p.diameterFt);
@@ -530,8 +552,8 @@ export function getGrainBagsReport(opts = {}){
       fieldName: fieldDisplay,
 
       bagSkuId,
-      bagBrand: normStr(bagSkuObj.brand),
-      bagDiameterFt: safeNum(bagSkuObj.diameterFt) ?? null,
+      bagBrand: normStr(bagSkuObj.brand) || normStr(raw.bagBrand),
+      bagDiameterFt: safeNum(bagSkuObj.diameterFt) ?? safeNum(raw.bagDiameterFt) ?? null,
       bagSizeFeet: bagSizeFeet,
 
       remainingFull,
@@ -549,10 +571,9 @@ export function getGrainBagsReport(opts = {}){
     });
   }
 
-  // Only “out in fields” by default
   const outItems = items.filter(x => x.isOut);
 
-  // ----- totals by crop -----
+  // totals by crop (include bag counts too)
   const cropMap = new Map();
   for(const it of outItems){
     if(!cropMap.has(it.crop)){
@@ -577,7 +598,6 @@ export function getGrainBagsReport(opts = {}){
 
   const byCrop = Array.from(cropMap.values()).sort((a,b) => b.bushelsTotal - a.bushelsTotal);
 
-  // ----- rollups by county -----
   function rollupByCounty(list){
     const map = new Map();
     for(const it of list){
@@ -605,7 +625,6 @@ export function getGrainBagsReport(opts = {}){
     })).sort((a,b) => b.bushelsTotal - a.bushelsTotal || a.county.localeCompare(b.county));
   }
 
-  // ----- rollups by farm -----
   function rollupByFarm(list){
     const map = new Map();
     for(const it of list){
@@ -641,13 +660,13 @@ export function getGrainBagsReport(opts = {}){
   const totalFullBags = byCrop.reduce((s,x)=>s+x.remainingFull,0);
   const totalPartialBags = byCrop.reduce((s,x)=>s+x.remainingPartial,0);
 
-  // Sort putDowns by remaining bushels (most important operationally)
   outItems.sort((a,b) => (b.bushelsTotal - a.bushelsTotal) || (b.remainingFull - a.remainingFull));
 
   return {
     ok: true,
     intent: "grainBagsReport",
     tableUsed: tEvents,
+    appliedToTableUsed: tApplied || "",
     counts: {
       putDowns: putDowns.length,
       outPutDowns: outItems.length
