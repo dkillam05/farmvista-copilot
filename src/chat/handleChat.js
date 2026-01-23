@@ -1,8 +1,12 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-22-v4-handlechat-add-grainbags-report
+// Rev: 2026-01-23-v5-handlechat-grainbags-count-first
 //
 // Enforces: ACTIVE ONLY by default.
 // includeArchived=true requests separated archived results (where getter supports it).
+//
+// Update:
+// - If user asks "how many / count / number of" + bags, prompt answers BAG COUNT FIRST.
+// - Grain bag inventory definition: PUTDOWN-only for bag counts (per Dane).
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
@@ -49,6 +53,13 @@ function looksLikeFirestoreId(s){
   return t.length >= 18 && t.length <= 40 && /^[A-Za-z0-9_-]+$/.test(t);
 }
 
+function isBagCountQuestion(s){
+  const t = (s ?? "").toString().toLowerCase();
+  const asksCount = /\b(how many|count|number of|total)\b/.test(t);
+  const mentionsBags = /\b(bag|bags|grain bag|grain bags|grainbag|grainbags)\b/.test(t);
+  return asksCount && mentionsBags;
+}
+
 const EQUIPMENT_TYPES = new Set([
   "tractor","combine","implement","sprayer","truck","trailer","construction","fertilizer","starfire"
 ]);
@@ -81,7 +92,8 @@ export async function handleChat(req, res) {
       case "GRAIN_BAGS_DOWN":
         data = getGrainBagsDownSummary();
         prompt =
-          "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal.";
+          "Summarize grain bags currently down. For each cropType show remaining full/partial counts and bushelsFull/bushelsPartial/bushelsTotal. " +
+          "If the user asked for a bag count, give the bag counts first.";
         break;
 
       case "GRAIN_BAGS_REPORT": {
@@ -92,12 +104,22 @@ export async function handleChat(req, res) {
            k.includes("wheat") ? "wheat" :
            "");
         data = getGrainBagsReport({ crop: crop || "" });
-        prompt =
-          "Summarize grain bags with a strong focus on BUSHELS BY CROP (most important). " +
-          "Show totals by crop (bushelsFull/bushelsPartial/bushelsTotal, plus remaining full/partial counts if present). " +
-          "Then show rollups by county and by farm. " +
-          "Finally list notable putDowns (top remaining bushels) with field -> farm -> county and bag capacity proof. " +
-          "Keep it readable and operational.";
+
+        if (isBagCountQuestion(promptIn)){
+          prompt =
+            "The user is asking for HOW MANY BAGS, not a bushel-first report. " +
+            "Answer with BAG COUNT FIRST for the requested crop (or all crops if none specified). " +
+            "Inventory definition for BAG COUNTS: PUTDOWN-only from grain_bag_events (type='putDown') using counts.full + counts.partial. " +
+            "Then (optional) include supporting totals like bushelsFull/bushelsPartial/bushelsTotal and small rollups by county/farm if available. " +
+            "Keep it short and operational.";
+        } else {
+          prompt =
+            "Summarize grain bags with a strong focus on BUSHELS BY CROP (most important). " +
+            "Show totals by crop (bushelsFull/bushelsPartial/bushelsTotal, plus remaining full/partial counts if present). " +
+            "Then show rollups by county and by farm. " +
+            "Finally list notable putDowns (top remaining bushels) with field -> farm -> county and bag capacity proof. " +
+            "Keep it readable and operational.";
+        }
         break;
       }
 
