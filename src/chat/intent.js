@@ -1,7 +1,11 @@
 // /src/chat/intent.js  (FULL FILE)
-// Rev: 2026-01-22-v4-intent-add-grainbags-report
+// Rev: 2026-01-23-v5-intent-grainbags-count-routing
 //
-// Adds:
+// Adds/Adjusts:
+// - GRAIN_BAGS_REPORT now triggers for "how many / count / number of" + grain bags/bags
+//   so questions like "how many corn grain bags do we have" route correctly.
+//
+// Keeps v4 adds:
 // - GRAIN_BAGS_REPORT (bushels by crop + county/farm/field linkage)
 // Keeps v3 adds:
 // - BOUNDARY_REQUESTS
@@ -33,9 +37,9 @@ Return JSON ONLY:
 
 INTENTS:
 - FIELD_FULL: field details (id/name). key=field id/name.
-- GRAIN_BAGS_DOWN: grain bags down summary. key="".
+- GRAIN_BAGS_DOWN: grain bags down summary. key="".  (quick summary)
 - GRAIN_BAGS_REPORT: grain bags FULL report w/ bushels by crop and rollups. key may be crop filter ("corn", "soybeans", "beans", "wheat") or "".
-- RTK_TOWER_COUNT: count RTK towers. key="".
+- RTK_TOWER_COUNT: count RTK towers. key="". 
 - RTK_TOWER_LIST: list RTK towers. key="".
 - RTK_TOWER_FIELDS: fields assigned to a specific RTK tower. key=tower name/id.
 
@@ -72,7 +76,10 @@ INTENT RULES (keep simple):
 - If question mentions "<something> county" AND mentions any of (HEL, CRP, tillable, acres, totals, stats) -> COUNTY_STATS (key=<something>).
 
 GRAIN BAGS RULES:
-- If question mentions "grain bags" (or "bags") AND mentions any of:
+- If question mentions "grain bags" (or "grain bag" or "grainbag" or "bags") AND asks any of:
+  ("how many", "count", "number of")
+  -> GRAIN_BAGS_REPORT.
+- Else if question mentions "grain bags" (or "bags") AND mentions any of:
   ("bushels", "by crop", "by county", "by farm", "report", "inventory", "capacity", "remaining")
   -> GRAIN_BAGS_REPORT.
 - Otherwise if question mentions "grain bags down" or "bags down" -> GRAIN_BAGS_DOWN.
