@@ -1,5 +1,5 @@
 // /src/data/getters/index.js  (FULL FILE)
-// Rev: 2026-01-22-v4-getters-index-add-grainbags-report-new-domains
+// Rev: 2026-01-23-v5-getters-index-add-hel-crp-totals
 
 export { getFieldFullByKey } from './fields.js';
 
@@ -26,9 +26,12 @@ export { getBoundaryRequests } from './boundaryRequests.js';
 export { getFieldMaintenance } from './fieldMaintenance.js';
 export { getEquipment } from './equipment.js';
 
-// (You still need to paste your makes/models getters if you haven’t converted them to ESM yet)
+// makes/models
 export { getEquipmentMakes } from './equipmentMakes.js';
 export { getEquipmentModels } from './equipmentModels.js';
 
 export { getBinSites } from './binSites.js';
 export { getBinMovements } from './binMovements.js';
+
+// NEW: HEL/CRP totals (toggle-first)
+export { getHelCrpTotals } from './helCrpTotals.js';
