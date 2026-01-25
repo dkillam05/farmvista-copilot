@@ -1,12 +1,12 @@
 // /src/chat/handleChat.js  (FULL FILE)
-// Rev: 2026-01-23-v5-handlechat-grainbags-count-first
+// Rev: 2026-01-23-v6-handlechat-add-hel-crp-totals
 //
 // Enforces: ACTIVE ONLY by default.
 // includeArchived=true requests separated archived results (where getter supports it).
 //
 // Update:
-// - If user asks "how many / count / number of" + bags, prompt answers BAG COUNT FIRST.
-// - Grain bag inventory definition: PUTDOWN-only for bag counts (per Dane).
+// - HEL_TOTALS / CRP_TOTALS / HEL_CRP_TOTALS now supported.
+// - Uses toggle-first logic in getter: hasHEL/hasCRP determines field counts; acres sum only when toggle is on.
 
 import { detectIntent } from "./intent.js";
 import { writeAnswer } from "./answerWriter.js";
@@ -31,7 +31,10 @@ import {
   getEquipmentMakes,
   getEquipmentModels,
   getBinSites,
-  getBinMovements
+  getBinMovements,
+
+  // NEW: HEL/CRP totals
+  getHelCrpTotals
 } from "../data/getters/index.js";
 
 function pickPrompt(body) {
@@ -125,8 +128,7 @@ export async function handleChat(req, res) {
 
       case "RTK_TOWER_COUNT":
         data = getRtkTowerCount();
-        prompt =
-          "Answer in one sentence with the total count of RTK towers.";
+        prompt = "Answer in one sentence with the total count of RTK towers.";
         break;
 
       case "RTK_TOWER_LIST":
@@ -163,6 +165,36 @@ export async function handleChat(req, res) {
         data = getCountyStatsByKey(key, { includeArchived });
         prompt =
           "Default is ACTIVE ONLY. Give county totals for ACTIVE fields: fieldCount, tillableAcres, HEL acres + helFieldCount, CRP acres + crpFieldCount. If includeArchived=true, also show a separate ARCHIVED totals section.";
+        break;
+
+      // ---------------------------
+      // HEL / CRP TOTALS (NEW)
+      // ---------------------------
+      case "HEL_TOTALS":
+        data = getHelCrpTotals({ includeArchived, mode: "hel" });
+        prompt =
+          "Answer clearly with HEL totals. Use the toggle-first rule: field counts come from hasHEL (not acres). " +
+          "Sum helAcres ONLY for fields where hasHEL is true. Default ACTIVE ONLY. " +
+          "Return: total HEL acres + count of fields with HEL. Also include optional by-county and by-farm rollups if present. " +
+          "If includeArchived=true, show a separate ARCHIVED section.";
+        break;
+
+      case "CRP_TOTALS":
+        data = getHelCrpTotals({ includeArchived, mode: "crp" });
+        prompt =
+          "Answer clearly with CRP totals. Use the toggle-first rule: field counts come from hasCRP (not acres). " +
+          "Sum crpAcres ONLY for fields where hasCRP is true. Default ACTIVE ONLY. " +
+          "Return: total CRP acres + count of fields with CRP. Also include optional by-county and by-farm rollups if present. " +
+          "If includeArchived=true, show a separate ARCHIVED section.";
+        break;
+
+      case "HEL_CRP_TOTALS":
+        data = getHelCrpTotals({ includeArchived, mode: "both" });
+        prompt =
+          "Answer clearly with BOTH HEL and CRP totals. Use toggle-first: field counts come from hasHEL/hasCRP (not acres). " +
+          "Sum helAcres only when hasHEL is true; sum crpAcres only when hasCRP is true. Default ACTIVE ONLY. " +
+          "Return: HEL acres + fieldsWithHEL, and CRP acres + fieldsWithCRP. " +
+          "Optionally include by-county and by-farm rollups if present. If includeArchived=true, show a separate ARCHIVED section.";
         break;
 
       // ---------------------------
