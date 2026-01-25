@@ -1,17 +1,14 @@
 // /src/chat/intent.js  (FULL FILE)
-// Rev: 2026-01-23-v5-intent-grainbags-count-routing
+// Rev: 2026-01-23-v6-intent-add-hel-crp-totals
 //
-// Adds/Adjusts:
-// - GRAIN_BAGS_REPORT now triggers for "how many / count / number of" + grain bags/bags
-//   so questions like "how many corn grain bags do we have" route correctly.
+// Adds:
+// - HEL_TOTALS (HEL acres + count of fields w/ HEL toggle)
+// - CRP_TOTALS (CRP acres + count of fields w/ CRP toggle)
+// - HEL_CRP_TOTALS (both)
 //
-// Keeps v4 adds:
-// - GRAIN_BAGS_REPORT (bushels by crop + county/farm/field linkage)
-// Keeps v3 adds:
-// - BOUNDARY_REQUESTS
-// - FIELD_MAINTENANCE
-// - EQUIPMENT / EQUIPMENT_MAKES / EQUIPMENT_MODELS
-// - BIN_SITES / BIN_MOVEMENTS
+// Keeps v5:
+// - Grain bag count/report routing
+// - New domain intents from v3+
 //
 // includeArchived boolean flag (default false)
 // Active-only is the default system behavior across the bot.
@@ -49,6 +46,11 @@ COUNTY INTENTS:
 - COUNTY_FARMS: list farms that have fields in a given county. key=county name.
 - COUNTY_STATS: HEL/CRP/tillable summaries for a given county. key=county name.
 
+HEL / CRP INTENTS:
+- HEL_TOTALS: total HEL acres + count of fields w/ HEL toggle. key="".
+- CRP_TOTALS: total CRP acres + count of fields w/ CRP toggle. key="".
+- HEL_CRP_TOTALS: both HEL + CRP totals. key="".
+
 NEW DOMAIN INTENTS:
 - BOUNDARY_REQUESTS: boundary fix requests report. key can be "open", "completed", or "all" (default "open").
 - FIELD_MAINTENANCE: field maintenance report. key can be a status like "needs approved", "pending", or "all".
@@ -74,6 +76,11 @@ INTENT RULES (keep simple):
 - If question mentions "fields" AND contains "<something> county" -> COUNTY_FIELDS (key=<something>).
 - If question mentions "farms" AND contains "<something> county" -> COUNTY_FARMS (key=<something>).
 - If question mentions "<something> county" AND mentions any of (HEL, CRP, tillable, acres, totals, stats) -> COUNTY_STATS (key=<something>).
+
+HEL/CRP TOTALS RULES:
+- If question mentions BOTH "hel" and "crp" AND mentions any of (acres, total, how many, count) -> HEL_CRP_TOTALS.
+- Else if question mentions "hel" AND mentions any of (acres, total, how many, count) -> HEL_TOTALS.
+- Else if question mentions "crp" AND mentions any of (acres, total, how many, count) -> CRP_TOTALS.
 
 GRAIN BAGS RULES:
 - If question mentions "grain bags" (or "grain bag" or "grainbag" or "bags") AND asks any of:
