@@ -1,5 +1,7 @@
 // /src/data/getters/grainBags.js  (FULL FILE)
-// Rev: 2026-01-23-v6-grainbags-support-snapshot-schema-appliedTo-table
+// Rev: 2026-01-24-v7-grainbags-use-corn-rated-capacity-factors
+//
+// Based on: 2026-01-23-v6-grainbags-support-snapshot-schema-appliedTo-table
 //
 // Fix (per Dane):
 // ✅ Support current SQLite snapshot schema from /context/snapshot-build.js:
@@ -9,6 +11,15 @@
 //    - field stored as fieldId/fieldName
 //    - pickUp reductions stored in grainBagAppliedTo table (refPutDownId + takeFull/takePartial)
 // ✅ Still supports Firestore-shaped JSON rows (counts/bagSku/field/appliedTo) if present
+//
+// NEW (per Dane):
+// ✅ productsGrainBags.bushels is CORN-RATED capacity
+// ✅ Convert bushels by crop using FarmVista factors (same as FVGrainCapacity):
+//    corn: 1.00
+//    soybeans: 0.93
+//    wheat: 1.07
+//    milo: 1.02
+//    oats: 0.78
 //
 // ACTIVE-ONLY DEFAULT (per Dane):
 // - "out in fields" means remainingFull>0 OR remainingPartial>0 OR remainingPartialFeetSum>0
@@ -96,6 +107,8 @@ function normCrop(v){
   if(s.includes("corn")) return "Corn";
   if(s.includes("soy") || s.includes("bean")) return "Soybeans";
   if(s.includes("wheat")) return "Wheat";
+  if(s.includes("milo") || s.includes("sorghum")) return "Milo";
+  if(s.includes("oat")) return "Oats";
   return "Other";
 }
 
@@ -107,13 +120,30 @@ function parseProductRef(ref){
   return parts.length === 2 ? parts[1] : "";
 }
 
+/* ----------------------------- crop factors (FVGrainCapacity) ----------------------------- */
+// All "bushels" in productsGrainBags are CORN-RATED capacity.
+// Convert to effective bushels for the target crop using these factors.
+const CROP_FACTORS = {
+  Corn: 1.00,
+  Soybeans: 0.93,
+  Wheat: 1.07,
+  Milo: 1.02,
+  Oats: 0.78,
+  Other: 1.00
+};
+
+function cropFactor(cropTypeNorm){
+  const f = CROP_FACTORS[cropTypeNorm];
+  return (typeof f === "number" && Number.isFinite(f)) ? f : 1.0;
+}
+
 /* ----------------------------- capacity ----------------------------- */
 function pickCapacityColumns(sqlite, tableProducts){
   const cols = sqlite.prepare(`PRAGMA table_info(${JSON.stringify(tableProducts)})`).all().map(r => r.name);
   const has = (c) => cols.includes(c);
 
   return {
-    any: has("bushels") ? "bushels" : null,
+    any: has("bushels") ? "bushels" : null, // CORN-RATED in FarmVista
     corn: has("bushelsCorn") ? "bushelsCorn" : null,
     soy:
       has("bushelsSoy") ? "bushelsSoy" :
@@ -131,15 +161,23 @@ function pickCapacityColumns(sqlite, tableProducts){
 function capacityForCrop(productRow, cropTypeNorm, capCols){
   if(!productRow) return null;
 
+  const f = cropFactor(cropTypeNorm);
+
+  // ✅ Preferred: CORN-RATED capacity stored in bushels
   if(capCols.any && productRow[capCols.any] != null){
-    return safeNum(productRow[capCols.any]);
+    const cornRated = safeNum(productRow[capCols.any]);
+    return (cornRated == null) ? null : (cornRated * f);
   }
 
-  if(cropTypeNorm === "Corn" && capCols.corn) return safeNum(productRow[capCols.corn]);
+  // ✅ If bushelsCorn exists, treat it as corn-rated and apply factor
+  if(capCols.corn && productRow[capCols.corn] != null){
+    const cornRated = safeNum(productRow[capCols.corn]);
+    return (cornRated == null) ? null : (cornRated * f);
+  }
+
+  // Legacy: If crop-specific exists, treat as already-correct capacity for that crop
   if(cropTypeNorm === "Soybeans" && capCols.soy) return safeNum(productRow[capCols.soy]);
   if(cropTypeNorm === "Wheat" && capCols.wheat) return safeNum(productRow[capCols.wheat]);
-
-  if(capCols.corn) return safeNum(productRow[capCols.corn]);
 
   return null;
 }
@@ -150,11 +188,16 @@ export function getGrainBagsDownSummary(){
 
   if(hasTable(sqlite, "v_grainBag_open_remaining") && hasTable(sqlite, "productsGrainBags")){
     const capCols = pickCapacityColumns(sqlite, "productsGrainBags");
-    const anyCol = capCols.any ? `p.${capCols.any} AS bushelsAny` : `NULL AS bushelsAny`;
-    const cornCol = capCols.corn ? `p.${capCols.corn} AS bushelsCorn` : `NULL AS bushelsCorn`;
-    const soyCol  = capCols.soy  ? `p.${capCols.soy}  AS bushelsSoy`  : `NULL AS bushelsSoy`;
-    const wheatCol= capCols.wheat? `p.${capCols.wheat} AS bushelsWheat`: `NULL AS bushelsWheat`;
 
+    // CORN-RATED base capacity
+    const anyCol = capCols.any ? `p.${capCols.any} AS cornRatedBu` : `NULL AS cornRatedBu`;
+    const cornCol = capCols.corn ? `p.${capCols.corn} AS cornRatedBu2` : `NULL AS cornRatedBu2`;
+
+    // keep legacy columns (optional)
+    const soyCol  = capCols.soy  ? `p.${capCols.soy}  AS bushelsSoyLegacy`  : `NULL AS bushelsSoyLegacy`;
+    const wheatCol= capCols.wheat? `p.${capCols.wheat} AS bushelsWheatLegacy`: `NULL AS bushelsWheatLegacy`;
+
+    // Apply FV factors in SQL so bushels are not zero
     const sql = `
       WITH cap AS (
         SELECT
@@ -188,11 +231,48 @@ export function getGrainBagsDownSummary(){
           open.remainingPartial AS remainingPartial,
           open.remainingPartialFeetSum AS remainingPartialFeetSum,
           open.bagSizeFeet AS bagSizeFeet,
-          COALESCE(cap.bushelsAny, cap.bushelsCorn, cap.bushelsSoy, cap.bushelsWheat, 0) AS bagCapacityBu
+
+          -- CORN-RATED base (prefer bushels, then bushelsCorn)
+          COALESCE(cap.cornRatedBu, cap.cornRatedBu2, 0) AS cornRatedCapacityBu,
+
+          -- legacy direct crop capacity (only used if cornRated missing)
+          COALESCE(cap.bushelsSoyLegacy, 0) AS soyLegacyBu,
+          COALESCE(cap.bushelsWheatLegacy, 0) AS wheatLegacyBu
+
         FROM open
         LEFT JOIN cap
           ON cap.diameterFt = open.bagDiameterFt
          AND cap.lengthFt   = open.bagSizeFeet
+      ),
+      cap2 AS (
+        SELECT
+          *,
+          CASE
+            WHEN lower(cropType) LIKE '%corn%' THEN
+              cornRatedCapacityBu * 1.00
+
+            WHEN lower(cropType) LIKE '%soy%' OR lower(cropType) LIKE '%bean%' THEN
+              CASE
+                WHEN cornRatedCapacityBu > 0 THEN cornRatedCapacityBu * 0.93
+                ELSE soyLegacyBu
+              END
+
+            WHEN lower(cropType) LIKE '%wheat%' THEN
+              CASE
+                WHEN cornRatedCapacityBu > 0 THEN cornRatedCapacityBu * 1.07
+                ELSE wheatLegacyBu
+              END
+
+            WHEN lower(cropType) LIKE '%milo%' OR lower(cropType) LIKE '%sorghum%' THEN
+              cornRatedCapacityBu * 1.02
+
+            WHEN lower(cropType) LIKE '%oat%' THEN
+              cornRatedCapacityBu * 0.78
+
+            ELSE
+              cornRatedCapacityBu * 1.00
+          END AS bagCapacityBu
+        FROM joined
       )
       SELECT
         cropType,
@@ -215,10 +295,11 @@ export function getGrainBagsDownSummary(){
             END
           )
         , 1) AS bushelsTotal
-      FROM joined
+      FROM cap2
       GROUP BY cropType
       ORDER BY cropType ASC
     `;
+
     return sqlite.prepare(sql).all();
   }
 
@@ -500,7 +581,7 @@ export function getGrainBagsReport(opts = {}){
     const farmDisplay = farmName || farmRow?.name || "(Unknown farm)";
     const fieldDisplay = fieldName || fieldRow?.name || "(Unknown field)";
 
-    // Resolve capacity
+    // Resolve capacity (now applies crop factors when using corn-rated columns)
     let capacityBu = null;
     let capacitySource = "";
 
@@ -519,10 +600,10 @@ export function getGrainBagsReport(opts = {}){
       const brand = normLower(bagSkuObj.brand) || normLower(raw.bagBrand);
       if(diam != null && len != null){
         for(const p of productById.values()){
-          const pd = safeNum(p.diameterFt);
-          const pl = safeNum(p.lengthFt);
-          const pb = normLower(p.brand);
-          if(pd === diam && pl === len && (!brand || !pb || brand === pb)){
+          const pdm = safeNum(p.diameterFt);
+          const pln = safeNum(p.lengthFt);
+          const pbr = normLower(p.brand);
+          if(pdm === diam && pln === len && (!brand || !pbr || brand === pbr)){
             capacityBu = capacityForCrop(p, crop, capCols);
             capacitySource = `productsGrainBags/${p.id} (matched by size)`;
             break;
